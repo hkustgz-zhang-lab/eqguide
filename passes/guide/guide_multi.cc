@@ -112,27 +112,100 @@ static int wrap_mul_in_module(RTLIL::Module *module)
     return cnt;
 }
 struct GuideMultiPass : public Pass {
-	GuideMultiPass() : Pass("guide_multi", "wrap $mul cells to a modules") { }
+	GuideMultiPass() : Pass("guide_multi", "wrap $mul cells to modules or set/unset multiplier attribute.") { }
 	void help() override
 	{
 		//   |---v---|---v---|---v---|---v---|---v---|---v---|---v---|---v---|---v---|---v---|
-		log("\n");
-		log("    guide_multi [selection]\n");
-		log("\n");
-		log("Warp $mul cells to modules\n");
-		log("\n");
+        log("\n");
+        log("    guide_multi [options] [selection]\n");
+        log("\n");
+        log("Wrap $mul cells into per-mul wrapper modules, and wrap $mul cells to modules.\n");
+        log("If NO options are given, only warp $mul cells in selected modules\n");
+        log("\n");
+        log("Options:\n");
+        log("    -mark\n");
+        log("        Set (* multiplier=1 *) on selected modules.\n");
+        log("\n");
+        log("    -unmark\n");
+        log("        Remove (* multiplier *) from selected modules.\n");
+        log("\n");
+        log("    -mark-mod <modname>\n");
+        log("        Set (* multiplier=1 *) on the named module.\n");
+        log("\n");
+        log("    -unmark-mod <modname>\n");
+        log("        Remove (* multiplier *) from the named module.\n");
+        log("\n");
+
 	}
 	void execute(std::vector<std::string> args, RTLIL::Design *design) override
 	{
         log_header(design, "Executing GUIDE_MULTI pass (wrap $mul cells to modules).\n");
         log_push();
+
+        bool do_mark = false;
+        bool do_unmark = false;
+        std::vector<RTLIL::IdString> mark_mods, unmark_mods;
+
 		size_t argidx;
 		for (argidx = 1; argidx < args.size(); argidx++)
 		{
-			break;
+			if( args[argidx] == "-mark" ) {
+                do_mark = true;
+                continue;
+            }
+            if( args[argidx] == "-unmark" ) {
+                do_unmark = true;
+                continue;
+            }
+            if( args[argidx] == "-mark-mod" && argidx+1 < args.size() ) {
+                mark_mods.push_back(RTLIL::escape_id(args[++argidx]));
+                continue;
+            }
+            if( args[argidx] == "-unmark-mod" && argidx+1 < args.size() ) {
+                unmark_mods.push_back(RTLIL::escape_id(args[++argidx]));
+                continue;
+            }
 		}
 		extra_args(args, argidx, design);
 
+        for (auto id : mark_mods) {
+            if (auto m = design->module(id)) {
+                m->attributes[ID(multiplier)] = RTLIL::Const(1);
+                log("Marked module %s as (* multiplier=1 *).\n", log_id(m->name));
+            } else {
+                log_warning("No such module: %s\n", log_id(id));
+            }
+        }
+        for (auto id : unmark_mods) {
+            if (auto m = design->module(id)) {
+                m->attributes.erase(ID(multiplier));
+                log("Unmarked module %s (removed (* multiplier *)).\n", log_id(m->name));
+            } else {
+                log_warning("No such module: %s\n", log_id(id));
+            }
+        }
+
+        if(do_mark || do_unmark) 
+        {
+            for (auto module : design->all_selected_modules())
+            {
+                if(do_mark) {
+                    log("Module %s: set attribute multiplier=1\n", module->name);
+                    module->attributes[ID(multiplier)] = RTLIL::Const(1);
+                }
+                if(do_unmark) {
+                    log("Module %s: remove attribute multiplier\n", module->name);
+                    module->attributes.erase(ID(multiplier));
+                }
+            }
+            log_pop();
+            return;
+        }
+
+        if(mark_mods.size() > 0 || unmark_mods.size() > 0) {
+            log_pop();
+            return;
+        }
 
 		for (auto module : design->all_selected_modules())
 		{
@@ -141,7 +214,7 @@ struct GuideMultiPass : public Pass {
                 log("Module %s is marked as multiplier module, skip wrapping $mul cells inside.\n", module->name);
                 continue;
             }
-            
+
             int cnt = wrap_mul_in_module(module);
             log("Module %s: wrapped %d $mul cells\n", module->name, cnt);
 		}
