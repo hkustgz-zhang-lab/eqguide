@@ -57,6 +57,8 @@ static int wrap_mul_in_module(RTLIL::Module *module)
             continue;
         }
 
+        bool is_signed = orig_params[ID::A_SIGNED].as_bool();
+
         if(origA.size()!=origB.size()){
             log_warning("$mul cell %s has mismatched widths between A and B ports. Skipping wrapping.\n", log_id(inst_name));
             log_assert(0); // TODO:
@@ -86,6 +88,7 @@ static int wrap_mul_in_module(RTLIL::Module *module)
         new_mod->name = new_mod_id;
 
         new_mod->attributes[ID(multiplier)] = RTLIL::Const(1);
+        new_mod->attributes[ID(is_signed)]     = RTLIL::Const(is_signed ? 1 : 0);
         new_mod->attributes[ID(keep_hierarchy)]    = RTLIL::Const(1);
 
         RTLIL::Wire *in_a  = new_mod->addWire(ID::A, aw);
