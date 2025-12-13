@@ -200,6 +200,7 @@ struct GuideMultiPass : public Pass {
                 unmark_mods.push_back(RTLIL::escape_id(args[++argidx]));
                 continue;
             }
+            break;
 		}
 		extra_args(args, argidx, design);
 
@@ -250,7 +251,7 @@ struct GuideMultiPass : public Pass {
                 continue;
             }
 
-            run_pass(string("wreduce ") + log_id(module->name));
+            run_pass(string("wreduce ") + log_id(module->name), design);
 
             int cnt = wrap_mul_in_module(module);
             log("Module %s: wrapped %d $mul cells\n", module->name, cnt);
