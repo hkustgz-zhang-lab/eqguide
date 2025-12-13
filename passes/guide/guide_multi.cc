@@ -89,7 +89,7 @@ static int wrap_mul_in_module(RTLIL::Module *module)
 
         new_mod->attributes[ID(multiplier)] = RTLIL::Const(1);
         new_mod->attributes[ID(is_signed)]     = RTLIL::Const(is_signed ? 1 : 0);
-        new_mod->attributes[ID(keep_hierarchy)]    = RTLIL::Const(1);
+        // new_mod->attributes[ID(keep_hierarchy)]    = RTLIL::Const(1);
 
         RTLIL::Wire *in_a  = new_mod->addWire(ID::A, aw);
         RTLIL::Wire *in_b  = new_mod->addWire(ID::B, bw);
@@ -120,7 +120,7 @@ static int wrap_mul_in_module(RTLIL::Module *module)
         mod_inst->setPort(ID::Y, origY);
 
         mod_inst->attributes = orig_attrs;
-        mod_inst->attributes[ID(keep_hierarchy)] = RTLIL::Const(1);
+        // mod_inst->attributes[ID(keep_hierarchy)] = RTLIL::Const(1);
 
         cnt++;
     }
