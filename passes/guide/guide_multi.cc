@@ -112,28 +112,47 @@ static int wrap_mul_in_module(RTLIL::Module *module)
     return cnt;
 }
 struct GuideMultiPass : public Pass {
-	GuideMultiPass() : Pass("guide_multi", "wrap $mul cells to modules or set/unset multiplier attribute.") { }
+	GuideMultiPass() : Pass("guide_multi", "wrap $mul cells; mark/unmark multiplier modules.") { }
 	void help() override
 	{
 		//   |---v---|---v---|---v---|---v---|---v---|---v---|---v---|---v---|---v---|---v---|
         log("\n");
         log("    guide_multi [options] [selection]\n");
         log("\n");
-        log("Wrap $mul cells into per-mul wrapper modules, and wrap $mul cells to modules.\n");
-        log("If NO options are given, only warp $mul cells in selected modules\n");
+        log("Description:\n");
+        log("    Wrap each selected $mul cell into its own wrapper module, and replace the\n");
+        log("    original $mul cell with an instance of that wrapper module.\n");
+        log("\n");
+        log("    Modules marked with (* multiplier=1 *) are treated as \"multiplier modules\"\n");
+        log("    and will be skipped during wrapping.\n");
+        log("\n");
+        log("Behavior:\n");
+        log("    - With no options, wrap $mul cells in the selected modules.\n");
+        log("    - With -mark/-unmark, only set/unset the attribute on selected modules.\n");
+        log("    - With -mark-mod/-unmark-mod, only set/unset the attribute on named modules.\n");
         log("\n");
         log("Options:\n");
         log("    -mark\n");
-        log("        Set (* multiplier=1 *) on selected modules.\n");
+        log("        Set (* multiplier=1 *) on the selected modules, then exit.\n");
         log("\n");
         log("    -unmark\n");
-        log("        Remove (* multiplier *) from selected modules.\n");
+        log("        Remove (* multiplier *) from the selected modules, then exit.\n");
         log("\n");
         log("    -mark-mod <modname>\n");
         log("        Set (* multiplier=1 *) on the named module.\n");
         log("\n");
         log("    -unmark-mod <modname>\n");
         log("        Remove (* multiplier *) from the named module.\n");
+        log("\n");
+        log("Examples:\n");
+        log("    # Wrap $mul in top (and its selected submodules, if any)\n");
+        log("    guide_multi top\n");
+        log("\n");
+        log("    # Mark mul_core as a multiplier module (skip wrapping inside it)\n");
+        log("    guide_multi -mark-mod mul_core\n");
+        log("\n");
+        log("    # Mark selected modules as multiplier modules\n");
+        log("    select -module mul_core; guide_multi -mark\n");
         log("\n");
 
 	}
