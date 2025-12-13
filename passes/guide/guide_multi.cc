@@ -20,6 +20,7 @@
 #include "kernel/register.h"
 #include "kernel/rtlil.h"
 #include "kernel/log.h"
+#include "kernel/yosys.h"
 #include <vector>
 
 USING_YOSYS_NAMESPACE
@@ -49,6 +50,18 @@ static int wrap_mul_in_module(RTLIL::Module *module)
         RTLIL::SigSpec origY = cell->getPort(ID::Y);
         dict<RTLIL::IdString, RTLIL::Const> orig_params = cell->parameters;
         dict<RTLIL::IdString, RTLIL::Const> orig_attrs  = cell->attributes;
+
+        if(orig_params[ID::A_SIGNED].as_bool() != orig_params[ID::B_SIGNED].as_bool()){
+            log_warning("$mul cell %s has mismatched signedness between A and B ports. Skipping wrapping.\n", log_id(inst_name));
+            log_assert(0); // TODO: 
+            continue;
+        }
+
+        if(origA.size()!=origB.size()){
+            log_warning("$mul cell %s has mismatched widths between A and B ports. Skipping wrapping.\n", log_id(inst_name));
+            log_assert(0); // TODO:
+            continue;
+        }
 
         int aw = origA.size();
         int bw = origB.size();
@@ -233,6 +246,8 @@ struct GuideMultiPass : public Pass {
                 log("Module %s is marked as multiplier module, skip wrapping $mul cells inside.\n", module->name);
                 continue;
             }
+
+            run_pass(string("wreduce ") + log_id(module->name));
 
             int cnt = wrap_mul_in_module(module);
             log("Module %s: wrapped %d $mul cells\n", module->name, cnt);
