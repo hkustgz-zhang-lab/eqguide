@@ -226,7 +226,29 @@ static void v2aig(const string& v_file, const string& aig_file, const string& mo
     auto yosys_exe_file = proc_self_dirname() + "yosys";
     string cmd = stringf("%s -p 'read_verilog %s; hierarchy -top %s; synth -flatten -flatten; aigmap; write_aiger %s'", 
                         yosys_exe_file, v_file, mod_name, aig_file);
-    system(cmd.c_str());
+    // system(cmd.c_str());
+
+    char buffer[1024];
+
+    FILE *pipe = popen(cmd.c_str(), "r");
+    if (!pipe) {
+        log_error("Error executing command: %s", cmd);
+        return;
+    }
+
+    while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
+    }
+
+    int status = pclose(pipe);
+    if (WIFEXITED(status)) {
+        status = WEXITSTATUS(status);
+    } else {
+        status = -1; 
+    }
+
+    if(status != 0){
+        log_error("Error executing command: %s", cmd);
+    }
 }
 
 
@@ -476,12 +498,20 @@ struct GuideCheckPass : public Pass {
 
         bool multi_result = false, cec_result = false;
         
-        // multi_result = check_multi(conf);
-        // if(!multi_result)
-        // {
-        //     log("GUIDE_CHECK multi-module check failed.\n");
-        //     goto check_failed;
-        // }
+        std::vector<RTLIL::Module*> multi_mods;
+        auto all_mods = design->all_selected_modules();
+        for(auto mod : all_mods)
+        {
+            multi_result = check_extract_multi(design, mod, tempdir_name, multi_mods);
+            if(!multi_result)
+            {
+                log("GUIDE_CHECK multi-module check failed.\n");
+                goto check_failed;
+            }
+        }
+        log("GUIDE_CHECK multi-module check passed.\n");
+
+        (void)multi_mods;
 
         cec_result = abc_cec(conf);
         if(!cec_result)
