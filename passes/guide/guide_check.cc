@@ -409,7 +409,9 @@ static bool abc_check(CheckConfig &conf, bool use_blif=false, string check_cmd="
 
 
 static bool abc_cec(CheckConfig &conf){
-    return abc_check(conf, true, "cec");
+    // TODO: We use desc here!!!!
+    //return abc_check(conf, true, "cec");
+    return abc_check(conf, true, "dsec");
 }
 
 static bool abc_dsec(CheckConfig &conf){
