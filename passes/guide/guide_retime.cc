@@ -27,8 +27,8 @@ USING_YOSYS_NAMESPACE
 PRIVATE_NAMESPACE_BEGIN
 
 
-struct GuideMultiPass : public Pass {
-	GuideMultiPass() : Pass("guide_retime", "mark selected modules with the `retime` attribute.") { }
+struct GuideRetimePass : public Pass {
+	GuideRetimePass() : Pass("guide_retime", "mark selected modules with the `retime` attribute.") { }
 	void help() override
 	{
 		//   |---v---|---v---|---v---|---v---|---v---|---v---|---v---|---v---|---v---|---v---|
@@ -75,7 +75,7 @@ struct GuideMultiPass : public Pass {
 
         log_pop();
 	}
-} GuideMultiPass;
+} GuideRetimePass;
 
 
 PRIVATE_NAMESPACE_END
