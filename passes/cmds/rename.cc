@@ -21,6 +21,7 @@
 #include "kernel/rtlil.h"
 #include "kernel/log.h"
 #include "backends/verilog/verilog_backend.h"
+#include "kernel/yosys_common.h"
 
 USING_YOSYS_NAMESPACE
 PRIVATE_NAMESPACE_BEGIN
@@ -215,6 +216,31 @@ static std::string renamed_unescaped(const std::string& str)
 	return new_str;
 }
 
+static void add_prefix_recursively(RTLIL::Design* design, std::string prefix, RTLIL::Module *module, pool<RTLIL::Module *> &visited)
+{
+	if (visited.count(module))
+		return;
+	visited.insert(module);
+
+	RTLIL::IdString new_name = RTLIL::escape_id( prefix + RTLIL::unescape_id(module->name.str()));
+
+	if (design->module(new_name))
+		log_cmd_error("Cannot rename module %s to %s: target name already exists.\n", log_id(module->name), log_id(new_name));
+
+	design->rename(module, new_name);
+
+	log("Renaming module %s to %s.\n", log_id(module->name), log_id(new_name));
+
+	auto cells = module->cells();
+	for( auto cell : cells ) {
+		RTLIL::Module *child_module = design->module( cell->type );
+		if ( child_module ) {
+			add_prefix_recursively( design, prefix, child_module, visited );
+			cell->type = RTLIL::escape_id( prefix + RTLIL::unescape_id( cell->type.str() ) );
+		}
+	}
+}
+
 struct RenamePass : public Pass {
 	RenamePass() : Pass("rename", "rename object in the design") { }
 	void help() override
@@ -291,11 +317,15 @@ struct RenamePass : public Pass {
 		log("Rename all selected public wires and cells that have to be escaped in Verilog.\n");
 		log("Replaces characters with underscores or adds additional underscores and numbers.\n");
 		log("\n");
+		log("    rename -recursive prefix mod_name\n");
+		log("Recursively rename all modules in the design by adding the given prefix to their names.\n");
+		log("\n");
 	}
 	void execute(std::vector<std::string> args, RTLIL::Design *design) override
 	{
 		std::string pattern_prefix = "_", pattern_suffix = "_";
 		std::string cell_suffix = "";
+		
 		bool flag_src = false;
 		bool flag_wire = false;
 		bool flag_move_to_cell = false;
@@ -307,6 +337,7 @@ struct RenamePass : public Pass {
 		bool flag_scramble_name = false;
 		bool flag_unescape = false;
 		bool got_mode = false;
+		bool flag_recursize = false;
 		unsigned int seed = 1;
 
 		size_t argidx;
@@ -358,6 +389,11 @@ struct RenamePass : public Pass {
 				got_mode = true;
 				continue;
 			}
+			if (arg == "-recursive" && !got_mode) {
+				flag_recursize = true;
+				got_mode = true;
+				continue;
+			}
 			if (arg == "-move-to-cell" && flag_wire && !flag_move_to_cell) {
 				flag_move_to_cell = true;
 				continue;
@@ -378,7 +414,23 @@ struct RenamePass : public Pass {
 			}
 			break;
 		}
+		if (flag_recursize) {
+			if( argidx + 2 != args.size())
+				log_cmd_error("Invalid number of arguments!\n");
+			
+			std::string recursive_prefix = args[argidx++];
+			std::string mod_name = RTLIL::escape_id(args[argidx++]);
+			extra_args(args, argidx, design);
 
+			RTLIL::Module *module = design->module(mod_name);
+			if (module == nullptr)
+				log_cmd_error("No such module found: %s\n", mod_name.c_str());
+
+			pool<RTLIL::Module *> visited;
+			add_prefix_recursively(design, recursive_prefix, module, visited);
+			
+		}
+		else 
 		if (flag_src)
 		{
 			extra_args(args, argidx, design);
