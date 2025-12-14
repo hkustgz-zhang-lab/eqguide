@@ -17,6 +17,7 @@
  *
  */
 
+#include "kernel/mem.h"
 #include "kernel/register.h"
 #include "kernel/rtlil.h"
 #include "kernel/log.h"
@@ -39,6 +40,8 @@ struct CheckConfig
     RTLIL::Design *design = nullptr;
     RTLIL::Module *gold_mod = nullptr;
     RTLIL::Module *gate_mod = nullptr;
+    string gold_prefix;
+    string gate_prefix;
 };
 
 static std::string strip_backslash(const RTLIL::IdString &id)
@@ -63,7 +66,7 @@ static int exectue_and_check(const std::string & cmd, bool & correct,
 
     while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
         output += buffer;
-        // std::cout<< buffer;
+        log("%s", buffer);
         if (output.find(target_output) != std::string::npos) {
             correct = true;
         }
@@ -117,7 +120,7 @@ static RTLIL::IdString unique_cell_name(RTLIL::Module *m, const std::string &bas
 }
 
 
-// 选两个“操作数”信号：$mul 用 A/B；子模块就取前两个 input port
+// Select two "operand" signals: $mul uses A/B; submodules take the first two input ports
 static void pick_operands(RTLIL::Design *design, RTLIL::Cell *cell,
                           RTLIL::SigSpec &op1, RTLIL::SigSpec &op2)
 {
@@ -131,7 +134,6 @@ static void pick_operands(RTLIL::Design *design, RTLIL::Cell *cell,
     }
 
     if (auto *sub = design->module(cell->type)) {
-        // 按 port_id 找 input ports
         std::vector<RTLIL::Wire*> ins;
         for (auto *w : sub->wires())
             if (w->port_id > 0 && w->port_input)
@@ -143,11 +145,9 @@ static void pick_operands(RTLIL::Design *design, RTLIL::Cell *cell,
         if (ins.size() >= 2 && cell->hasPort(ins[1]->name)) op2 = cell->getPort(ins[1]->name);
     }
 
-    // 兜底：没找到就尽量用 A/B/Y
     if (!op1.size() && cell->hasPort(ID::A)) op1 = cell->getPort(ID::A);
     if (!op2.size() && cell->hasPort(ID::B)) op2 = cell->getPort(ID::B);
 
-    // 再兜底：只有一个操作数就 op2=op1；都没有就用常 0
     if (!op1.size() && !op2.size()) {
         op1 = RTLIL::SigSpec(RTLIL::State::S0);
         op2 = RTLIL::SigSpec(RTLIL::State::S0);
@@ -185,7 +185,7 @@ static void replace_mul_with_commutative_stub(RTLIL::Design *design, RTLIL::Modu
         if (cell->hasPort(ID::Y))
             add_xor_driver(cell->getPort(ID::Y), "Y");
     } else {
-        // 子模块：把每个 output port 都驱动成同一个交换律 stub
+        
         if (auto *sub = design->module(cell->type)) {
             std::vector<RTLIL::Wire*> outs;
             for (auto *w : sub->wires())
@@ -199,7 +199,7 @@ static void replace_mul_with_commutative_stub(RTLIL::Design *design, RTLIL::Modu
                 add_xor_driver(cell->getPort(w->name), strip_backslash(w->name));
             }
         } else {
-            // fallback：常见 Y
+            // fallback
             if (cell->hasPort(ID::Y))
                 add_xor_driver(cell->getPort(ID::Y), "Y");
         }
@@ -219,24 +219,17 @@ static void extract_multi(RTLIL::Design *design, RTLIL::Module *mod)
     mod->fixup_ports();
 }
 
-
-
-
-static void v2aig(const string& v_file, const string& aig_file, const string& mod_name){
-    auto yosys_exe_file = proc_self_dirname() + "yosys";
-    string cmd = stringf("%s -p 'read_verilog %s; hierarchy -top %s; synth -flatten -flatten; aigmap; write_aiger %s'", 
-                        yosys_exe_file, v_file, mod_name, aig_file);
-    // system(cmd.c_str());
-
+int exec_cmd(string &cmd){
     char buffer[1024];
 
     FILE *pipe = popen(cmd.c_str(), "r");
     if (!pipe) {
         log_error("Error executing command: %s", cmd);
-        return;
+        return -1;
     }
 
     while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
+        log("%s", buffer);
     }
 
     int status = pclose(pipe);
@@ -249,7 +242,32 @@ static void v2aig(const string& v_file, const string& aig_file, const string& mo
     if(status != 0){
         log_error("Error executing command: %s", cmd);
     }
+    return status;
 }
+
+
+static void v2aig(const string& v_file, const string& aig_file, const string& mod_name){
+    auto yosys_exe_file = proc_self_dirname() + "yosys";
+    string cmd = stringf("%s -p 'read_verilog %s; hierarchy -top %s; synth -flatten; aigmap; write_aiger %s'", 
+                        yosys_exe_file, v_file, mod_name, aig_file);
+    // system(cmd.c_str());
+
+    exec_cmd(cmd);
+}
+
+
+static void v2blif(const vector<string>& v_files, const string& blif_file, const string& mod_name){
+    string read_verilog_cmd = "";
+    for(const auto& v_file : v_files){
+        read_verilog_cmd += stringf("read_verilog %s; ", v_file);
+    }
+    auto yosys_exe_file = proc_self_dirname() + "yosys";
+    string cmd = stringf("%s -p '%s hierarchy -top %s; synth -flatten; dffunmap; write_blif -blackbox -top %s %s'", 
+                        yosys_exe_file, read_verilog_cmd, mod_name, mod_name, blif_file);
+    // system(cmd.c_str());
+    exec_cmd(cmd);
+}
+
 
 
 static string dump_aig(RTLIL::Design* design, const string &dir_name, RTLIL::Module *mod){
@@ -267,8 +285,9 @@ static string dump_aig(RTLIL::Design* design, const string &dir_name, RTLIL::Mod
     // log_files.clear(); // TODO: Maybe it's not a good ieda... 
 	// log_streams.clear(); // TODO: We can not see any log...
 
-    run_pass(stringf("flatten %s", mod->name.str()), design); // TODO: flatten all dependencies?
+    run_pass(stringf("flatten %s", mod->name.str()), design);
     run_pass(stringf("select %s", mod->name.str()), design);  // TODO: select all dependencies?
+    run_pass(stringf("proc"), design);
     run_pass(stringf("write_verilog -selected %s", v_file), design);
     run_pass(stringf("select -clear"), design);
     v2aig(v_file, aig_file, strip_backslash(mod->name));
@@ -276,6 +295,37 @@ static string dump_aig(RTLIL::Design* design, const string &dir_name, RTLIL::Mod
     log_streams = log_streams_backup;
     return aig_file;
 }
+
+static string dump_blif(RTLIL::Design* design, const string &dir_name, RTLIL::Module *mod){
+    string blif_file = dir_name + "/" 
+        + strip_backslash(mod->name)
+        + ".blif";
+    string v_file = dir_name + "/" 
+        + strip_backslash(mod->name)
+        + ".v";
+    string v_file_bb = dir_name + "/" 
+        + strip_backslash(mod->name)
+        + "_bb.v";        
+    log("Dumping module %s to BLIF file %s.\n", mod->name.str(), blif_file);
+    
+    auto log_files_backup = log_files;
+    auto log_streams_backup = log_streams;
+
+    // log_files.clear(); // TODO: Maybe it's not a good ieda... 
+    // log_streams.clear(); // TODO: We can not see any log...
+
+    run_pass(stringf("flatten %s", mod->name.str()), design);
+    run_pass(stringf("select %s", mod->name.str()), design);
+    run_pass(stringf("proc %s", mod->name.str()), design);
+    run_pass(stringf("write_verilog %s", v_file), design); // write_verilog will ignore the blackbox module
+    run_pass(stringf("write_verilog -blackboxes %s", v_file_bb), design); // write blackbox module
+    run_pass(stringf("select -clear"), design);
+    v2blif({v_file, v_file_bb}, blif_file, strip_backslash(mod->name));
+    log_files = log_files_backup;
+    log_streams = log_streams_backup;
+    return blif_file;
+}
+
 
 
 static bool check_multi(RTLIL::Design* design, RTLIL::Module* mod, string& tempdir_name){
@@ -299,7 +349,6 @@ static bool check_multi(RTLIL::Design* design, RTLIL::Module* mod, string& tempd
         ret = system(amulet_veri_cmd.c_str());
          if(WEXITSTATUS(ret) != 1){
             log("Amulet Verify failed.\n");
-                // return;
             return false;
         }
         return true;
@@ -325,15 +374,27 @@ static bool check_extract_multi(RTLIL::Design* design, RTLIL::Module* mod, strin
 }
 
 
-bool abc_cec(CheckConfig &conf){
+static bool abc_check(CheckConfig &conf, bool use_blif=false, string check_cmd="cec"){
     auto gold_mod = conf.gold_mod;
     auto gate_mod = conf.gate_mod;
 
 
-    string gold_aig = dump_aig(conf.design, conf.tempdir_name, gold_mod);
-    string gate_aig = dump_aig(conf.design, conf.tempdir_name, gate_mod);
+    string gold_file;
+    
+    string gate_file;
 
-    string abc_cmd = stringf("cec %s %s", gold_aig, gate_aig);
+    if(use_blif)
+    {
+        gold_file = dump_blif(conf.design, conf.tempdir_name, gold_mod);
+        gate_file = dump_blif(conf.design, conf.tempdir_name, gate_mod);
+    }
+    else
+    {
+        gold_file = dump_aig(conf.design, conf.tempdir_name, gold_mod);
+        gate_file = dump_aig(conf.design, conf.tempdir_name, gate_mod);
+    }
+    
+    string abc_cmd = stringf("%s %s %s", check_cmd, gold_file, gate_file);
     string cmd = stringf("%s -c '%s'", conf.abc_exe_file, abc_cmd);
     bool correct = false;
 
@@ -346,6 +407,145 @@ bool abc_cec(CheckConfig &conf){
     return correct;
 }
 
+
+static bool abc_cec(CheckConfig &conf){
+    return abc_check(conf, true, "cec");
+}
+
+static bool abc_dsec(CheckConfig &conf){
+    return abc_check(conf, true, "dsec");
+}
+
+static std::vector<RTLIL::Module*> topo_sort_modules(RTLIL::Design *design)
+{
+    TopoSort<RTLIL::Module*> ts;
+    ts.analyze_loops = true;
+
+    for (auto m : design->modules()) {
+        ts.node(m);
+    }
+
+    for (auto parent : design->modules()) {
+        for (auto cell : parent->cells()) {
+            RTLIL::Module *child = design->module(cell->type);
+            if (!child) continue;
+            ts.edge(child, parent);
+        }
+    }
+
+    bool ok = ts.sort();
+    if (!ok) {
+        for (const auto &loop : ts.loops) {
+            std::string s;
+            for (auto id : loop) s += " " + id->name.str();
+            log_warning("Module instantiation loop:%s\n", s.c_str());
+        }
+    }
+
+    return ts.sorted;
+}
+
+
+
+bool check_retime(RTLIL::Design* design, string& tempdir_name, 
+                  const string& gold_prefix,
+                  const string& gate_prefix,
+                  const string& abc_exe_file,
+                  bool nocleanup,
+                  std::set<std::pair<RTLIL::Module*, RTLIL::Module*>>&retimed_mods)
+{
+    auto sorted_mods = topo_sort_modules(design);
+
+        std::vector<RTLIL::Module*> gate_mods;
+        std::map<RTLIL::IdString, RTLIL::Module*> gold_mods;
+
+        for(auto mod : sorted_mods)
+        {
+            if(mod->name.begins_with(RTLIL::escape_id(gate_prefix)) && mod->get_bool_attribute(ID(retime)))
+            {
+                gate_mods.push_back(mod);
+            }
+            else 
+            if(mod->name.begins_with(RTLIL::escape_id(gold_prefix)))
+            {
+                gold_mods[mod->name] = mod;
+            }
+        }
+
+        for(auto gate_m : gate_mods)
+        {
+            string original_name = RTLIL::unescape_id(gate_m->name).substr(gate_prefix.size());
+            auto gold_m_it = gold_mods.find(RTLIL::escape_id(gold_prefix + original_name));
+            if(gold_m_it == gold_mods.end())
+            {
+                log_error("Can't find the corresponding gold module for gate module %s.\n", log_id(gate_m->name));
+                continue;
+            }
+            auto gold_m = gold_m_it->second;
+            
+            retimed_mods.insert({gold_m, gate_m});
+        }
+
+        bool final_result = true;
+
+        for(auto mod_pair : retimed_mods)
+        {
+            auto gold_m = mod_pair.first;
+            auto gate_m = mod_pair.second;
+            log("Checking retimed module pair: gold=%s vs gate=%s\n", log_id(gold_m->name), log_id(gate_m->name));
+            CheckConfig conf = {
+                .nocleanup = nocleanup,
+                .abc_exe_file = abc_exe_file,
+                .tempdir_name = tempdir_name,
+                .design = design,
+                .gold_mod = gold_m,
+                .gate_mod = gate_m,
+                .gold_prefix = gold_prefix,
+                .gate_prefix = gate_prefix,
+            };
+            bool dsec_result = abc_dsec(conf);
+            if(!dsec_result)
+            {
+                log("\nGUIDE_CHECK_RETIME failed for module pair: gold=%s vs gate=%s\n", 
+                    log_id(gold_m->name), log_id(gate_m->name));
+                final_result = false;
+                break;
+            }
+            else 
+            {
+                log("\nGUIDE_CHECK_RETIME passed for module pair: gold=%s vs gate=%s\n", 
+                    log_id(gold_m->name), log_id(gate_m->name));
+            }
+            
+            
+        }
+
+        return final_result;
+}
+
+
+bool check_extract_retime(RTLIL::Design* design, string& tempdir_name, 
+                  const string& gold_prefix,
+                  const string& gate_prefix,
+                  const string& abc_exe_file,
+                  bool nocleanup)
+{
+
+    std::set<std::pair<RTLIL::Module*, RTLIL::Module*>> retimed_mods;
+
+    bool check_result = check_retime(design, tempdir_name, gold_prefix, gate_prefix, 
+                    abc_exe_file, nocleanup, retimed_mods);
+    
+    for(auto mod_pair : retimed_mods)
+    {
+        for(auto mod : {mod_pair.first, mod_pair.second})
+        {
+            log("Marking module %s as (* blackbox *)\n", log_id(mod->name));
+            mod->set_bool_attribute(ID(blackbox), true);
+        }
+    }
+    return check_result;
+}
 
 struct GuideCheckMultiPass : public Pass {
     GuideCheckMultiPass() : Pass("guide_check_multi", "check and extract multiplier using verfication guide information.") { }
@@ -419,16 +619,89 @@ struct GuideCheckRetimePass : public Pass {
     {
         //   |---v---|---v---|---v---|---v---|---v---|---v---|---v---|---v---|---v---|---v---|
         log("\n");
-        log("    guide_check_retime [options] [selection]\n");
+        log("    guide_check_retime [options] gold_top_module gold_prefix gate_top_module gate_prefix\n");
         log("\n");
         log("This pass checks the retimed design using the verification guide information.\n");
         log("\n");
+        log("    -nocleanup\n");
+        log("        when this option is used, the temporary files created by this pass\n");
+        log("        are not removed. this is useful for debugging.\n");
+        log("\n");
+        log("    -exe <command>\n");
+#ifdef ABCEXTERNAL
+		log("        use the specified command instead of \"" ABCEXTERNAL "\" to execute ABC.\n");
+#else
+		log("        use the specified command instead of \"<yosys-bindir>/%syosys-abc\" to execute ABC.\n", proc_program_prefix());
+#endif	
+        log("\n");
+        log("    -assert\n");
+		log("        produce an error if any unproven structure is found\n");
+		log("\n");
     }
     void execute(std::vector<std::string> args, RTLIL::Design *design) override 
     {
         log_header(design, "Executing GUIDE_CHECK_RETIME pass.\n");
         log_push();
+        string gold_top_mod_name, gate_top_mod_name;
+        string gate_prefix, gold_prefix;
+        bool nocleanup = false;
+        bool assert_mode = false;
+        string abc_exe_file = design->scratchpad_get_string("abc.exe", yosys_abc_executable);
 
+        size_t argidx;
+        for (argidx = 1; argidx < args.size(); argidx++)
+        {
+            if (args[argidx] == "-nocleanup") {
+                nocleanup = true;
+                continue;
+            }
+            if (args[argidx] == "-exe" && argidx+1 < args.size()) {
+                abc_exe_file = args[++argidx];
+                continue;
+            }
+            break;
+        }
+        if (argidx + 4 != args.size())
+            log_cmd_error("Wrong number of arguments for guide_check_retime pass.\n");
+
+        gold_top_mod_name = args[argidx++];
+        gold_prefix = args[argidx++];
+        gate_top_mod_name = args[argidx++];
+        gate_prefix = args[argidx++];
+        RTLIL::Module *gold_mod = design->module(RTLIL::escape_id(gold_top_mod_name));
+        RTLIL::Module *gate_mod = design->module(RTLIL::escape_id(gate_top_mod_name));
+        for(auto mod : {gold_mod, gate_mod}) 
+        {
+            if (mod == nullptr)
+                log_cmd_error("Can't find module %s.\n", mod == gold_mod ? gold_top_mod_name : gate_top_mod_name);
+        }
+        
+        string tempdir_name;
+        if(nocleanup)
+            tempdir_name = "_tmp_";
+        else
+            tempdir_name = get_base_tmpdir() + "/";
+        
+        tempdir_name += proc_program_prefix() + "yosys-guide-check-XXXXXX";
+        tempdir_name = make_temp_dir(tempdir_name);
+        log("Creating temporary directory %s for GUIDE_CHECK pass.\n", tempdir_name);
+        
+        bool result = check_extract_retime(design,tempdir_name, gold_prefix, gate_prefix,
+            abc_exe_file, nocleanup);
+
+        if(!nocleanup){
+            remove_directory(tempdir_name);
+        }
+
+        if(result){
+            log("\nGUIDE_CHECK_RETIME PASSED: Retimed design is equivalent to the gold design.\n");
+        }
+        else {
+            if(assert_mode)
+                log_cmd_error("\nGUIDE_CHECK_RETIME FAILED: Retimed design is NOT equivalent to the gold design.\n");
+            else
+                log("\nGUIDE_CHECK_RETIME FAILED: Retimed design is NOT equivalent to the gold design.\n");
+        }
 
         log_pop();
     }
@@ -440,7 +713,7 @@ struct GuideCheckPass : public Pass {
 	{
 		//   |---v---|---v---|---v---|---v---|---v---|---v---|---v---|---v---|---v---|---v---|
         log("\n");
-        log("    guide_check [options] gold_module gate_module\n");
+        log("    guide_check [options] gold_top_module gold_prefix gate_top_module gate_prefix\n");
         log("\n");
         log("This pass compares two modules using the verification guide information.\n");
         log("\n");
@@ -463,7 +736,8 @@ struct GuideCheckPass : public Pass {
 	{
         log_header(design, "Executing GUIDE_CHECK pass.\n");
         log_push();
-        string gold_mod_name, gate_mod_name;
+        string gold_top_mod_name, gate_top_mod_name;
+        string gate_prefix, gold_prefix;
         bool nocleanup = false;
         bool assert_mode = false;
         string abc_exe_file = design->scratchpad_get_string("abc.exe", yosys_abc_executable);
@@ -486,18 +760,20 @@ struct GuideCheckPass : public Pass {
             break;
         }
 
-        if (argidx + 2 != args.size())
+        if (argidx + 4 != args.size())
             log_cmd_error("Wrong number of arguments for guide_check pass.\n");
         
-        gold_mod_name = args[argidx];
-        gate_mod_name = args[argidx+1];
+        gold_top_mod_name = args[argidx++];
+        gold_prefix = args[argidx++];
+        gate_top_mod_name = args[argidx++];
+        gate_prefix = args[argidx++];
 
-        RTLIL::Module *gold_mod = design->module(RTLIL::escape_id(gold_mod_name));
-        RTLIL::Module *gate_mod = design->module(RTLIL::escape_id(gate_mod_name));
+        RTLIL::Module *gold_mod = design->module(RTLIL::escape_id(gold_top_mod_name));
+        RTLIL::Module *gate_mod = design->module(RTLIL::escape_id(gate_top_mod_name));
         if (gold_mod == nullptr)
-            log_cmd_error("Can't find gold module %s.\n", gold_mod_name);
+            log_cmd_error("Can't find gold module %s.\n", gold_top_mod_name);
         if (gate_mod == nullptr)
-            log_cmd_error("Can't find gate module %s.\n", gate_mod_name);
+            log_cmd_error("Can't find gate module %s.\n", gate_top_mod_name);
 
         string tempdir_name;
         if(nocleanup)
@@ -516,9 +792,11 @@ struct GuideCheckPass : public Pass {
             .design = design,
             .gold_mod = gold_mod,
             .gate_mod = gate_mod,
+            .gold_prefix = gold_prefix,
+            .gate_prefix = gate_prefix,
         };
 
-        bool multi_result = false, cec_result = false;
+        bool multi_result = false, cec_result = false, retime_result;
         
         std::vector<RTLIL::Module*> multi_mods;
         auto all_mods = design->all_selected_modules();
@@ -535,6 +813,17 @@ struct GuideCheckPass : public Pass {
 
         (void)multi_mods;
 
+        retime_result = check_extract_retime(design,tempdir_name, gold_prefix, gate_prefix,
+            abc_exe_file, nocleanup);
+
+        if(!retime_result)
+        {
+            log("GUIDE_CHECK retime check failed.\n");
+            goto check_failed;
+        }
+        log("GUIDE_CHECK retime check passed.\n");
+
+
         cec_result = abc_cec(conf);
         if(!cec_result)
         {
@@ -550,7 +839,7 @@ struct GuideCheckPass : public Pass {
 check_failed:
         if(assert_mode)
         {
-            log_error("\nGUIDE_CHECK FAILED: Modules %s and %s are NOT equivalent.\n", 
+            log_cmd_error("\nGUIDE_CHECK FAILED: Modules %s and %s are NOT equivalent.\n", 
                 log_id(gold_mod->name), log_id(gate_mod->name));
         }
         else
