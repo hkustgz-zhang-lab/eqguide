@@ -412,6 +412,28 @@ struct GuideCheckMultiPass : public Pass {
 
 } GuideCheckMultiPass;
 
+
+struct GuideCheckRetimePass : public Pass {
+    GuideCheckRetimePass() : Pass("guide_check_retime", "check retimed design using verfication guide information.") { }
+    void help() override
+    {
+        //   |---v---|---v---|---v---|---v---|---v---|---v---|---v---|---v---|---v---|---v---|
+        log("\n");
+        log("    guide_check_retime [options] [selection]\n");
+        log("\n");
+        log("This pass checks the retimed design using the verification guide information.\n");
+        log("\n");
+    }
+    void execute(std::vector<std::string> args, RTLIL::Design *design) override 
+    {
+        log_header(design, "Executing GUIDE_CHECK_RETIME pass.\n");
+        log_push();
+
+
+        log_pop();
+    }
+} GuideCheckRetimePass;
+
 struct GuideCheckPass : public Pass {
 	GuideCheckPass() : Pass("guide_check", "equivalence checking using verfication guide information.") { }
 	void help() override
