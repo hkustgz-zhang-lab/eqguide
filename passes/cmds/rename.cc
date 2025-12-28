@@ -216,27 +216,36 @@ static std::string renamed_unescaped(const std::string& str)
 	return new_str;
 }
 
-static void add_prefix_recursively(RTLIL::Design* design, std::string prefix, RTLIL::Module *module, pool<RTLIL::Module *> &visited)
+static void add_prefix_recursively(RTLIL::Design* design, std::string prefix, RTLIL::Module *module,
+		pool<RTLIL::Module *> &visited, dict<RTLIL::IdString, RTLIL::IdString> &renamed)
 {
 	if (visited.count(module))
 		return;
 	visited.insert(module);
 
-	RTLIL::IdString new_name = RTLIL::escape_id( prefix + RTLIL::unescape_id(module->name.str()));
+	RTLIL::IdString old_name = module->name;
+	RTLIL::IdString new_name = RTLIL::escape_id(prefix + RTLIL::unescape_id(old_name.str()));
 
 	if (design->module(new_name))
-		log_cmd_error("Cannot rename module %s to %s: target name already exists.\n", log_id(module->name), log_id(new_name));
+		log_cmd_error("Cannot rename module %s to %s: target name already exists.\n", log_id(old_name), log_id(new_name));
 
+	renamed[old_name] = new_name;
 	design->rename(module, new_name);
 
-	log("Renaming module %s to %s.\n", log_id(module->name), log_id(new_name));
+	log("Renaming module %s to %s.\n", log_id(old_name), log_id(new_name));
 
 	auto cells = module->cells();
 	for( auto cell : cells ) {
-		RTLIL::Module *child_module = design->module( cell->type );
-		if ( child_module ) {
-			add_prefix_recursively( design, prefix, child_module, visited );
-			cell->type = RTLIL::escape_id( prefix + RTLIL::unescape_id( cell->type.str() ) );
+		auto renamed_it = renamed.find(cell->type);
+		if (renamed_it != renamed.end()) {
+			cell->type = renamed_it->second;
+			continue;
+		}
+
+		RTLIL::Module *child_module = design->module(cell->type);
+		if (child_module) {
+			add_prefix_recursively(design, prefix, child_module, visited, renamed);
+			cell->type = renamed.at(cell->type);
 		}
 	}
 }
@@ -427,7 +436,8 @@ struct RenamePass : public Pass {
 				log_cmd_error("No such module found: %s\n", mod_name.c_str());
 
 			pool<RTLIL::Module *> visited;
-			add_prefix_recursively(design, recursive_prefix, module, visited);
+			dict<RTLIL::IdString, RTLIL::IdString> renamed;
+			add_prefix_recursively(design, recursive_prefix, module, visited, renamed);
 			
 		}
 		else 
