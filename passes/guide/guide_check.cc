@@ -248,8 +248,13 @@ int exec_cmd(string &cmd){
 
 static void v2aig(const string& v_file, const string& aig_file, const string& mod_name){
     auto yosys_exe_file = proc_self_dirname() + "yosys";
-    string cmd = stringf("%s -p 'read_verilog %s; hierarchy -top %s; synth -flatten; aigmap; write_aiger %s'", 
+    // string cmd = stringf("%s -p 'read_verilog %s; hierarchy -top %s; synth -flatten; aigmap; write_aiger %s'", 
+    //                     yosys_exe_file, v_file, mod_name, aig_file);
+
+    string cmd = stringf("%s -p 'read_verilog %s; hierarchy -top %s; prep; proc; techmap; aigmap; write_aiger %s'", 
                         yosys_exe_file, v_file, mod_name, aig_file);
+
+
     // system(cmd.c_str());
 
     exec_cmd(cmd);
@@ -413,7 +418,7 @@ static bool abc_cec(CheckConfig &conf){
     //return abc_check(conf, true, "cec");
     return abc_check(conf, true, "dsec");
 }
-
+    
 static bool abc_dsec(CheckConfig &conf){
     return abc_check(conf, true, "dsec");
 }
