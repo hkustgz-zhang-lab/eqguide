@@ -216,10 +216,17 @@ static std::string renamed_unescaped(const std::string& str)
 	return new_str;
 }
 
+static bool is_lib_cell_module(const RTLIL::Module *module)
+{
+	return module->get_bool_attribute(ID::blackbox) || module->get_bool_attribute(ID::whitebox);
+}
+
 static void add_prefix_recursively(RTLIL::Design* design, std::string prefix, RTLIL::Module *module,
 		pool<RTLIL::Module *> &visited, dict<RTLIL::IdString, RTLIL::IdString> &renamed)
 {
 	if (visited.count(module))
+		return;
+	if (is_lib_cell_module(module))
 		return;
 	visited.insert(module);
 
@@ -245,7 +252,9 @@ static void add_prefix_recursively(RTLIL::Design* design, std::string prefix, RT
 		RTLIL::Module *child_module = design->module(cell->type);
 		if (child_module) {
 			add_prefix_recursively(design, prefix, child_module, visited, renamed);
-			cell->type = renamed.at(cell->type);
+			auto updated_it = renamed.find(cell->type);
+			if (updated_it != renamed.end())
+				cell->type = updated_it->second;
 		}
 	}
 }
@@ -328,6 +337,7 @@ struct RenamePass : public Pass {
 		log("\n");
 		log("    rename -recursive prefix mod_name\n");
 		log("Recursively rename all modules in the design by adding the given prefix to their names.\n");
+		log("Standard-cell modules marked blackbox/whitebox (e.g. loaded from Liberty) are not renamed.\n");
 		log("\n");
 	}
 	void execute(std::vector<std::string> args, RTLIL::Design *design) override
@@ -434,6 +444,10 @@ struct RenamePass : public Pass {
 			RTLIL::Module *module = design->module(mod_name);
 			if (module == nullptr)
 				log_cmd_error("No such module found: %s\n", mod_name.c_str());
+			if (is_lib_cell_module(module)) {
+				log_warning("Skipping rename of standard-cell module %s.\n", log_id(module));
+				return;
+			}
 
 			pool<RTLIL::Module *> visited;
 			dict<RTLIL::IdString, RTLIL::IdString> renamed;
