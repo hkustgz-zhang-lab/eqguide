@@ -307,9 +307,9 @@ static string dump_aig(RTLIL::Design* design, const string &dir_name, RTLIL::Mod
     string aig_file = dir_name + "/" 
         + strip_backslash(mod->name)
         + ".aig";
-    string v_file = dir_name + "/" 
-        + strip_backslash(mod->name)
-        + ".v";
+    // string v_file = dir_name + "/" 
+    //     + strip_backslash(mod->name)
+    //     + ".v";
     string mod_name = strip_backslash(mod->name);
     log("Dumping module %s to AIG file %s.\n", mod->name.str(), aig_file);
     
@@ -319,12 +319,17 @@ static string dump_aig(RTLIL::Design* design, const string &dir_name, RTLIL::Mod
     // log_files.clear(); // TODO: Maybe it's not a good ieda... 
 	// log_streams.clear(); // TODO: We can not see any log...
     RTLIL::Design *design_copy = clone_design_for_passes(design);
+    if(!lib_file.empty())
+        run_pass(stringf("read_verilog -overwrite %s", lib_file), design_copy);
     run_pass("hierarchy -top " + mod->name.str(), design_copy);
     run_pass(stringf("flatten %s", mod->name.str()), design_copy);
+    run_pass(stringf("opt"), design_copy);
     run_pass(stringf("proc"), design_copy);
     run_pass(stringf("techmap"), design_copy);
-    run_pass(stringf("write_verilog %s", v_file), design_copy);
-    v2aig(v_file, aig_file, mod_name, lib_file);
+    run_pass(stringf("aigmap"), design_copy);
+    run_pass(stringf("write_aiger %s", aig_file), design_copy);
+    // run_pass(stringf("write_verilog %s", v_file), design_copy);
+    // v2aig(v_file, aig_file, mod_name, lib_file);
     delete design_copy;
     log_files = log_files_backup;
     log_streams = log_streams_backup;
@@ -339,12 +344,12 @@ static string dump_blif(RTLIL::Design* design, const string &dir_name, RTLIL::Mo
     string blif_file = dir_name + "/" 
         + strip_backslash(mod->name)
         + ".blif";
-    string v_file = dir_name + "/" 
-        + strip_backslash(mod->name)
-        + ".v";
-    string v_file_bb = dir_name + "/" 
-        + strip_backslash(mod->name)
-        + "_bb.v";        
+    // string v_file = dir_name + "/" 
+    //     + strip_backslash(mod->name)
+    //     + ".v";
+    // string v_file_bb = dir_name + "/" 
+    //     + strip_backslash(mod->name)
+    //     + "_bb.v";        
     string mod_name = strip_backslash(mod->name);
     log("Dumping module %s to BLIF file %s.\n", mod->name.str(), blif_file);
     
@@ -354,14 +359,18 @@ static string dump_blif(RTLIL::Design* design, const string &dir_name, RTLIL::Mo
     // log_files.clear(); // TODO: Maybe it's not a good ieda... 
     // log_streams.clear(); // TODO: We can not see any log...
     RTLIL::Design *design_copy = clone_design_for_passes(design);
-    run_pass(stringf("read_verilog -overwrite %s", lib_file), design_copy); // dummy to reset the design
+    if(!lib_file.empty())
+        run_pass(stringf("read_verilog -overwrite %s", lib_file), design_copy);
     run_pass(stringf("hierarchy -top %s", mod->name.str()), design_copy);
-    run_pass(stringf("flatten %s", mod->name.str()), design_copy);
-    run_pass(stringf("proc %s", mod->name.str()), design_copy);
+    run_pass(stringf("flatten"), design_copy);
+    run_pass(stringf("proc"), design_copy);
+    run_pass(stringf("opt"), design_copy);
     run_pass(stringf("techmap"), design_copy);
-    run_pass(stringf("write_verilog %s", v_file), design_copy); // write_verilog will ignore the blackbox module
-    run_pass(stringf("write_verilog -blackboxes %s", v_file_bb), design_copy); // write blackbox module
-    v2blif({v_file, v_file_bb}, blif_file, mod_name);
+    run_pass(stringf("dffunmap"), design_copy);
+    run_pass(stringf("write_blif -blackbox -top %s %s", mod_name, blif_file), design_copy);
+    // run_pass(stringf("write_verilog %s", v_file), design_copy); // write_verilog will ignore the blackbox module
+    // run_pass(stringf("write_verilog -blackboxes %s", v_file_bb), design_copy); // write blackbox module
+    // v2blif({v_file, v_file_bb}, blif_file, mod_name);
     delete design_copy;
     log_files = log_files_backup;
     log_streams = log_streams_backup;
@@ -387,7 +396,8 @@ static string dump_smt2(RTLIL::Design* design, const string &dir_name, std::pair
     // log_streams.clear(); // TODO: We can not see any log...
 
     RTLIL::Design *design_copy = clone_design_for_passes(design);
-    run_pass(stringf("read_verilog -overwrite %s", lib_file), design_copy); // dummy to reset the design
+    if(!lib_file.empty())
+        run_pass(stringf("read_verilog -overwrite %s", lib_file), design_copy);
     run_pass(stringf("flatten %s", gold_mod->name.str()), design_copy);
     run_pass(stringf("flatten %s", gate_mod->name.str()), design_copy);
     run_pass(stringf("proc %s", gold_mod->name.str()), design_copy);
@@ -491,7 +501,21 @@ static bool abc_check(const CheckConfig &conf, bool use_blif=false, string check
 static bool abc_cec(const CheckConfig &conf){
     // TODO: We use desc here!!!!
     //return abc_check(conf, true, "cec");
-    return abc_check(conf, true, "dsec");
+    bool has_dff = false;
+    for(auto cells: conf.gold_mod->cells()){
+        if(cells->type == ID($ff) || cells->type == ID($dff) || 
+           cells->type == ID($_DFF_P_) || cells->type == ID($_DFF_N_)){
+            has_dff = true;
+            break;
+        } 
+    }
+    if(has_dff){
+        return abc_check(conf, true, "dsec");
+    }
+    else {
+        return abc_check(conf, true, "cec");
+    }
+    
 }
     
 // static bool abc_dsec(const CheckConfig &conf){
@@ -666,6 +690,9 @@ bool check_extract_retime(const CheckConfig &conf)
 
     bool check_result = check_retime(conf, retimed_mods);
     
+    std::set<RTLIL::IdString> blackbox_mods;
+
+
     for (auto mod_pair : retimed_mods)
     {
         for (auto mod_name : {mod_pair.first, mod_pair.second})
@@ -677,8 +704,23 @@ bool check_extract_retime(const CheckConfig &conf)
             }
             log("Marking module %s as (* blackbox *)\n", log_id(mod_name));
             mod->set_bool_attribute(ID(blackbox), true);
+            blackbox_mods.insert(mod_name);
         }
     }
+
+    for(auto mod : conf.design->modules())
+    {
+        for(auto cell : mod->cells())
+        {
+            if(blackbox_mods.find(cell->type) != blackbox_mods.end())
+            {
+                log("Marking cell %s in module %s as (* blackbox *)\n", 
+                    log_id(cell->name), log_id(mod->name));
+                cell->set_bool_attribute(ID(blackbox), true);
+            }
+        }
+    }
+
     return check_result;
 }
 
@@ -1055,6 +1097,8 @@ struct GuideCheckPass : public Pass {
 
         bool multi_result = false, cec_result = false, retime_result;
         
+        run_pass("proc", design);
+
         std::vector<RTLIL::Module*> multi_mods;
         auto all_mods = design->all_selected_modules();
         for(auto mod : all_mods)
