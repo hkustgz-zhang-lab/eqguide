@@ -61,7 +61,7 @@ static int wrap_mul_in_module(RTLIL::Module *module)
 
         if(origA.size()!=origB.size()){
             log_warning("$mul cell %s has mismatched widths between A and B ports. Skipping wrapping.\n", log_id(inst_name));
-            log_assert(0); // TODO:
+            // TODO: support unequal width multiplication, we also need to modified guide_check_multi pass...
             continue;
         }
 
@@ -251,7 +251,7 @@ struct GuideMultiPass : public Pass {
                 continue;
             }
 
-            run_pass(string("wreduce ") + log_id(module->name), design);
+            run_pass(stringf("wreduce %s", RTLIL::unescape_id(module->name)), design);
 
             int cnt = wrap_mul_in_module(module);
             log("Module %s: wrapped %d $mul cells\n", module->name, cnt);

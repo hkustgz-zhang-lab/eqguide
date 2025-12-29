@@ -103,10 +103,30 @@ static int exectue_and_check(const std::string & cmd, bool & correct,
     return status;
 }
 
+static bool valid_internal_multiplier_cell(RTLIL::Cell *cell)
+{
+    if(cell->type != ID($mul))
+        return false;
+
+    RTLIL::SigSpec origA = cell->getPort(ID::A);
+    RTLIL::SigSpec origB = cell->getPort(ID::B);
+    RTLIL::SigSpec origY = cell->getPort(ID::Y);
+    dict<RTLIL::IdString, RTLIL::Const> orig_params = cell->parameters;
+
+    if(orig_params[ID::A_SIGNED].as_bool() != orig_params[ID::B_SIGNED].as_bool()){
+        return false;
+    }
+
+    if(origA.size()!=origB.size()){
+        return false;
+    }
+    return true;
+}
+
 
 static bool is_multiplier_cell(RTLIL::Design *design, RTLIL::Cell *cell)
 {
-    if (cell->type == ID($mul))
+    if (valid_internal_multiplier_cell(cell))
         return true;
 
     if (cell->get_bool_attribute(ID(multiplier)))
@@ -267,39 +287,39 @@ int exec_cmd(const string &cmd){
 }
 
 
-static void v2aig(const string& v_file, const string& aig_file, const string& mod_name, const string& lib_file){
-    auto yosys_exe_file = proc_self_dirname() + "yosys";
-    // string cmd = stringf("%s -p 'read_verilog %s; hierarchy -top %s; synth -flatten; aigmap; write_aiger %s'", 
-    //                     yosys_exe_file, v_file, mod_name, aig_file);
+// static void v2aig(const string& v_file, const string& aig_file, const string& mod_name, const string& lib_file){
+//     auto yosys_exe_file = proc_self_dirname() + "yosys";
+//     // string cmd = stringf("%s -p 'read_verilog %s; hierarchy -top %s; synth -flatten; aigmap; write_aiger %s'", 
+//     //                     yosys_exe_file, v_file, mod_name, aig_file);
     
-    string cmd; 
-    cmd = stringf("%s -p '", yosys_exe_file);
-    if(!lib_file.empty()){
-        cmd += stringf("read_verilog %s; ", lib_file);
-    }
-    cmd += stringf("read_verilog %s; hierarchy -top %s; prep -flatten; proc; techmap; aigmap; write_aiger %s'", 
-                        v_file, mod_name, aig_file);
+//     string cmd; 
+//     cmd = stringf("%s -p '", yosys_exe_file);
+//     if(!lib_file.empty()){
+//         cmd += stringf("read_verilog %s; ", lib_file);
+//     }
+//     cmd += stringf("read_verilog %s; hierarchy -top %s; prep -flatten; proc; techmap; aigmap; write_aiger %s'", 
+//                         v_file, mod_name, aig_file);
 
-    // system(cmd.c_str());
+//     // system(cmd.c_str());
 
-    exec_cmd(cmd);
-}
+//     exec_cmd(cmd);
+// }
 
 // static void v2aig(const string& v_file, const string& aig_file, const string& mod_name){
 //     v2aig(v_file, aig_file, mod_name, "");
 // }
 
-static void v2blif(const vector<string>& v_files, const string& blif_file, const string& mod_name){
-    string read_verilog_cmd = "";
-    for(const auto& v_file : v_files){
-        read_verilog_cmd += stringf("read_verilog %s; ", v_file);
-    }
-    auto yosys_exe_file = proc_self_dirname() + "yosys";
-    string cmd = stringf("%s -p '%s hierarchy -top %s; synth -flatten; dffunmap; write_blif -blackbox -top %s %s'", 
-                        yosys_exe_file, read_verilog_cmd, mod_name, mod_name, blif_file);
-    // system(cmd.c_str());
-    exec_cmd(cmd);
-}
+// static void v2blif(const vector<string>& v_files, const string& blif_file, const string& mod_name){
+//     string read_verilog_cmd = "";
+//     for(const auto& v_file : v_files){
+//         read_verilog_cmd += stringf("read_verilog %s; ", v_file);
+//     }
+//     auto yosys_exe_file = proc_self_dirname() + "yosys";
+//     string cmd = stringf("%s -p '%s hierarchy -top %s; synth -flatten; dffunmap; write_blif -blackbox -top %s %s'", 
+//                         yosys_exe_file, read_verilog_cmd, mod_name, mod_name, blif_file);
+//     // system(cmd.c_str());
+//     exec_cmd(cmd);
+// }
 
 
 static string dump_aig(RTLIL::Design* design, const string &dir_name, RTLIL::Module *mod,
@@ -307,9 +327,7 @@ static string dump_aig(RTLIL::Design* design, const string &dir_name, RTLIL::Mod
     string aig_file = dir_name + "/" 
         + strip_backslash(mod->name)
         + ".aig";
-    // string v_file = dir_name + "/" 
-    //     + strip_backslash(mod->name)
-    //     + ".v";
+    
     string mod_name = strip_backslash(mod->name);
     log("Dumping module %s to AIG file %s.\n", mod->name.str(), aig_file);
     
@@ -328,8 +346,7 @@ static string dump_aig(RTLIL::Design* design, const string &dir_name, RTLIL::Mod
     run_pass(stringf("techmap"), design_copy);
     run_pass(stringf("aigmap"), design_copy);
     run_pass(stringf("write_aiger %s", aig_file), design_copy);
-    // run_pass(stringf("write_verilog %s", v_file), design_copy);
-    // v2aig(v_file, aig_file, mod_name, lib_file);
+    
     delete design_copy;
     log_files = log_files_backup;
     log_streams = log_streams_backup;
@@ -344,12 +361,6 @@ static string dump_blif(RTLIL::Design* design, const string &dir_name, RTLIL::Mo
     string blif_file = dir_name + "/" 
         + strip_backslash(mod->name)
         + ".blif";
-    // string v_file = dir_name + "/" 
-    //     + strip_backslash(mod->name)
-    //     + ".v";
-    // string v_file_bb = dir_name + "/" 
-    //     + strip_backslash(mod->name)
-    //     + "_bb.v";        
     string mod_name = strip_backslash(mod->name);
     log("Dumping module %s to BLIF file %s.\n", mod->name.str(), blif_file);
     
@@ -368,9 +379,6 @@ static string dump_blif(RTLIL::Design* design, const string &dir_name, RTLIL::Mo
     run_pass(stringf("techmap"), design_copy);
     run_pass(stringf("dffunmap"), design_copy);
     run_pass(stringf("write_blif -blackbox -top %s %s", mod_name, blif_file), design_copy);
-    // run_pass(stringf("write_verilog %s", v_file), design_copy); // write_verilog will ignore the blackbox module
-    // run_pass(stringf("write_verilog -blackboxes %s", v_file_bb), design_copy); // write blackbox module
-    // v2blif({v_file, v_file_bb}, blif_file, mod_name);
     delete design_copy;
     log_files = log_files_backup;
     log_streams = log_streams_backup;
