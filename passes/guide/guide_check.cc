@@ -376,6 +376,7 @@ static string dump_blif(RTLIL::Design* design, const string &dir_name, RTLIL::Mo
     run_pass(stringf("flatten"), design_copy);
     run_pass(stringf("proc"), design_copy);
     run_pass(stringf("opt"), design_copy);
+    run_pass(stringf("memory_map"), design_copy);
     run_pass(stringf("techmap"), design_copy);
     run_pass(stringf("dffunmap"), design_copy);
     run_pass(stringf("write_blif -blackbox -top %s %s", mod_name, blif_file), design_copy);
@@ -510,20 +511,25 @@ static bool abc_cec(const CheckConfig &conf){
     // TODO: We use desc here!!!!
     //return abc_check(conf, true, "cec");
     bool has_dff = false;
+    bool has_submodule = false;
     for(auto cells: conf.gold_mod->cells()){
-        if(cells->type == ID($ff) || cells->type == ID($dff) || 
-           cells->type == ID($_DFF_P_) || cells->type == ID($_DFF_N_)){
+        if(cells->type == ID($ff) || cells->type == ID($dff) || cells->type == ID($dffe)|| 
+           cells->type == ID($_DFF_P_) || cells->type == ID($_DFF_N_) || cells->type == ID($_DFFE_PN) ||
+           cells->type == ID($_DFFE_PP)){
             has_dff = true;
-            break;
         } 
+        if(!(conf.design->module(cells->type)->attributes.count(ID::blackbox))){
+            has_submodule = true;
+        }
+        if(has_dff && has_submodule){
+            break;
+        }
     }
-    if(has_dff){
-        return abc_check(conf, true, "dsec");
+    if (has_dff || has_submodule) {
+	    return abc_check(conf, true, "dsec");
+    } else {
+	    return abc_check(conf, true, "cec");
     }
-    else {
-        return abc_check(conf, true, "cec");
-    }
-    
 }
     
 // static bool abc_dsec(const CheckConfig &conf){
