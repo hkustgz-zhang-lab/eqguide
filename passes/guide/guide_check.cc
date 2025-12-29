@@ -42,6 +42,7 @@ struct CheckConfig
     RTLIL::Module *gate_mod = nullptr;
     string gold_prefix;
     string gate_prefix;
+    string lib_file;
 };
 
 static std::string strip_backslash(const RTLIL::IdString &id)
@@ -246,20 +247,27 @@ int exec_cmd(string &cmd){
 }
 
 
-static void v2aig(const string& v_file, const string& aig_file, const string& mod_name){
+static void v2aig(const string& v_file, const string& aig_file, const string& mod_name, const string& lib_file){
     auto yosys_exe_file = proc_self_dirname() + "yosys";
     // string cmd = stringf("%s -p 'read_verilog %s; hierarchy -top %s; synth -flatten; aigmap; write_aiger %s'", 
     //                     yosys_exe_file, v_file, mod_name, aig_file);
-
-    string cmd = stringf("%s -p 'read_verilog %s; hierarchy -top %s; prep; proc; techmap; aigmap; write_aiger %s'", 
-                        yosys_exe_file, v_file, mod_name, aig_file);
-
+    
+    string cmd; 
+    cmd = stringf("%s -p '", yosys_exe_file);
+    if(!lib_file.empty()){
+        cmd += stringf("read_verilog %s; ", lib_file);
+    }
+    cmd += stringf("read_verilog %s; hierarchy -top %s; prep -flatten; proc; techmap; aigmap; write_aiger %s'", 
+                        v_file, mod_name, aig_file);
 
     // system(cmd.c_str());
 
     exec_cmd(cmd);
 }
 
+static void v2aig(const string& v_file, const string& aig_file, const string& mod_name){
+    v2aig(v_file, aig_file, mod_name, "");
+}
 
 static void v2blif(const vector<string>& v_files, const string& blif_file, const string& mod_name){
     string read_verilog_cmd = "";
@@ -274,8 +282,8 @@ static void v2blif(const vector<string>& v_files, const string& blif_file, const
 }
 
 
-
-static string dump_aig(RTLIL::Design* design, const string &dir_name, RTLIL::Module *mod){
+static string dump_aig(RTLIL::Design* design, const string &dir_name, RTLIL::Module *mod,
+                        const string& lib_file){
     string aig_file = dir_name + "/" 
         + strip_backslash(mod->name)
         + ".aig";
@@ -291,14 +299,18 @@ static string dump_aig(RTLIL::Design* design, const string &dir_name, RTLIL::Mod
 	// log_streams.clear(); // TODO: We can not see any log...
 
     run_pass(stringf("flatten %s", mod->name.str()), design);
-    run_pass(stringf("select %s", mod->name.str()), design);  // TODO: select all dependencies?
+    //run_pass(stringf("select %s", mod->name.str()), design);  // TODO: select all dependencies?
     run_pass(stringf("proc"), design);
     run_pass(stringf("write_verilog -selected %s", v_file), design);
-    run_pass(stringf("select -clear"), design);
-    v2aig(v_file, aig_file, strip_backslash(mod->name));
+    //run_pass(stringf("select -clear"), design);
+    v2aig(v_file, aig_file, strip_backslash(mod->name), lib_file);
     log_files = log_files_backup;
     log_streams = log_streams_backup;
     return aig_file;
+}
+
+static string dump_aig(RTLIL::Design* design, const string &dir_name, RTLIL::Module *mod){
+    return dump_aig(design, dir_name, mod, "");
 }
 
 static string dump_blif(RTLIL::Design* design, const string &dir_name, RTLIL::Module *mod){
@@ -333,10 +345,10 @@ static string dump_blif(RTLIL::Design* design, const string &dir_name, RTLIL::Mo
 
 
 
-static bool check_multi(RTLIL::Design* design, RTLIL::Module* mod, string& tempdir_name){
+static bool check_multi(RTLIL::Design* design, RTLIL::Module* mod, string& tempdir_name, const string& lib_file){
     log_assert(mod->get_bool_attribute(ID(multiplier)));
     bool is_signed = mod->get_bool_attribute(ID(is_signed));    
-    auto aig_file = dump_aig(design, tempdir_name, mod);
+    auto aig_file = dump_aig(design, tempdir_name, mod, lib_file);
 
     log("Using amulet to verify the multiplier.\n");
         auto miter_tmp_file = tempdir_name + "/" 
@@ -359,10 +371,11 @@ static bool check_multi(RTLIL::Design* design, RTLIL::Module* mod, string& tempd
         return true;
 }
 
-static bool check_extract_multi(RTLIL::Design* design, RTLIL::Module* mod, string& tempdir_name, std::vector<RTLIL::Module*> &multi_mods){
+static bool check_extract_multi(RTLIL::Design* design, RTLIL::Module* mod, string& tempdir_name, std::vector<RTLIL::Module*> &multi_mods,
+                                const string& lib_file){
     if(mod->get_bool_attribute(ID(multiplier))){
         multi_mods.push_back(mod);
-        return check_multi(design, mod, tempdir_name);
+        return check_multi(design, mod, tempdir_name, lib_file);
     }
     else 
     {
@@ -564,16 +577,23 @@ struct GuideCheckMultiPass : public Pass {
         log("\n");
         log("This pass checks and extracts multiplier cells/modules using the verification guide information.\n");
         log("\n");
+        log("    -lib <sim_lib.v>\n");
+        log("        Simulation library.\n");
+        log("\n");
     }
     void execute(std::vector<std::string> args, RTLIL::Design *design) override
     {
         log_header(design, "Executing GUIDE_CHECK_MULTI pass.\n");
         log_push();
         string mod_name;
-
+        string lib_file;
         size_t argidx;
         for (argidx = 1; argidx < args.size(); argidx++)
         {
+            if (args[argidx] == "-lib" && argidx + 1 < args.size()) {
+                lib_file = args[++argidx];
+                continue;
+            }
             break;
         }
 
@@ -597,7 +617,7 @@ struct GuideCheckMultiPass : public Pass {
         {
             log("Checking module %s for multiplier extraction.\n", mod->name.str());
             bool multi_result = false;
-            multi_result = check_extract_multi(design, mod, tempdir_name, multi_mods);
+            multi_result = check_extract_multi(design, mod, tempdir_name, multi_mods, lib_file);
             if(!multi_result)
             {
                 log("\nGUIDE_CHECK_MULTI failed for module %s.\n", log_id(mod->name));
@@ -724,6 +744,9 @@ struct GuideCheckPass : public Pass {
         log("\n");
         log("This pass compares two modules using the verification guide information.\n");
         log("\n");
+        log("    -lib <sim_lib.v>\n");
+        log("        Simulation library.\n");
+        log("\n");
         log("    -nocleanup\n");
 		log("        when this option is used, the temporary files created by this pass\n");
 		log("        are not removed. this is useful for debugging.\n");
@@ -748,6 +771,7 @@ struct GuideCheckPass : public Pass {
         bool nocleanup = false;
         bool assert_mode = false;
         string abc_exe_file = design->scratchpad_get_string("abc.exe", yosys_abc_executable);
+        string lib_file;
 
         size_t argidx;
         for (argidx = 1; argidx < args.size(); argidx++)
@@ -762,6 +786,10 @@ struct GuideCheckPass : public Pass {
             }
             if (args[argidx] == "-assert") {
                 assert_mode = true;
+                continue;
+            }
+            if (args[argidx] == "-lib" && argidx + 1 < args.size()) {
+                lib_file = args[++argidx];
                 continue;
             }
             break;
@@ -801,6 +829,7 @@ struct GuideCheckPass : public Pass {
             .gate_mod = gate_mod,
             .gold_prefix = gold_prefix,
             .gate_prefix = gate_prefix,
+            .lib_file = lib_file,
         };
 
         bool multi_result = false, cec_result = false, retime_result;
@@ -809,7 +838,7 @@ struct GuideCheckPass : public Pass {
         auto all_mods = design->all_selected_modules();
         for(auto mod : all_mods)
         {
-            multi_result = check_extract_multi(design, mod, tempdir_name, multi_mods);
+            multi_result = check_extract_multi(design, mod, tempdir_name, multi_mods, lib_file);
             if(!multi_result)
             {
                 log("GUIDE_CHECK multi-module check failed.\n");
