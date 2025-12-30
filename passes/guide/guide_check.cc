@@ -21,10 +21,14 @@
 #include "kernel/register.h"
 #include "kernel/rtlil.h"
 #include "kernel/log.h"
+#include "kernel/sigtools.h"
+#include "kernel/ffinit.h"
+#include "kernel/ff.h"
 #include "kernel/yosys.h"
 #include <cassert>
 #include <cstdlib>
 #include <cstring>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -357,6 +361,747 @@ static string dump_aig(RTLIL::Design* design, const string &dir_name, RTLIL::Mod
     return dump_aig(design, dir_name, mod, "");
 }
 
+enum class gate_type_t {
+    G_NONE,
+    G_FF,
+    G_FF0,
+    G_FF1,
+    G_BUF,
+    G_NOT,
+    G_AND,
+    G_NAND,
+    G_OR,
+    G_NOR,
+    G_XOR,
+    G_XNOR,
+    G_ANDNOT,
+    G_ORNOT,
+    G_MUX,
+    G_NMUX,
+    G_AOI3,
+    G_OAI3,
+    G_AOI4,
+    G_OAI4
+};
+
+#define G(_name) gate_type_t::G_ ## _name
+
+struct gate_t
+{
+    int id;
+    gate_type_t type;
+    int in1, in2, in3, in4;
+    bool is_port;
+    bool bit_is_wire;
+    bool bit_is_1;
+    RTLIL::State init;
+    std::string bit_str;
+};
+
+struct AbcSigVal {
+    bool is_port;
+
+    AbcSigVal(bool is_port = false) : is_port(is_port) {}
+    AbcSigVal &operator|=(const AbcSigVal &other) {
+        is_port |= other.is_port;
+        return *this;
+    }
+};
+
+using AbcSigMap = SigValMap<AbcSigVal>;
+
+static int guide_abc_autoidx = 1;
+
+struct GuideGateState
+{
+    std::vector<gate_t> signal_list;
+    std::vector<RTLIL::SigBit> signal_bits;
+    dict<RTLIL::SigBit, int> signal_map;
+    FfInitVals &initvals;
+    bool clock_set = false;
+    bool clk_polarity = true;
+    bool en_polarity = true;
+    bool arst_polarity = true;
+    bool srst_polarity = true;
+    RTLIL::SigSpec clk_sig, en_sig, arst_sig, srst_sig;
+    int undef_bits_lost = 0;
+
+    GuideGateState(FfInitVals &initvals) : initvals(initvals) {}
+
+    int map_signal(const AbcSigMap &assign_map, RTLIL::SigBit bit, gate_type_t gate_type = G(NONE),
+                   int in1 = -1, int in2 = -1, int in3 = -1, int in4 = -1);
+    void mark_port(const AbcSigMap &assign_map, RTLIL::SigSpec sig);
+    bool extract_cell(const AbcSigMap &assign_map, RTLIL::Module *module, RTLIL::Cell *cell);
+    void dump_loop_graph(FILE *f, int &nr, dict<int, pool<int>> &edges, pool<int> &workpool,
+                         std::vector<int> &in_counts);
+    void handle_loops(AbcSigMap &assign_map, RTLIL::Module *module);
+};
+
+static void connect(AbcSigMap &assign_map, RTLIL::Module *module, const RTLIL::SigSig &conn)
+{
+    module->connect(conn);
+    assign_map.add(conn.first, conn.second);
+}
+
+int GuideGateState::map_signal(const AbcSigMap &assign_map, RTLIL::SigBit bit, gate_type_t gate_type, int in1, int in2, int in3, int in4)
+{
+    AbcSigVal val = assign_map.apply_and_get_value(bit);
+
+    if (bit == State::Sx)
+        undef_bits_lost++;
+
+    if (signal_map.count(bit) == 0) {
+        gate_t gate;
+        gate.id = signal_list.size();
+        gate.type = G(NONE);
+        gate.in1 = -1;
+        gate.in2 = -1;
+        gate.in3 = -1;
+        gate.in4 = -1;
+        gate.is_port = bit.wire != nullptr && val.is_port;
+        gate.bit_is_wire = bit.wire != nullptr;
+        gate.bit_is_1 = bit == State::S1;
+        gate.init = initvals(bit);
+        gate.bit_str = std::string(log_signal(bit));
+        signal_map[bit] = gate.id;
+        signal_list.push_back(std::move(gate));
+        signal_bits.push_back(bit);
+    }
+
+    gate_t &gate = signal_list[signal_map[bit]];
+
+    if (gate_type != G(NONE))
+        gate.type = gate_type;
+    if (in1 >= 0)
+        gate.in1 = in1;
+    if (in2 >= 0)
+        gate.in2 = in2;
+    if (in3 >= 0)
+        gate.in3 = in3;
+    if (in4 >= 0)
+        gate.in4 = in4;
+
+    return gate.id;
+}
+
+void GuideGateState::mark_port(const AbcSigMap &assign_map, RTLIL::SigSpec sig)
+{
+    for (auto &bit : assign_map(sig))
+        if (bit.wire != nullptr && signal_map.count(bit) > 0)
+            signal_list[signal_map[bit]].is_port = true;
+}
+
+bool GuideGateState::extract_cell(const AbcSigMap &assign_map, RTLIL::Module *module, RTLIL::Cell *cell)
+{
+    if (cell->is_builtin_ff()) {
+        FfData ff(&initvals, cell);
+        gate_type_t type = G(FF);
+        if (!ff.has_clk)
+            return false;
+        if (ff.has_gclk)
+            return false;
+        if (ff.has_aload)
+            return false;
+        if (ff.has_sr)
+            return false;
+        if (!ff.is_fine)
+            return false;
+
+        if (!clock_set) {
+            clock_set = true;
+            clk_polarity = ff.pol_clk;
+            clk_sig = assign_map(ff.sig_clk);
+            if (ff.has_ce) {
+                en_polarity = ff.pol_ce;
+                en_sig = assign_map(ff.sig_ce);
+            }
+            if (ff.has_arst) {
+                arst_polarity = ff.pol_arst;
+                arst_sig = assign_map(ff.sig_arst);
+            }
+            if (ff.has_srst) {
+                srst_polarity = ff.pol_srst;
+                srst_sig = assign_map(ff.sig_srst);
+            }
+        }
+
+        if (clk_polarity != ff.pol_clk)
+            return false;
+        if (clk_sig != assign_map(ff.sig_clk))
+            return false;
+        if (ff.has_ce) {
+            if (en_polarity != ff.pol_ce)
+                return false;
+            if (en_sig != assign_map(ff.sig_ce))
+                return false;
+        } else {
+            if (GetSize(en_sig) != 0)
+                return false;
+        }
+        if (ff.has_arst) {
+            if (arst_polarity != ff.pol_arst)
+                return false;
+            if (arst_sig != assign_map(ff.sig_arst))
+                return false;
+        } else {
+            if (GetSize(arst_sig) != 0)
+                return false;
+        }
+        if (ff.has_srst) {
+            if (srst_polarity != ff.pol_srst)
+                return false;
+            if (srst_sig != assign_map(ff.sig_srst))
+                return false;
+        } else {
+            if (GetSize(srst_sig) != 0)
+                return false;
+        }
+
+        if (ff.val_init == State::S1)
+            type = G(FF1);
+        else if (ff.val_init == State::S0)
+            type = G(FF0);
+
+        if (ff.has_arst) {
+            if (ff.val_arst == State::S1) {
+                if (type == G(FF0))
+                    return false;
+                type = G(FF1);
+            } else if (ff.val_arst == State::S0) {
+                if (type == G(FF1))
+                    return false;
+                type = G(FF0);
+            }
+        }
+        if (ff.has_srst) {
+            if (ff.val_srst == State::S1) {
+                if (type == G(FF0))
+                    return false;
+                type = G(FF1);
+            } else if (ff.val_srst == State::S0) {
+                if (type == G(FF1))
+                    return false;
+                type = G(FF0);
+            }
+        }
+
+        map_signal(assign_map, ff.sig_q, type, map_signal(assign_map, ff.sig_d));
+        ff.remove();
+        return true;
+    }
+
+    if (cell->type.in(ID($_BUF_), ID($_NOT_)))
+    {
+        RTLIL::SigSpec sig_a = cell->getPort(ID::A);
+        RTLIL::SigSpec sig_y = cell->getPort(ID::Y);
+
+        assign_map.apply(sig_a);
+        assign_map.apply(sig_y);
+
+        map_signal(assign_map, sig_y, cell->type == ID($_BUF_) ? G(BUF) : G(NOT), map_signal(assign_map, sig_a));
+
+        module->remove(cell);
+        return true;
+    }
+
+    if (cell->type.in(ID($_AND_), ID($_NAND_), ID($_OR_), ID($_NOR_), ID($_XOR_), ID($_XNOR_), ID($_ANDNOT_), ID($_ORNOT_)))
+    {
+        RTLIL::SigSpec sig_a = cell->getPort(ID::A);
+        RTLIL::SigSpec sig_b = cell->getPort(ID::B);
+        RTLIL::SigSpec sig_y = cell->getPort(ID::Y);
+
+        assign_map.apply(sig_a);
+        assign_map.apply(sig_b);
+        assign_map.apply(sig_y);
+
+        int mapped_a = map_signal(assign_map, sig_a);
+        int mapped_b = map_signal(assign_map, sig_b);
+
+        if (cell->type == ID($_AND_))
+            map_signal(assign_map, sig_y, G(AND), mapped_a, mapped_b);
+        else if (cell->type == ID($_NAND_))
+            map_signal(assign_map, sig_y, G(NAND), mapped_a, mapped_b);
+        else if (cell->type == ID($_OR_))
+            map_signal(assign_map, sig_y, G(OR), mapped_a, mapped_b);
+        else if (cell->type == ID($_NOR_))
+            map_signal(assign_map, sig_y, G(NOR), mapped_a, mapped_b);
+        else if (cell->type == ID($_XOR_))
+            map_signal(assign_map, sig_y, G(XOR), mapped_a, mapped_b);
+        else if (cell->type == ID($_XNOR_))
+            map_signal(assign_map, sig_y, G(XNOR), mapped_a, mapped_b);
+        else if (cell->type == ID($_ANDNOT_))
+            map_signal(assign_map, sig_y, G(ANDNOT), mapped_a, mapped_b);
+        else if (cell->type == ID($_ORNOT_))
+            map_signal(assign_map, sig_y, G(ORNOT), mapped_a, mapped_b);
+        else
+            log_abort();
+
+        module->remove(cell);
+        return true;
+    }
+
+    if (cell->type.in(ID($_MUX_), ID($_NMUX_)))
+    {
+        RTLIL::SigSpec sig_a = cell->getPort(ID::A);
+        RTLIL::SigSpec sig_b = cell->getPort(ID::B);
+        RTLIL::SigSpec sig_s = cell->getPort(ID::S);
+        RTLIL::SigSpec sig_y = cell->getPort(ID::Y);
+
+        assign_map.apply(sig_a);
+        assign_map.apply(sig_b);
+        assign_map.apply(sig_s);
+        assign_map.apply(sig_y);
+
+        int mapped_a = map_signal(assign_map, sig_a);
+        int mapped_b = map_signal(assign_map, sig_b);
+        int mapped_s = map_signal(assign_map, sig_s);
+
+        map_signal(assign_map, sig_y, cell->type == ID($_MUX_) ? G(MUX) : G(NMUX), mapped_a, mapped_b, mapped_s);
+
+        module->remove(cell);
+        return true;
+    }
+
+    if (cell->type.in(ID($_AOI3_), ID($_OAI3_)))
+    {
+        RTLIL::SigSpec sig_a = cell->getPort(ID::A);
+        RTLIL::SigSpec sig_b = cell->getPort(ID::B);
+        RTLIL::SigSpec sig_c = cell->getPort(ID::C);
+        RTLIL::SigSpec sig_y = cell->getPort(ID::Y);
+
+        assign_map.apply(sig_a);
+        assign_map.apply(sig_b);
+        assign_map.apply(sig_c);
+        assign_map.apply(sig_y);
+
+        int mapped_a = map_signal(assign_map, sig_a);
+        int mapped_b = map_signal(assign_map, sig_b);
+        int mapped_c = map_signal(assign_map, sig_c);
+
+        map_signal(assign_map, sig_y, cell->type == ID($_AOI3_) ? G(AOI3) : G(OAI3), mapped_a, mapped_b, mapped_c);
+
+        module->remove(cell);
+        return true;
+    }
+
+    if (cell->type.in(ID($_AOI4_), ID($_OAI4_)))
+    {
+        RTLIL::SigSpec sig_a = cell->getPort(ID::A);
+        RTLIL::SigSpec sig_b = cell->getPort(ID::B);
+        RTLIL::SigSpec sig_c = cell->getPort(ID::C);
+        RTLIL::SigSpec sig_d = cell->getPort(ID::D);
+        RTLIL::SigSpec sig_y = cell->getPort(ID::Y);
+
+        assign_map.apply(sig_a);
+        assign_map.apply(sig_b);
+        assign_map.apply(sig_c);
+        assign_map.apply(sig_d);
+        assign_map.apply(sig_y);
+
+        int mapped_a = map_signal(assign_map, sig_a);
+        int mapped_b = map_signal(assign_map, sig_b);
+        int mapped_c = map_signal(assign_map, sig_c);
+        int mapped_d = map_signal(assign_map, sig_d);
+
+        map_signal(assign_map, sig_y, cell->type == ID($_AOI4_) ? G(AOI4) : G(OAI4), mapped_a, mapped_b, mapped_c, mapped_d);
+
+        module->remove(cell);
+        return true;
+    }
+
+    return false;
+}
+
+void GuideGateState::dump_loop_graph(FILE *f, int &nr, dict<int, pool<int>> &edges, pool<int> &workpool, std::vector<int> &in_counts)
+{
+    if (f == nullptr)
+        return;
+
+    fprintf(f, "digraph graph%d {\n", nr++);
+
+    pool<int> nodes;
+    for (auto &e : edges) {
+        nodes.insert(e.first);
+        for (auto n : e.second)
+            nodes.insert(n);
+    }
+
+    for (auto n : nodes)
+        fprintf(f, "  ys__n%d [label=\"%s\\nid=%d, count=%d\"%s];\n", n, signal_list[n].bit_str.c_str(),
+                n, in_counts[n], workpool.count(n) ? ", shape=box" : "");
+
+    for (auto &e : edges)
+        for (auto n : e.second)
+            fprintf(f, "  ys__n%d -> ys__n%d;\n", e.first, n);
+
+    fprintf(f, "}\n");
+}
+
+void GuideGateState::handle_loops(AbcSigMap &assign_map, RTLIL::Module *module)
+{
+    dict<int, pool<int>> edges;
+    std::vector<int> in_edges_count(signal_list.size());
+    pool<int> workpool;
+
+    FILE *dot_f = nullptr;
+    int dot_nr = 0;
+
+    for (auto &g : signal_list) {
+        if (g.type == G(NONE) || g.type == G(FF) || g.type == G(FF0) || g.type == G(FF1)) {
+            workpool.insert(g.id);
+        } else {
+            if (g.in1 >= 0) {
+                edges[g.in1].insert(g.id);
+                in_edges_count[g.id]++;
+            }
+            if (g.in2 >= 0 && g.in2 != g.in1) {
+                edges[g.in2].insert(g.id);
+                in_edges_count[g.id]++;
+            }
+            if (g.in3 >= 0 && g.in3 != g.in2 && g.in3 != g.in1) {
+                edges[g.in3].insert(g.id);
+                in_edges_count[g.id]++;
+            }
+            if (g.in4 >= 0 && g.in4 != g.in3 && g.in4 != g.in2 && g.in4 != g.in1) {
+                edges[g.in4].insert(g.id);
+                in_edges_count[g.id]++;
+            }
+        }
+    }
+
+    dump_loop_graph(dot_f, dot_nr, edges, workpool, in_edges_count);
+
+    while (workpool.size() > 0)
+    {
+        int id = *workpool.begin();
+        workpool.erase(id);
+
+        for (int id2 : edges[id]) {
+            log_assert(in_edges_count[id2] > 0);
+            if (--in_edges_count[id2] == 0)
+                workpool.insert(id2);
+        }
+        edges.erase(id);
+
+        dump_loop_graph(dot_f, dot_nr, edges, workpool, in_edges_count);
+
+        while (workpool.size() == 0)
+        {
+            if (edges.size() == 0)
+                break;
+
+            int id1 = edges.begin()->first;
+
+            for (auto &edge_it : edges) {
+                int id2 = edge_it.first;
+                RTLIL::Wire *w1 = signal_bits[id1].wire;
+                RTLIL::Wire *w2 = signal_bits[id2].wire;
+                if (w1 == nullptr)
+                    id1 = id2;
+                else if (w2 == nullptr)
+                    continue;
+                else if (w1->name[0] == '$' && w2->name[0] == '\\')
+                    id1 = id2;
+                else if (w1->name[0] == '\\' && w2->name[0] == '$')
+                    continue;
+                else if (edges[id1].size() < edges[id2].size())
+                    id1 = id2;
+                else if (edges[id1].size() > edges[id2].size())
+                    continue;
+                else if (w2->name.str() < w1->name.str())
+                    id1 = id2;
+            }
+
+            if (edges[id1].size() == 0) {
+                edges.erase(id1);
+                continue;
+            }
+
+            log_assert(signal_bits[id1].wire != nullptr);
+
+            std::stringstream sstr;
+            sstr << "$abcloop$" << (guide_abc_autoidx++);
+            RTLIL::Wire *wire = module->addWire(sstr.str());
+
+            bool first_line = true;
+            for (int id2 : edges[id1]) {
+                if (first_line)
+                    log("Breaking loop using new signal %s: %s -> %s\n", log_signal(RTLIL::SigSpec(wire)),
+                            signal_list[id1].bit_str, signal_list[id2].bit_str);
+                else
+                    log("                               %*s  %s -> %s\n", int(log_signal(RTLIL::SigSpec(wire)).size()), "",
+                            signal_list[id1].bit_str, signal_list[id2].bit_str);
+                first_line = false;
+            }
+
+            int id3 = map_signal(assign_map, RTLIL::SigSpec(wire));
+            signal_list[id1].is_port = true;
+            signal_list[id3].is_port = true;
+            log_assert(id3 == int(in_edges_count.size()));
+            in_edges_count.push_back(0);
+            workpool.insert(id3);
+
+            for (int id2 : edges[id1]) {
+                if (signal_list[id2].in1 == id1)
+                    signal_list[id2].in1 = id3;
+                if (signal_list[id2].in2 == id1)
+                    signal_list[id2].in2 = id3;
+                if (signal_list[id2].in3 == id1)
+                    signal_list[id2].in3 = id3;
+                if (signal_list[id2].in4 == id1)
+                    signal_list[id2].in4 = id3;
+            }
+            edges[id1].swap(edges[id3]);
+
+            connect(assign_map, module, RTLIL::SigSig(signal_bits[id3], signal_bits[id1]));
+            dump_loop_graph(dot_f, dot_nr, edges, workpool, in_edges_count);
+        }
+    }
+
+    if (dot_f != nullptr)
+        fclose(dot_f);
+}
+
+static void assign_cell_connection_ports(RTLIL::Module *module,
+                                         const std::vector<std::vector<RTLIL::Cell *> *> &cell_sets,
+                                         AbcSigMap &assign_map)
+{
+    pool<RTLIL::Cell *> cells_in_no_set;
+    for (RTLIL::Cell *cell : module->cells()) {
+        cells_in_no_set.insert(cell);
+    }
+    dict<SigBit, int> signal_cell_set;
+    for (int i = 0; i < int(cell_sets.size()); ++i) {
+        for (RTLIL::Cell *cell : *cell_sets[i]) {
+            cells_in_no_set.erase(cell);
+            for (auto &port_it : cell->connections()) {
+                for (SigBit bit : port_it.second) {
+                    assign_map.apply(bit);
+                    auto it = signal_cell_set.find(bit);
+                    if (it == signal_cell_set.end())
+                        signal_cell_set[bit] = i;
+                    else if (it->second >= 0 && it->second != i) {
+                        it->second = -1;
+                        assign_map.addVal(bit, AbcSigVal(true));
+                    }
+                }
+            }
+        }
+    }
+    for (RTLIL::Cell *cell : cells_in_no_set) {
+        for (auto &port_it : cell->connections()) {
+            for (SigBit bit : port_it.second) {
+                assign_map.apply(bit);
+                auto it = signal_cell_set.find(bit);
+                if (it != signal_cell_set.end() && it->second >= 0)
+                    assign_map.addVal(bit, AbcSigVal(true));
+            }
+        }
+    }
+}
+
+static string dump_blif_2(RTLIL::Design* design, const string &dir_name, RTLIL::Module *mod){
+    string blif_file = dir_name + "/" + strip_backslash(mod->name) + ".blif";
+    log("Dumping module %s to BLIF file %s.\n", mod->name.str(), blif_file);
+
+    auto log_files_backup = log_files;
+    auto log_streams_backup = log_streams;
+
+    RTLIL::Design *design_copy = clone_design_for_passes(design);
+    run_pass(stringf("hierarchy -top %s", mod->name.str()), design_copy);
+    run_pass(stringf("flatten"), design_copy);
+    run_pass(stringf("proc"), design_copy);
+    run_pass(stringf("opt"), design_copy);
+    run_pass(stringf("memory_map"), design_copy);
+    run_pass(stringf("techmap"), design_copy);
+    run_pass(stringf("dffunmap"), design_copy);
+
+    RTLIL::Module *work_mod = design_copy->module(mod->name);
+    if (work_mod == nullptr) {
+        delete design_copy;
+        log_files = log_files_backup;
+        log_streams = log_streams_backup;
+        log_error("Can't find module %s in copied design.\n", log_id(mod->name));
+        return "";
+    }
+
+    AbcSigMap assign_map;
+    assign_map.set(work_mod);
+    FfInitVals initvals;
+    initvals.set(&assign_map, work_mod);
+
+    for (auto wire : work_mod->wires())
+        if (wire->port_id > 0 || wire->get_bool_attribute(ID::keep))
+            assign_map.addVal(SigSpec(wire), AbcSigVal(true));
+
+    std::vector<RTLIL::Cell*> cells = work_mod->selected_cells();
+    assign_cell_connection_ports(work_mod, {&cells}, assign_map);
+
+    GuideGateState state(initvals);
+    std::vector<RTLIL::Cell *> kept_cells;
+    for (auto cell : cells)
+        if (!state.extract_cell(assign_map, work_mod, cell))
+            kept_cells.push_back(cell);
+
+    if (state.undef_bits_lost)
+        log("Replacing %d occurrences of constant undef bits with constant zero bits\n", state.undef_bits_lost);
+
+    for (auto cell : kept_cells)
+        for (auto &port_it : cell->connections()) {
+            for (auto bit : assign_map(port_it.second))
+                state.map_signal(assign_map, bit);
+            state.mark_port(assign_map, port_it.second);
+        }
+
+    for (auto wire : work_mod->wires())
+        if (wire->port_id > 0 || wire->get_bool_attribute(ID::keep)) {
+            for (auto bit : assign_map(SigSpec(wire)))
+                state.map_signal(assign_map, bit);
+            state.mark_port(assign_map, SigSpec(wire));
+        }
+
+    if (GetSize(state.clk_sig) != 0)
+        state.mark_port(assign_map, state.clk_sig);
+    if (GetSize(state.en_sig) != 0)
+        state.mark_port(assign_map, state.en_sig);
+    if (GetSize(state.arst_sig) != 0)
+        state.mark_port(assign_map, state.arst_sig);
+    if (GetSize(state.srst_sig) != 0)
+        state.mark_port(assign_map, state.srst_sig);
+
+    state.handle_loops(assign_map, work_mod);
+
+	FILE *f = fopen(blif_file.c_str(), "wt");
+	if (f == nullptr) {
+		log_error("Opening %s for writing failed: %s\n", blif_file.c_str(), strerror(errno));
+        delete design_copy;
+        log_files = log_files_backup;
+        log_streams = log_streams_backup;
+		return "";
+	}
+
+	fprintf(f, ".model netlist\n");
+
+	int count_input = 0;
+    dict<int, std::string> pi_map, po_map;
+	fprintf(f, ".inputs");
+	for (auto &si : state.signal_list) {
+		if (!si.is_port || si.type != G(NONE))
+			continue;
+		fprintf(f, " ys__n%d", si.id);
+		pi_map[count_input++] = si.bit_str;
+	}
+	if (count_input == 0)
+		fprintf(f, " dummy_input\n");
+	fprintf(f, "\n");
+
+	int count_output = 0;
+	fprintf(f, ".outputs");
+	for (auto &si : state.signal_list) {
+		if (!si.is_port || si.type == G(NONE))
+			continue;
+		fprintf(f, " ys__n%d", si.id);
+		po_map[count_output++] = si.bit_str;
+	}
+	fprintf(f, "\n");
+
+	for (auto &si : state.signal_list)
+		fprintf(f, "# ys__n%-5d %s\n", si.id, si.bit_str.c_str());
+
+	for (auto &si : state.signal_list) {
+		if (!si.bit_is_wire) {
+			fprintf(f, ".names ys__n%d\n", si.id);
+			if (si.bit_is_1)
+				fprintf(f, "1\n");
+		}
+	}
+
+	int count_gates = 0;
+	for (auto &si : state.signal_list) {
+		if (si.type == G(BUF)) {
+			fprintf(f, ".names ys__n%d ys__n%d\n", si.in1, si.id);
+			fprintf(f, "1 1\n");
+		} else if (si.type == G(NOT)) {
+			fprintf(f, ".names ys__n%d ys__n%d\n", si.in1, si.id);
+			fprintf(f, "0 1\n");
+		} else if (si.type == G(AND)) {
+			fprintf(f, ".names ys__n%d ys__n%d ys__n%d\n", si.in1, si.in2, si.id);
+			fprintf(f, "11 1\n");
+		} else if (si.type == G(NAND)) {
+			fprintf(f, ".names ys__n%d ys__n%d ys__n%d\n", si.in1, si.in2, si.id);
+			fprintf(f, "0- 1\n");
+			fprintf(f, "-0 1\n");
+		} else if (si.type == G(OR)) {
+			fprintf(f, ".names ys__n%d ys__n%d ys__n%d\n", si.in1, si.in2, si.id);
+			fprintf(f, "-1 1\n");
+			fprintf(f, "1- 1\n");
+		} else if (si.type == G(NOR)) {
+			fprintf(f, ".names ys__n%d ys__n%d ys__n%d\n", si.in1, si.in2, si.id);
+			fprintf(f, "00 1\n");
+		} else if (si.type == G(XOR)) {
+			fprintf(f, ".names ys__n%d ys__n%d ys__n%d\n", si.in1, si.in2, si.id);
+			fprintf(f, "01 1\n");
+			fprintf(f, "10 1\n");
+		} else if (si.type == G(XNOR)) {
+			fprintf(f, ".names ys__n%d ys__n%d ys__n%d\n", si.in1, si.in2, si.id);
+			fprintf(f, "00 1\n");
+			fprintf(f, "11 1\n");
+		} else if (si.type == G(ANDNOT)) {
+			fprintf(f, ".names ys__n%d ys__n%d ys__n%d\n", si.in1, si.in2, si.id);
+			fprintf(f, "10 1\n");
+		} else if (si.type == G(ORNOT)) {
+			fprintf(f, ".names ys__n%d ys__n%d ys__n%d\n", si.in1, si.in2, si.id);
+			fprintf(f, "1- 1\n");
+			fprintf(f, "-0 1\n");
+		} else if (si.type == G(MUX)) {
+			fprintf(f, ".names ys__n%d ys__n%d ys__n%d ys__n%d\n", si.in1, si.in2, si.in3, si.id);
+			fprintf(f, "1-0 1\n");
+			fprintf(f, "-11 1\n");
+		} else if (si.type == G(NMUX)) {
+			fprintf(f, ".names ys__n%d ys__n%d ys__n%d ys__n%d\n", si.in1, si.in2, si.in3, si.id);
+			fprintf(f, "0-0 1\n");
+			fprintf(f, "-01 1\n");
+		} else if (si.type == G(AOI3)) {
+			fprintf(f, ".names ys__n%d ys__n%d ys__n%d ys__n%d\n", si.in1, si.in2, si.in3, si.id);
+			fprintf(f, "-00 1\n");
+			fprintf(f, "0-0 1\n");
+		} else if (si.type == G(OAI3)) {
+			fprintf(f, ".names ys__n%d ys__n%d ys__n%d ys__n%d\n", si.in1, si.in2, si.in3, si.id);
+			fprintf(f, "00- 1\n");
+			fprintf(f, "--0 1\n");
+		} else if (si.type == G(AOI4)) {
+			fprintf(f, ".names ys__n%d ys__n%d ys__n%d ys__n%d ys__n%d\n", si.in1, si.in2, si.in3, si.in4, si.id);
+			fprintf(f, "-0-0 1\n");
+			fprintf(f, "-00- 1\n");
+			fprintf(f, "0--0 1\n");
+			fprintf(f, "0-0- 1\n");
+		} else if (si.type == G(OAI4)) {
+			fprintf(f, ".names ys__n%d ys__n%d ys__n%d ys__n%d ys__n%d\n", si.in1, si.in2, si.in3, si.in4, si.id);
+			fprintf(f, "00-- 1\n");
+			fprintf(f, "--00 1\n");
+		} else if (si.type == G(FF)) {
+			fprintf(f, ".latch ys__n%d ys__n%d 2\n", si.in1, si.id);
+		} else if (si.type == G(FF0)) {
+			fprintf(f, ".latch ys__n%d ys__n%d 0\n", si.in1, si.id);
+		} else if (si.type == G(FF1)) {
+			fprintf(f, ".latch ys__n%d ys__n%d 1\n", si.in1, si.id);
+		} else if (si.type != G(NONE))
+			log_abort();
+		if (si.type != G(NONE))
+			count_gates++;
+	}
+
+	fprintf(f, ".end\n");
+	fclose(f);
+
+	log("Extracted %d gates and %d wires to a netlist network with %d inputs and %d outputs.\n",
+			count_gates, GetSize(state.signal_list), count_input, count_output);
+    delete design_copy;
+    log_files = log_files_backup;
+    log_streams = log_streams_backup;
+    return blif_file;
+}
+
 static string dump_blif(RTLIL::Design* design, const string &dir_name, RTLIL::Module *mod, const string& lib_file){
     string blif_file = dir_name + "/" 
         + strip_backslash(mod->name)
@@ -483,8 +1228,14 @@ static bool abc_check(const CheckConfig &conf, bool use_blif=false, string check
 
     if(use_blif)
     {
-        gold_file = dump_blif(conf.design, conf.tempdir_name, gold_mod, conf.lib_file);
-        gate_file = dump_blif(conf.design, conf.tempdir_name, gate_mod, conf.lib_file);
+        if(conf.lib_file.empty()) {
+            gold_file = dump_blif_2(conf.design, conf.tempdir_name, gold_mod);
+            gate_file = dump_blif_2(conf.design, conf.tempdir_name, gate_mod);
+        }
+        else {
+            gold_file = dump_blif(conf.design, conf.tempdir_name, gold_mod, conf.lib_file);
+            gate_file = dump_blif(conf.design, conf.tempdir_name, gate_mod, conf.lib_file);
+        }
     }
     else
     {
@@ -527,7 +1278,7 @@ static bool abc_cec(const CheckConfig &conf){
         }
     }
     if (has_dff || has_submodule) {
-	    return abc_check(conf, true, "dsec");
+	    return abc_check(conf, true, "dsec -n");
     } else {
 	    return abc_check(conf, true, "cec");
     }
