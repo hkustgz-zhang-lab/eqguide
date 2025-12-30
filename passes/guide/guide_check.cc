@@ -518,7 +518,8 @@ static bool abc_cec(const CheckConfig &conf){
            cells->type == ID($_DFFE_PP)){
             has_dff = true;
         } 
-        if(!(conf.design->module(cells->type)->attributes.count(ID::blackbox))){
+        auto submod = conf.design->module(cells->type);
+        if (submod != nullptr && !(submod->attributes.count(ID::blackbox))) {
             has_submodule = true;
         }
         if(has_dff && has_submodule){
@@ -1064,6 +1065,10 @@ struct GuideCheckPass : public Pass {
             break;
         }
 
+        auto design_backup = design; 
+        
+        design = clone_design_for_passes(design_backup);
+
         if (argidx + 4 != args.size())
             log_cmd_error("Wrong number of arguments for guide_check pass.\n");
         
@@ -1166,6 +1171,9 @@ end_pass:
 			log("Removing temp directory.\n");
 			remove_directory(conf.tempdir_name);
 		}
+
+        delete design;
+        design = design_backup;
         log_pop();
 	}
 } GuideCheckPass;
