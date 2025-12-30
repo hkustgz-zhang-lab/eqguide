@@ -1373,12 +1373,13 @@ bool check_retime(const CheckConfig &conf,
 
         for(auto mod : sorted_mods)
         {
-            if(mod->name.begins_with(RTLIL::escape_id(conf.gate_prefix)) && mod->get_bool_attribute(ID(retime)))
+            if((mod->name.begins_with(RTLIL::escape_id(conf.gate_prefix)) || mod->name == conf.gate_mod->name )
+                && mod->get_bool_attribute(ID(retime)))
             {
                 gate_mods.push_back(mod);
             }
             else 
-            if(mod->name.begins_with(RTLIL::escape_id(conf.gold_prefix)))
+            if((mod->name.begins_with(RTLIL::escape_id(conf.gold_prefix)) || mod->name == conf.gold_mod->name ))
             {
                 gold_mods[mod->name] = mod;
             }
@@ -1386,10 +1387,27 @@ bool check_retime(const CheckConfig &conf,
 
         for(auto gate_m : gate_mods)
         {
-            string original_name = RTLIL::unescape_id(gate_m->name).substr(conf.gate_prefix.size());
-            auto gold_m_it = gold_mods.find(RTLIL::escape_id(conf.gold_prefix + original_name));
+            string original_name = gate_m ->name == conf.gate_mod->name ? 
+                RTLIL::unescape_id(conf.gold_mod->name) :
+                RTLIL::unescape_id(gate_m->name).substr(conf.gate_prefix.size()
+            );
+            
+            auto gold_m_it = gold_mods.find(
+                original_name == conf.gold_mod->name.str() ?
+                conf.gold_mod->name :
+                RTLIL::escape_id(conf.gold_prefix + original_name)
+            );
             if(gold_m_it == gold_mods.end())
             {
+                
+                for(auto gm_pair : gold_mods)
+                {
+                    log("Available gold module: %s\n", log_id(gm_pair.first));
+                }
+                for(auto gm : gate_mods)
+                {
+                    log("Available gate module: %s\n", log_id(gm->name));
+                }
                 log_error("Can't find the corresponding gold module for gate module %s.\n", log_id(gate_m->name));
                 continue;
             }
@@ -1726,7 +1744,7 @@ struct GuideCheckPass : public Pass {
 	{
 		//   |---v---|---v---|---v---|---v---|---v---|---v---|---v---|---v---|---v---|---v---|
         log("\n");
-        log("    guide_check [options] gold_top_module gold_prefix gate_top_module gate_prefix\n");
+        log("    guide_check [options] <[gold_top_module gold_prefix gate_top_module gate_prefix]/[gold_top_module gate_top_module]>\n");
         log("\n");
         log("This pass compares two modules using the verification guide information.\n");
         log("\n");
@@ -1820,13 +1838,21 @@ struct GuideCheckPass : public Pass {
         
         design = clone_design_for_passes(design_backup);
 
-        if (argidx + 4 != args.size())
+        if (argidx + 2 == args.size()) {
+            gold_top_mod_name = args[argidx++];
+            gate_top_mod_name = args[argidx++];
+            gold_prefix = gold_top_mod_name + ".";
+            gate_prefix = gate_top_mod_name + ".";
+        } 
+        else if (argidx + 4 == args.size()) {
+            gold_top_mod_name = args[argidx++];
+            gold_prefix = args[argidx++];
+            gate_top_mod_name = args[argidx++];
+            gate_prefix = args[argidx++];
+        }
+        else { 
             log_cmd_error("Wrong number of arguments for guide_check pass.\n");
-        
-        gold_top_mod_name = args[argidx++];
-        gold_prefix = args[argidx++];
-        gate_top_mod_name = args[argidx++];
-        gate_prefix = args[argidx++];
+        }
 
         RTLIL::Module *gold_mod = design->module(RTLIL::escape_id(gold_top_mod_name));
         RTLIL::Module *gate_mod = design->module(RTLIL::escape_id(gate_top_mod_name));
