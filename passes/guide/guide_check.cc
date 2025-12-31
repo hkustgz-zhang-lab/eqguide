@@ -401,14 +401,15 @@ static string dump_blif_module(RTLIL::Design* design, const string &dir_name, RT
     // log_files.clear(); // TODO: Maybe it's not a good ieda... 
     // log_streams.clear(); // TODO: We can not see any log...
     RTLIL::Design *design_copy = clone_design_for_passes(design);
-    if(!lib_file.empty())
-        run_pass(stringf("read_verilog -overwrite %s", lib_file), design_copy);
+    (void)lib_file;
+    // if(!lib_file.empty())
+    //     run_pass(stringf("read_verilog -overwrite %s", lib_file), design_copy);
     run_pass(stringf("hierarchy -top %s", mod->name.str()), design_copy);
-    run_pass(stringf("flatten"), design_copy);
-    run_pass(stringf("hierarchy -top %s", mod->name.str()), design_copy);
-    run_pass(stringf("proc"), design_copy);
-    run_pass(stringf("opt"), design_copy);
-    run_pass(stringf("memory_map"), design_copy);
+    // run_pass(stringf("flatten"), design_copy);
+    // run_pass(stringf("hierarchy -top %s", mod->name.str()), design_copy);
+    // run_pass(stringf("proc"), design_copy);
+    // run_pass(stringf("opt"), design_copy);
+    // run_pass(stringf("memory_map"), design_copy);
 
     for(auto mod_: design_copy->modules()){
         if(mod_!= mod){
@@ -1306,7 +1307,13 @@ struct GuideCheckPass : public Pass {
 
         bool multi_result = false, cec_result = false, retime_result;
         
+        if(!lib_file.empty()){
+            run_pass("read_verilog -overwrite " + lib_file, design);
+        }
         run_pass("proc", design);
+        run_pass("memory_map", design);
+        run_pass("opt_expr", design);
+
 
         std::vector<RTLIL::Module*> multi_mods;
         auto all_mods = design->all_selected_modules();
