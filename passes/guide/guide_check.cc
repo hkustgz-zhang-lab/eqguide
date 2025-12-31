@@ -23,6 +23,7 @@
 #include "kernel/log.h"
 #include "kernel/yosys.h"
 #include <cassert>
+#include <cstddef>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -387,6 +388,42 @@ static string dump_blif(RTLIL::Design* design, const string &dir_name, RTLIL::Mo
     return blif_file;
 }
 
+static string dump_blif_module(RTLIL::Design* design, const string &dir_name, RTLIL::Module *mod, const string& lib_file){
+    string blif_file = dir_name + "/" 
+        + strip_backslash(mod->name)
+        + ".blif";
+    string mod_name = strip_backslash(mod->name);
+    log("Dumping module %s to BLIF file %s.\n", mod->name.str(), blif_file);
+    
+    auto log_files_backup = log_files;
+    auto log_streams_backup = log_streams;
+
+    // log_files.clear(); // TODO: Maybe it's not a good ieda... 
+    // log_streams.clear(); // TODO: We can not see any log...
+    RTLIL::Design *design_copy = clone_design_for_passes(design);
+    if(!lib_file.empty())
+        run_pass(stringf("read_verilog -overwrite %s", lib_file), design_copy);
+    run_pass(stringf("hierarchy -top %s", mod->name.str()), design_copy);
+    run_pass(stringf("flatten"), design_copy);
+    run_pass(stringf("hierarchy -top %s", mod->name.str()), design_copy);
+    run_pass(stringf("proc"), design_copy);
+    run_pass(stringf("opt"), design_copy);
+    run_pass(stringf("memory_map"), design_copy);
+
+    for(auto mod_: design_copy->modules()){
+        if(mod_!= mod){
+            mod_->set_bool_attribute(ID(blackbox), true);
+        }
+    }
+    run_pass(stringf("techmap"), design_copy);
+    run_pass(stringf("dffunmap"), design_copy);
+    run_pass(stringf("write_blif -blackbox -top %s %s", mod_name, blif_file), design_copy);
+    delete design_copy;
+    log_files = log_files_backup;
+    log_streams = log_streams_backup;
+    return blif_file;
+}
+
 
 static string dump_smt2(RTLIL::Design* design, const string &dir_name, std::pair<RTLIL::Module*, RTLIL::Module*> mod_pair,
                         const string& lib_file){
@@ -508,7 +545,7 @@ static bool abc_check(const CheckConfig &conf, bool use_blif=false, string check
 }
 
 
-static bool abc_cec(const CheckConfig &conf){
+[[maybe_unused]]static bool abc_cec_full(const CheckConfig &conf){
     // TODO: We use desc here!!!!
     //return abc_check(conf, true, "cec");
     bool has_dff = false;
@@ -533,7 +570,133 @@ static bool abc_cec(const CheckConfig &conf){
 	    return abc_check(conf, true, "cec");
     }
 }
+
+
+
+static bool abc_cec_module(const CheckConfig &conf){
     
+    auto gold_mod = conf.gold_mod;
+    auto gate_mod = conf.gate_mod;
+    auto design = conf.design;
+
+    // for(auto mod: design->modules()){
+    //     if(mod!= gold_mod && mod != gate_mod){
+    //         mod->set_bool_attribute(ID(blackbox), true);
+    //     }
+    // }
+    auto gold_file = dump_blif_module(design, conf.tempdir_name, gold_mod, conf.lib_file);
+    auto gate_file = dump_blif_module(design, conf.tempdir_name, gate_mod, conf.lib_file);
+
+    bool has_dff = false;
+    bool has_submodule = false;
+    for(auto cells: conf.gold_mod->cells()){
+        if(cells->type == ID($ff) || cells->type == ID($dff) || cells->type == ID($dffe)|| 
+           cells->type == ID($_DFF_P_) || cells->type == ID($_DFF_N_) || cells->type == ID($_DFFE_PN) ||
+           cells->type == ID($_DFFE_PP)){
+            has_dff = true;
+        } 
+        auto submod = conf.design->module(cells->type);
+        if (submod != nullptr && !(submod->attributes.count(ID::blackbox))) {
+            has_submodule = true;
+        }
+        if(has_dff && has_submodule){
+            break;
+        }
+    }
+
+
+    string abc_cmd = //(has_dff) ? stringf("dsec %s %s", gold_file, gate_file) :
+                                                stringf("cec %s %s", gold_file, gate_file);
+    string cmd = stringf("%s -c '%s'", conf.abc_exe_file, abc_cmd);
+    bool correct = false;
+    log("Executing ABC command: '%s'\n", abc_cmd);
+    bool abc_ret = exectue_and_check(cmd, correct, "Networks are equivalent");
+    if (abc_ret != 0) {
+        log_error("Error executing ABC command: %s\n", cmd);
+    }
+    return correct;
+}
+    
+
+static bool abc_cec(const CheckConfig &conf){
+    // find equivalence-checking pair
+    auto design = conf.design;
+
+    vector<std::pair<RTLIL::IdString, RTLIL::IdString>> equiv_mods;
+
+    for( auto mod : design->modules()){
+        if (mod->name.begins_with(RTLIL::escape_id(conf.gold_prefix)) ||
+            mod->name == conf.gold_mod->name ) {
+            RTLIL::IdString original_name = 
+                mod->name == conf.gold_mod->name ? 
+                conf.gold_mod->name :
+                RTLIL::escape_id(strip_backslash(mod->name).substr(conf.gold_prefix.size()));
+            
+            RTLIL::IdString gate_name = mod->name == conf.gold_mod->name ?
+                conf.gate_mod->name :
+                RTLIL::escape_id(conf.gate_prefix + strip_backslash(original_name));
+            if (design->module(gate_name) != nullptr) {
+                equiv_mods.push_back({mod->name, gate_name});
+            }
+        }
+            
+    }
+
+    log("Found %zu equivalence module pairs for CEC.\n", equiv_mods.size());
+    for(const auto &mod_pair : equiv_mods){
+        log("  gold=%s  gate=%s\n", 
+            log_id(mod_pair.first), log_id(mod_pair.second));
+    }
+
+    CheckConfig conf_ = {
+        .nocleanup = conf.nocleanup,
+        .abc_exe_file = conf.abc_exe_file,
+        .tempdir_name = conf.tempdir_name,
+        .design = nullptr,
+        .gold_mod = nullptr,
+        .gate_mod = nullptr,
+        .gold_prefix = conf.gold_prefix,
+        .gate_prefix = conf.gate_prefix,
+        .lib_file = conf.lib_file,
+        .seq_check_cfg = conf.seq_check_cfg
+    };
+
+    for(auto mod_pair : equiv_mods){
+        auto gold_name = mod_pair.first;
+        auto gate_name = mod_pair.second;
+
+        auto design_ = clone_design_for_passes(design); 
+
+        auto gold_m = design_->module(gold_name);
+        auto gate_m = design_->module(gate_name);
+        
+        // Have checked the existence before, should not append
+        assert(gold_m && gate_m);
+
+        conf_.gold_mod = gold_m;
+        conf_.gate_mod = gate_m;
+        conf_.design = design_;
+
+        bool cec_result = abc_cec_module(conf_);
+
+        delete design_;
+        
+        if(!cec_result){
+            log("\nGUIDE_CHECK failed for module pair: gold=%s vs gate=%s\n", 
+                log_id(gold_name), log_id(gate_name));
+            return false;
+        }
+        else 
+        {
+            log("\nGUIDE_CHECK passed for module pair: gold=%s vs gate=%s\n", 
+                log_id(gold_name), log_id(gate_name));
+        }
+
+
+    }
+    
+    return true;    
+}
 // static bool abc_dsec(const CheckConfig &conf){
 //     return abc_check(conf, true, "dsec");
 // }
