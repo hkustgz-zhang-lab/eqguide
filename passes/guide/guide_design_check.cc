@@ -60,6 +60,10 @@ struct GuideRetimePass : public Pass {
         log("        allow mismatch in early cycles; prove that once outputs are equal\n");
         log("        for K cycles they will never diverge (k-induction).\n");
         log("\n");
+        log("    -nocleanup\n");
+        log("        when this option is used, the temporary files created by this pass\n");
+        log("        are not removed. this is useful for debugging.\n");
+        log("\n");
 	}
 	void execute(std::vector<std::string> args, RTLIL::Design *design) override
 	{
@@ -68,6 +72,7 @@ struct GuideRetimePass : public Pass {
 		size_t argidx;
         string lib_file;
         bool weak_mode = false;
+        bool nocleanup = false;
 		for (argidx = 1; argidx < args.size(); argidx++)
 		{
             if (args[argidx] == "-lib" && argidx + 1 < args.size()) {
@@ -76,6 +81,10 @@ struct GuideRetimePass : public Pass {
             }
             if (args[argidx] == "-weak") {
                 weak_mode = true;
+                continue;
+            }
+            if (args[argidx] == "-nocleanup") {
+                nocleanup = true;
                 continue;
             }
             break;
@@ -93,7 +102,9 @@ struct GuideRetimePass : public Pass {
             run_pass("design -reset",design);
             run_pass("design -import " + gold_name, design);
             run_pass("design -import " + gate_name, design);
-            string guide_check_cmd = "guide_check -assert -nocleanup";
+            string guide_check_cmd = "guide_check -assert";
+            if(nocleanup)
+                guide_check_cmd += " -nocleanup";
             if(!lib_file.empty())
                 guide_check_cmd += " -lib " + lib_file;
             if(weak_mode)
