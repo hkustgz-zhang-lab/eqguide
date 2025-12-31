@@ -344,6 +344,7 @@ static string dump_aig(RTLIL::Design* design, const string &dir_name, RTLIL::Mod
     run_pass(stringf("opt"), design_copy);
     run_pass(stringf("proc"), design_copy);
     run_pass(stringf("techmap"), design_copy);
+    run_pass(stringf("opt_expr"), design_copy);
     run_pass(stringf("aigmap"), design_copy);
     run_pass(stringf("write_aiger %s", aig_file), design_copy);
     
