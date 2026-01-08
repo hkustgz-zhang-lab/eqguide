@@ -1,6 +1,6 @@
 [submodule "abc"]
 	path = abc
-	url = https://github.com/YosysHQ/abc
+	url = ssh://git@eptansuo.life:2233/home/git/abc-guide.git
 # Don't use paths as names to avoid git archive problems
 [submodule "cxxopts"]
 	path = libs/cxxopts

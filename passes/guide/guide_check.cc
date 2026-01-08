@@ -17,16 +17,23 @@
  *
  */
 
+#include "kernel/celltypes.h"
 #include "kernel/mem.h"
 #include "kernel/register.h"
 #include "kernel/rtlil.h"
 #include "kernel/log.h"
+#include "kernel/ff.h"
+#include "kernel/sigtools.h"
 #include "kernel/yosys.h"
 #include <cassert>
 #include <cstddef>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <tuple>
+#include "kernel/modtools.h"
+#include <utility>
 #include <vector>
 
 USING_YOSYS_NAMESPACE
@@ -52,6 +59,45 @@ struct CheckConfig
     string gate_prefix;
     string lib_file;
     SeqCheckConfig seq_check_cfg;
+    RTLIL::Design *lib_design = nullptr;
+};
+
+struct ModMap{
+    dict<RTLIL::IdString, RTLIL::IdString> mod_map_gold; // gold -> gate
+    dict<RTLIL::IdString, RTLIL::IdString> mod_map_gate; // gate -> gold
+    pool<RTLIL::IdString> mapped_mods_gold;
+    pool<RTLIL::IdString> mapped_mods_gate;
+    pool<RTLIL::IdString> unmapped_mods_gate;
+    pool<RTLIL::IdString> unmapped_mods_gold;
+};
+
+enum class MatchType {
+    NONE,
+    PO,
+    PI,
+    DFF,
+    DFF_PO,
+    SUBCKT_PIPO,
+};
+
+struct CutPoint{
+    RTLIL::IdString name;
+    RTLIL::SigBit gold_sig;
+    RTLIL::SigBit gate_sig;
+    MatchType type = MatchType::NONE;
+    RTLIL::Cell* gold_ff_cell = nullptr;
+    RTLIL::Cell* gate_ff_cell = nullptr;
+    RTLIL::IdString gold_wire_name;
+    int gold_bit_index = 0;
+    RTLIL::IdString gate_wire_name;
+    int gate_bit_index = 0;
+};
+
+struct NamedSig {
+    RTLIL::SigBit sig;
+    MatchType type = MatchType::NONE;
+    RTLIL::IdString wire_name;
+    int bit_index = 0;
 };
 
 static std::string strip_backslash(const RTLIL::IdString &id)
@@ -59,6 +105,59 @@ static std::string strip_backslash(const RTLIL::IdString &id)
     std::string s = id.str();
     if (!s.empty() && s[0] == '\\') s = s.substr(1);
     return s;
+}
+static RTLIL::Design *empty_design()
+{
+    auto *design = new RTLIL::Design;
+    design->push_full_selection();
+    return design;
+}
+
+static RTLIL::SigSpec resize_u0(RTLIL::SigSpec src, int width);
+
+static void flatten_std_cells(RTLIL::Design *design, RTLIL::Design *lib_design)
+{
+    assert(design);
+    assert(lib_design);
+    pool<RTLIL::IdString> std_cells;
+    for (auto mod : lib_design->modules())
+    {
+        std_cells.insert(mod->name);
+    }
+
+    // Real Modules. Exclude standard cells.
+    std::vector<RTLIL::Module*> modules;
+    for (auto mod : design->modules())
+    {
+        if(std_cells.count(mod->name) != 0)
+            continue;
+        modules.push_back(mod);
+    }
+
+    std::vector<bool> keep_hierarchy_flags(modules.size(), false);
+    for(size_t i = 0; i < modules.size(); i++){
+        RTLIL::Module *mod = modules[i];
+        if(mod->get_bool_attribute(ID(keep_hierarchy))){
+            keep_hierarchy_flags[i] = true;
+        }
+    }
+
+    for(auto mod : modules)
+    {
+        mod->set_bool_attribute(ID(keep_hierarchy), true);
+    }
+
+    for (auto mod : modules)
+    {
+        if(mod->get_bool_attribute(ID(blackbox)))
+            continue;
+        run_pass(stringf("flatten %s", mod->name.str()), design);
+    }
+
+    for(size_t i = 0; i < modules.size(); i++){
+        RTLIL::Module *mod = modules[i];
+        mod->set_bool_attribute(ID(keep_hierarchy), keep_hierarchy_flags[i]);
+    }
 }
 
 static RTLIL::Design *clone_design_for_passes(RTLIL::Design *design)
@@ -72,6 +171,736 @@ static RTLIL::Design *clone_design_for_passes(RTLIL::Design *design)
     copy->selected_active_module.clear();
     copy->push_full_selection();
     return copy;
+}
+
+static void lib_import_to_design(RTLIL::Design *design, RTLIL::Design *lib_design)
+{
+    assert(design);
+    assert(lib_design);
+    for (auto mod : lib_design->modules())
+    {
+        if(design->module(mod->name) != nullptr){
+            design->remove(design->module(mod->name));
+        }
+        RTLIL::Module *t = mod->clone();
+        t->design = design;
+        design->add(t);
+    }
+}
+
+RTLIL::IdString get_orignal_mod_name(const RTLIL::IdString &mod_name,const RTLIL::IdString root_mod_name, const string& prefix)
+{
+
+    if (mod_name == root_mod_name) {
+        return root_mod_name;
+    }
+    else if (mod_name.begins_with(RTLIL::escape_id(prefix))) {
+        return RTLIL::escape_id(strip_backslash(mod_name).substr(prefix.size()));
+    }
+    else {
+        return RTLIL::IdString();
+    }
+}
+
+ModMap hier_mod_map(RTLIL::Design *design, CheckConfig& conf)
+{
+    assert(design);
+    ModMap mod_map;
+    
+    auto gold2gate = &mod_map.mod_map_gold;
+    auto gate2gold = &mod_map.mod_map_gate;
+    
+    for( auto mod : design->modules()){
+        if (mod->name.begins_with(RTLIL::escape_id(conf.gold_prefix)) ||
+            mod->name == conf.gold_mod->name ) {
+            RTLIL::IdString original_name = get_orignal_mod_name(
+                mod->name, conf.gold_mod->name, conf.gold_prefix);
+                
+            RTLIL::IdString gate_name = mod->name == conf.gold_mod->name ?
+                conf.gate_mod->name :
+                RTLIL::escape_id(conf.gate_prefix + strip_backslash(original_name));
+            if (design->module(gate_name) != nullptr) {
+                (*gold2gate)[mod->name] = gate_name;
+                mod_map.mapped_mods_gold.insert(mod->name);
+                mod_map.mapped_mods_gate.insert(gate_name);
+            }
+            else {
+                mod_map.unmapped_mods_gold.insert(mod->name);
+            }
+        }
+            
+    }
+
+    for( auto mod : design->modules()){
+        if (mod->name.begins_with(RTLIL::escape_id(conf.gate_prefix)) ||
+            mod->name == conf.gate_mod->name ) {
+            RTLIL::IdString original_name = get_orignal_mod_name(
+                mod->name, conf.gate_mod->name, conf.gate_prefix);
+
+            RTLIL::IdString gold_name = mod->name == conf.gate_mod->name ?
+                conf.gold_mod->name :
+                RTLIL::escape_id(conf.gold_prefix + strip_backslash(original_name));
+            if (design->module(gold_name) != nullptr) {
+                (*gate2gold)[gold_name] = mod->name;
+                mod_map.mapped_mods_gold.insert(gold_name);
+                mod_map.mapped_mods_gate.insert(mod->name);
+            }
+            else {
+                mod_map.unmapped_mods_gate.insert(mod->name);
+            }
+        }
+            
+    }
+
+    log("Found %zu equivalence module pairs for LEC.\n", mod_map.mapped_mods_gold.size());
+    for(auto const &mod_name : mod_map.mapped_mods_gold){
+        log("  Gold module %s  <=>  Gate module %s\n", 
+            log_id(mod_name), log_id((*gold2gate)[mod_name]));
+    }
+    
+    for(const auto &mod_name : mod_map.unmapped_mods_gold){
+        log_warning("Gold module %s has no matching gate module.\n", log_id(mod_name));
+    }
+    for(const auto &mod_name : mod_map.unmapped_mods_gate){
+        log_warning("Gate module %s has no matching gold module.\n", log_id(mod_name));
+    }
+    return mod_map;
+}
+
+/*
+static void remove_sub_mods(RTLIL::Design *design, const CheckConfig& confp)
+{
+    assert(design);
+    pool<RTLIL::IdString> std_cells;
+    if (confp.lib_design) {
+        for (auto mod : confp.lib_design->modules())
+        {
+            std_cells.insert(mod->name);
+        }
+    }
+
+    pool<RTLIL::Module*> modules;
+    for (auto mod : design->modules())
+    {
+        if(std_cells.count(mod->name) != 0)
+            continue;
+        modules.insert(mod);
+    }
+
+    pool<RTLIL::IdString> submods;
+    for (auto mod : modules)
+    {
+        for (auto cell : mod->cells())
+        {
+            RTLIL::Module *child = design->module(cell->type);
+            if (!child)
+                continue;
+            if (std_cells.count(child->name) != 0)
+                continue;
+            if (child->get_blackbox_attribute())
+                continue;
+            submods.insert(child->name);
+        }
+    }
+
+    // PO/PO of sub modules -> PO/PO of parent module
+    // Remove sub modules
+    for (auto mod : modules)
+    {
+        if (mod->get_blackbox_attribute())
+            continue;
+
+        std::vector<RTLIL::Cell*> cells = mod->cells();
+        for (auto cell : cells)
+        {
+            RTLIL::Module *child = design->module(cell->type);
+            if (!child)
+                continue;
+            if (std_cells.count(child->name) != 0)
+                continue;
+            if (child->get_blackbox_attribute())
+                continue;
+
+            std::vector<RTLIL::Wire*> child_ports;
+            for (auto *w : child->wires())
+                if (w->port_id > 0 && (w->port_input || w->port_output))
+                    child_ports.push_back(w);
+
+            std::sort(child_ports.begin(), child_ports.end(),
+                      [](RTLIL::Wire *a, RTLIL::Wire *b){ return a->port_id < b->port_id; });
+
+            for (auto *port : child_ports)
+            {
+                if (!cell->hasPort(port->name))
+                    continue;
+
+                RTLIL::SigSpec port_sig = cell->getPort(port->name);
+                port_sig = resize_u0(port_sig, GetSize(port));
+
+                if (port->port_input) {
+                    std::string base = stringf("%s__%s__to_sub",
+                        strip_backslash(cell->name).c_str(),
+                        strip_backslash(port->name).c_str());
+                    RTLIL::IdString wire_name = mod->uniquify(RTLIL::escape_id(base));
+                    RTLIL::Wire *w = mod->addWire(wire_name, GetSize(port));
+                    w->is_signed = port->is_signed;
+                    w->upto = port->upto;
+                    w->start_offset = port->start_offset;
+                    w->port_output = true;
+                    mod->connect(RTLIL::SigSpec(w), port_sig);
+                }
+
+                if (port->port_output) {
+                    std::string base = stringf("%s__%s__from_sub",
+                        strip_backslash(cell->name).c_str(),
+                        strip_backslash(port->name).c_str());
+                    RTLIL::IdString wire_name = mod->uniquify(RTLIL::escape_id(base));
+                    RTLIL::Wire *w = mod->addWire(wire_name, GetSize(port));
+                    w->is_signed = port->is_signed;
+                    w->upto = port->upto;
+                    w->start_offset = port->start_offset;
+                    w->port_input = true;
+                    mod->connect(port_sig, RTLIL::SigSpec(w));
+                }
+            }
+
+            mod->remove(cell);
+        }
+        mod->fixup_ports();
+    }
+
+    for (auto mod : design->modules().to_vector())
+    {
+        if (std_cells.count(mod->name) != 0)
+            continue;
+        if (submods.count(mod->name) == 0)
+            continue;
+        if (mod->get_bool_attribute(ID::top))
+            continue;
+        if (mod == confp.gold_mod || mod == confp.gate_mod)
+            continue;
+        design->remove(mod);
+    }
+    
+}
+*/
+
+
+static dict<RTLIL::IdString, NamedSig> build_named_sigs(RTLIL::Design* design, RTLIL::Module *m, dict<RTLIL::SigBit, RTLIL::Cell*>& ff_q_map)
+{
+    // have't use yet.
+    (void) design;
+
+
+    SigMap sigmap(m);
+    dict<RTLIL::IdString, NamedSig> out;
+    pool<RTLIL::Cell*> subckts;
+    dict<RTLIL::SigBit, RTLIL::Cell*> ff_q_bits_map;
+
+    for (auto cell : m->cells()) {
+
+        // subckt
+        if (!yosys_celltypes.cell_known(cell->type)){
+            subckts.insert(cell);
+            continue;
+        }
+
+        if (!cell->is_builtin_ff() && cell->type != ID($anyinit))
+            continue;
+
+        FfData ff(nullptr, cell);
+        if (!ff.has_clk && !ff.has_gclk){
+            assert(0);
+            continue;
+        }
+            
+
+        RTLIL::SigSpec q = ff.sig_q;
+        q = sigmap(q);
+
+        for (int i = 0; i < GetSize(q); i++) {
+            RTLIL::SigBit qb = q[i];
+            ff_q_bits_map[qb] = cell;
+            ff_q_bits_map[sigmap(qb)] = cell;
+            // log("Found FF Q bit: %s\n", log_signal(sigmap(qb)));
+        }
+    }
+
+    dict<RTLIL::SigBit, RTLIL::Cell*> ff_conn_bits = ff_q_bits_map;
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (auto &conn : m->connections()) {
+            RTLIL::SigSpec lhs = sigmap(conn.first);
+            RTLIL::SigSpec rhs = sigmap(conn.second);
+            int width = GetSize(lhs);
+            for (int i = 0; i < width; i++) {
+                RTLIL::SigBit rb = rhs[i];
+                RTLIL::SigBit lb = lhs[i];
+                if (rb.is_wire() && ff_conn_bits.count(rb) && !ff_conn_bits.count(lb)) {
+                    ff_conn_bits[lb] = ff_conn_bits[rb];
+                    changed = true;
+                }
+            }
+        }
+    }
+
+
+    for (auto *w : m->wires()) {
+        // if (!w->port_input && !w->port_output) continue;
+        // if(w->port_input) continue;
+        RTLIL::SigSpec sig = sigmap(RTLIL::SigSpec(w));
+        int width = GetSize(sig);
+                
+        MatchType type = MatchType::NONE;
+
+        for (int i = 0; i < width; i++) {
+            RTLIL::SigBit b = sig[i];
+            RTLIL::SigBit bm = sigmap(b);
+
+            RTLIL::IdString bit_name;
+            if(width == 1){
+                bit_name = w->name;
+            }
+            else{
+                bit_name = RTLIL::IdString(stringf("%s[%d]", w->name, i));
+            }
+            
+            bool is_ff = ff_conn_bits.count(bm);
+
+            bool is_output = w->port_output;
+
+            bool is_input = w->port_input;
+            // log("Wire %s is input: %s, output: %s\n", bit_name, is_input ? "true" : "false", is_output ? "true" : "false");
+            // log("Wire %s is FF Q: %s\n", bit_name, is_ff ? "true" : "false");
+            // Can not process `inout`
+            assert(!(is_output && is_input));
+
+            type = is_ff && is_output ? MatchType::DFF_PO :
+                is_ff ? MatchType::DFF :
+                is_output ? MatchType::PO :
+                MatchType::NONE;
+
+            type = is_input ? MatchType::PI : type;
+
+            NamedSig entry;
+            entry.sig = bm;
+            entry.type = type;
+            entry.wire_name = w->name;
+            entry.bit_index = i;
+            out[bit_name] = entry;
+            if(is_ff){
+                ff_q_map[bm] = ff_conn_bits[bm];
+            }
+        }
+    }
+    return out;
+
+}
+
+
+static std::vector<CutPoint> match_signals_module(RTLIL::Design *design, RTLIL::Module *gold_mod, RTLIL::Module *gate_mod, const string& tempdir)
+{
+    assert(design && gold_mod && gate_mod);
+
+    SigMap sigmap_gate(gate_mod);
+    SigMap sigmap_gold(gold_mod);
+
+    std::vector<CutPoint> cut_points;
+    dict<RTLIL::SigBit, RTLIL::Cell*> gold_ff_q_map;
+    dict<RTLIL::SigBit, RTLIL::Cell*> gate_ff_q_map;
+
+    auto gold = build_named_sigs(design, gold_mod, gold_ff_q_map);
+    auto gate = build_named_sigs(design, gate_mod, gate_ff_q_map);
+    log("---------------------------------------------\n");
+    log("Matching signals between Gold module %s and Gate module %s\n",
+        log_id(gold_mod), log_id(gate_mod));
+
+    string match_file = tempdir + "/match_" + RTLIL::unescape_id(gold_mod->name) + "_" + RTLIL::unescape_id(gate_mod->name) + ".txt";
+    FILE *f = fopen(match_file.c_str(), "w");
+
+    for (auto &it : gold) {
+        auto name = it.first;
+        if (!gate.count(name))
+            continue;
+
+        const auto &gentry = it.second;
+        const auto &kentry = gate.at(name);
+        RTLIL::SigBit gsig = gentry.sig;
+        RTLIL::SigBit ksig = kentry.sig;
+        
+
+        log("Matched signal %s: gold %s gate %s, Type %s\n",
+            name.c_str(), log_signal(gsig), log_signal(ksig), gentry.type == MatchType::DFF ? "DFF" :
+                                gentry.type == MatchType::DFF_PO ? "DFF_PO" :
+                                gentry.type == MatchType::PO ? "PO" : 
+                                gentry.type == MatchType::PI ? "PI" : "NONE");
+
+        // Don't dump NONE type
+        // if(gentry.type != MatchType::NONE){
+        if(1){
+            fprintf(f, "Matched signal %s: gold %s gate %s, Type %s\n",
+                name.c_str(), log_signal(gsig).c_str(), log_signal(ksig).c_str(), gentry.type == MatchType::DFF ? "DFF" :
+                                gentry.type == MatchType::DFF_PO ? "DFF_PO" :
+                                gentry.type == MatchType::PO ? "PO" : 
+                                gentry.type == MatchType::PI ? "PI" : "NONE");
+        }
+        cut_points.push_back(CutPoint{name, gsig, ksig, gentry.type,
+                gold_ff_q_map.count(gsig) ? gold_ff_q_map[gsig] : nullptr,
+                gate_ff_q_map.count(ksig) ? gate_ff_q_map[ksig] : nullptr,
+                gentry.wire_name, gentry.bit_index,
+                kentry.wire_name, kentry.bit_index});
+    }
+    fclose(f);
+    return cut_points;
+}
+
+static dict<RTLIL::Module*, std::vector<CutPoint>> match_signals(RTLIL::Design *design, const CheckConfig& conf, ModMap& mod_map)
+{
+    assert(design);
+    auto gold2gate = mod_map.mod_map_gold;
+    auto gate2gold = mod_map.mod_map_gate;
+
+    dict<RTLIL::Module*, std::vector<CutPoint>> gold2cutpoints;
+
+    for(auto const &[gold, gate] : gold2gate){
+        gold2cutpoints[design->module(gold)] = 
+            match_signals_module(design, design->module(gold), design->module(gate), conf.tempdir_name);
+    }
+    return gold2cutpoints;
+}
+
+static void cutpoints_to_pi_po(RTLIL::Module *mod,
+                               const std::vector<CutPoint> &cutpoints,
+                               bool use_gold)
+{
+    SigMap sigmap(mod);
+    pool<RTLIL::Cell*> cut_cells;
+    pool<RTLIL::SigBit> cut_q_bits;
+    std::vector<RTLIL::SigSig> pending_q_conns;
+
+    auto make_port_wire = [&](const RTLIL::IdString &base, const char *suffix, int width,
+                              bool is_input, bool is_output) -> RTLIL::Wire* {
+        std::string base_name = strip_backslash(base);
+        RTLIL::IdString name = mod->uniquify(RTLIL::escape_id(base_name + suffix));
+        RTLIL::Wire *w = mod->addWire(name, width);
+        w->port_input = is_input;
+        w->port_output = is_output;
+        return w;
+    };
+
+    auto find_ff_by_qbit = [&](RTLIL::SigBit qbit) -> RTLIL::Cell* {
+        if (!qbit.is_wire())
+            return nullptr;
+        for (auto cell : mod->cells()) {
+            if (!cell->is_builtin_ff() && cell->type != ID($anyinit))
+                continue;
+            RTLIL::SigSpec qsig = sigmap(cell->getPort(ID::Q));
+            for (int i = 0; i < GetSize(qsig); i++) {
+                if (qsig[i] == qbit)
+                    return cell;
+            }
+        }
+        return nullptr;
+    };
+
+    for (const auto &cp : cutpoints)
+    {
+        if (cp.type != MatchType::DFF && cp.type != MatchType::DFF_PO)
+            continue;
+
+        RTLIL::Cell *ff = use_gold ? cp.gold_ff_cell : cp.gate_ff_cell;
+        if (ff != nullptr)
+            ff = mod->cell(ff->name);
+
+        RTLIL::IdString qwire_name = use_gold ? cp.gold_wire_name : cp.gate_wire_name;
+        int qbit_index = use_gold ? cp.gold_bit_index : cp.gate_bit_index;
+        if (qwire_name.empty()) {
+            log_warning("Missing cutpoint wire name for %s in module %s.\n",
+                log_id(cp.name), log_id(mod->name));
+            continue;
+        }
+        RTLIL::Wire *qwire = mod->wire(qwire_name);
+        if (qwire == nullptr) {
+            log_warning("Missing cutpoint wire %s in module %s.\n",
+                log_id(cp.name), log_id(mod->name));
+            continue;
+        }
+        if (qbit_index < 0 || qbit_index >= GetSize(qwire)) {
+            log_warning("Cutpoint index out of range for %s in module %s.\n",
+                log_id(cp.name), log_id(mod->name));
+            continue;
+        }
+        RTLIL::SigBit qbit_port(qwire, qbit_index);
+        RTLIL::SigBit qbit_mapped = sigmap(qbit_port);
+
+        if (ff == nullptr)
+            ff = find_ff_by_qbit(qbit_mapped);
+
+        if (ff == nullptr) {
+            log_warning("Missing FF cell for cutpoint %s in module %s.\n",
+                log_id(cp.name), log_id(mod->name));
+            continue;
+        }
+
+        if (!qbit_port.is_wire()) {
+            log_warning("Cutpoint %s has non-wire Q bit in module %s.\n",
+                log_id(cp.name), log_id(mod->name));
+            continue;
+        }
+
+        bool is_dff_po = (cp.type == MatchType::DFF_PO);
+        cut_q_bits.insert(qbit_mapped);
+        cut_cells.insert(ff);
+
+        RTLIL::SigBit pi_bit = qbit_port;
+        if (!is_dff_po) {
+            if (qbit_port.wire->port_output) {
+                RTLIL::Wire *pi_wire = make_port_wire(cp.name, "_pi", 1, true, false);
+                pi_bit = RTLIL::SigBit(pi_wire);
+                pending_q_conns.emplace_back(RTLIL::SigSpec(qbit_port), RTLIL::SigSpec(pi_wire));
+            } else {
+                qbit_port.wire->port_input = true;
+            }
+            if (qbit_mapped != pi_bit)
+                pending_q_conns.emplace_back(RTLIL::SigSpec(qbit_mapped), RTLIL::SigSpec(pi_bit));
+        }
+
+        RTLIL::SigSpec qsig = sigmap(ff->getPort(ID::Q));
+        RTLIL::SigSpec dsig = sigmap(ff->getPort(ID::D));
+
+        int qidx = -1;
+        for (int i = 0; i < GetSize(qsig); i++) {
+            if (qsig[i] == qbit_mapped) {
+                qidx = i;
+                break;
+            }
+        }
+        if (qidx < 0) {
+            if (GetSize(qsig) > 1) {
+                if (qbit_index < 0 || qbit_index >= GetSize(qsig)) {
+                    log_warning("Cannot map Q bit for cutpoint %s in module %s.\n",
+                        log_id(cp.name), log_id(mod->name));
+                    continue;
+                }
+                qidx = qbit_index;
+            } else {
+                qidx = 0;
+            }
+        }
+
+        if (qidx < 0 || qidx >= GetSize(dsig)) {
+            log_warning("Cutpoint %s has invalid D index in module %s.\n",
+                log_id(cp.name), log_id(mod->name));
+            continue;
+        }
+        RTLIL::SigBit dbit = dsig[qidx];
+        if (is_dff_po) {
+            pending_q_conns.emplace_back(RTLIL::SigSpec(qbit_mapped), RTLIL::SigSpec(dbit));
+            if (qbit_port != qbit_mapped)
+                pending_q_conns.emplace_back(RTLIL::SigSpec(qbit_port), RTLIL::SigSpec(qbit_mapped));
+        } else {
+            RTLIL::Wire *w_out = make_port_wire(cp.name, "_po", 1, false, true);
+            mod->connect(RTLIL::SigSpec(w_out), RTLIL::SigSpec(dbit));
+        }
+    }
+
+    if (!cut_q_bits.empty()) {
+        std::vector<RTLIL::SigSig> new_conns;
+        new_conns.reserve(mod->connections().size());
+        for (auto &ss : mod->connections()) {
+            RTLIL::SigSpec lhs, rhs;
+            RTLIL::SigSpec lhs_sig = ss.first;
+            RTLIL::SigSpec rhs_sig = ss.second;
+            int width = GetSize(lhs_sig);
+            for (int i = 0; i < width; i++) {
+                RTLIL::SigBit lb = sigmap(lhs_sig[i]);
+                if (cut_q_bits.count(lb))
+                    continue;
+                lhs.append(lhs_sig[i]);
+                rhs.append(rhs_sig[i]);
+            }
+            if (GetSize(lhs))
+                new_conns.emplace_back(lhs, rhs);
+        }
+        mod->connections_.swap(new_conns);
+    }
+
+    for (auto &conn : pending_q_conns)
+        mod->connect(conn.first, conn.second);
+
+    for (auto *ff : cut_cells)
+        mod->remove(ff);
+
+    mod->fixup_ports();
+}
+
+
+static void submod_to_pi_po(RTLIL::Design *design, RTLIL::Module *mod)
+{
+    assert(design);
+    assert(mod);
+
+    SigMap sigmap(mod);
+    pool<RTLIL::SigBit> cut_bits;
+    std::vector<RTLIL::SigSig> pending_conns;
+    std::vector<RTLIL::Cell*> remove_cells;
+
+    for (auto *cell : mod->cells()) {
+
+        if(yosys_celltypes.cell_known(cell->type))
+            continue;
+
+        RTLIL::Module *child = design->module(cell->type);
+        if (!child) {
+            log_error("Missing module %s for cell %s in module %s.\n",
+                    log_id(cell->type), log_id(cell->name), log_id(mod->name));
+            continue;
+        }
+
+        
+
+        std::vector<RTLIL::Wire*> child_ports;
+        for (auto *w : child->wires())
+            if (w->port_id > 0 && (w->port_input || w->port_output))
+                child_ports.push_back(w);
+
+        std::sort(child_ports.begin(), child_ports.end(),
+                  [](RTLIL::Wire *a, RTLIL::Wire *b){ return a->port_id < b->port_id; });
+
+        for (auto *port : child_ports) {
+            if (!cell->hasPort(port->name))
+                continue;
+
+            RTLIL::SigSpec port_sig = cell->getPort(port->name);
+            port_sig = resize_u0(port_sig, GetSize(port));
+            RTLIL::SigSpec mapped_sig = sigmap(port_sig);
+
+            std::string base = stringf("%s_%s",
+                strip_backslash(cell->name).c_str(),
+                strip_backslash(port->name).c_str());
+
+            auto add_port_wire = [&](const char *suffix, bool is_input, bool is_output) -> RTLIL::Wire* {
+                RTLIL::IdString name = mod->uniquify(RTLIL::escape_id(base + suffix));
+                RTLIL::Wire *w = mod->addWire(name, GetSize(port));
+                w->is_signed = port->is_signed;
+                w->upto = port->upto;
+                w->start_offset = port->start_offset;
+                w->port_input = is_input;
+                w->port_output = is_output;
+                return w;
+            };
+
+            if (port->port_output) {
+                RTLIL::Wire *w_pi = add_port_wire("_pi", true, false);
+                pending_conns.emplace_back(mapped_sig, RTLIL::SigSpec(w_pi));
+
+                int width = GetSize(port_sig);
+                for (int i = 0; i < width; i++) {
+                    RTLIL::SigBit pb = port_sig[i];
+                    RTLIL::SigBit mb = mapped_sig[i];
+                    if (mb.is_wire())
+                        cut_bits.insert(mb);
+                    if (pb.is_wire() && mb.is_wire() && pb != mb)
+                        pending_conns.emplace_back(RTLIL::SigSpec(pb), RTLIL::SigSpec(mb));
+                }
+            }
+        }
+
+        remove_cells.push_back(cell);
+    }
+
+    if (!cut_bits.empty()) {
+        std::vector<RTLIL::SigSig> new_conns;
+        new_conns.reserve(mod->connections().size());
+        for (auto &ss : mod->connections()) {
+            RTLIL::SigSpec lhs, rhs;
+            RTLIL::SigSpec lhs_sig = ss.first;
+            RTLIL::SigSpec rhs_sig = ss.second;
+            int width = GetSize(lhs_sig);
+            for (int i = 0; i < width; i++) {
+                RTLIL::SigBit lb = sigmap(lhs_sig[i]);
+                if (cut_bits.count(lb))
+                    continue;
+                lhs.append(lhs_sig[i]);
+                rhs.append(rhs_sig[i]);
+            }
+            if (GetSize(lhs))
+                new_conns.emplace_back(lhs, rhs);
+        }
+        mod->connections_.swap(new_conns);
+    }
+
+    for (auto &conn : pending_conns)
+        mod->connect(conn.first, conn.second);
+
+    for (auto *cell : remove_cells)
+        mod->remove(cell);
+
+    mod->fixup_ports();
+}
+
+static std::vector<RTLIL::Module*> topo_sort_modules(RTLIL::Design *design, const RTLIL::IdString& root);
+
+// The function still has bug
+[[maybe_unused]]static void remove_subclk(RTLIL::Design* design, CheckConfig& conf) {
+
+    // haven't use now.
+    (void) design;
+
+    auto gold_topo = topo_sort_modules(design, conf.gold_mod->name);
+    auto gate_topo = topo_sort_modules(design, conf.gate_mod->name);
+
+    for(auto m: gold_topo){
+        submod_to_pi_po(design, m);
+    }
+    for(auto m: gate_topo) {
+        submod_to_pi_po(design, m);
+    }
+}
+
+// RetVal: <gold_submodule, gate_submodule> , pointer in design_check
+static std::pair<RTLIL::Module*, RTLIL::Module*> partition_module(RTLIL::Design *design, RTLIL::Design *design_check, 
+    RTLIL::Module *gold_mod, RTLIL::Module *gate_mod,  //pointer in design
+    const std::vector<CutPoint>& cutpoints, const CheckConfig& conf)
+{
+    // Maybe implement further.
+    assert(0);
+    (void) design;
+    (void) design_check;
+    (void) conf;
+
+    RTLIL::Module *gold_clone = gold_mod->clone();
+    RTLIL::Module *gate_clone = gate_mod->clone();
+
+    // convert_ff_to_fine(gold_clone);
+    // convert_ff_to_fine(gate_clone);
+
+
+    cutpoints_to_pi_po(gold_clone, cutpoints, true);
+    cutpoints_to_pi_po(gate_clone, cutpoints, false);
+
+    // blackbox_to_pi_po(design, gold_clone);
+    // blackbox_to_pi_po(design, gate_clone);
+
+    return {gold_clone, gate_clone};
+}
+
+// Maybe implement further.
+[[maybe_unused]]static void partition_design_for_check(RTLIL::Design *design, RTLIL::Design *design_check, 
+    const CheckConfig& conf, ModMap& mod_map,
+    const dict<RTLIL::Module*, std::vector<CutPoint>>& gold2cutpoints)
+{
+    for(const auto &[gold_mod, cutpoints] : gold2cutpoints){
+        RTLIL::IdString gold_mod_name = gold_mod->name;
+        RTLIL::IdString gate_mod_name = mod_map.mod_map_gold.at(gold_mod_name);
+        RTLIL::Module *gate_mod = design->module(gate_mod_name);
+
+        auto module_partition = 
+            partition_module(design, design_check, gold_mod, gate_mod, cutpoints, conf);
+        design_check->add(module_partition.first);
+        design_check->add(module_partition.second);
+    }
 }
 
 static int exectue_and_check(const std::string & cmd, bool & correct, 
@@ -373,7 +1202,7 @@ static string dump_blif(RTLIL::Design* design, const string &dir_name, RTLIL::Mo
     // log_streams.clear(); // TODO: We can not see any log...
     RTLIL::Design *design_copy = clone_design_for_passes(design);
     if(!lib_file.empty())
-        run_pass(stringf("read_verilog -overwrite %s", lib_file), design_copy);
+        run_pass(stringf("read_verilog -overwrite -noblackbox %s", lib_file), design_copy);
     run_pass(stringf("hierarchy -top %s", mod->name.str()), design_copy);
     run_pass(stringf("flatten"), design_copy);
     run_pass(stringf("proc"), design_copy);
@@ -401,10 +1230,10 @@ static string dump_blif_module(RTLIL::Design* design, const string &dir_name, RT
     // log_files.clear(); // TODO: Maybe it's not a good ieda... 
     // log_streams.clear(); // TODO: We can not see any log...
     RTLIL::Design *design_copy = clone_design_for_passes(design);
-    (void)lib_file;
+    // (void)lib_file;
     // if(!lib_file.empty())
     //     run_pass(stringf("read_verilog -overwrite %s", lib_file), design_copy);
-    run_pass(stringf("hierarchy -top %s", mod->name.str()), design_copy);
+    
     // run_pass(stringf("flatten"), design_copy);
     // run_pass(stringf("hierarchy -top %s", mod->name.str()), design_copy);
     // run_pass(stringf("proc"), design_copy);
@@ -412,12 +1241,19 @@ static string dump_blif_module(RTLIL::Design* design, const string &dir_name, RT
     // run_pass(stringf("memory_map"), design_copy);
 
     for(auto mod_: design_copy->modules()){
-        if(mod_!= mod){
+        if(mod_->name != mod->name){
             mod_->set_bool_attribute(ID(blackbox), true);
+            // log("Current Module: %s, Set Module `%s` to blackbox.\n", mod->name.str(), mod_->name.str());
         }
     }
-    run_pass(stringf("techmap"), design_copy);
-    run_pass(stringf("dffunmap"), design_copy);
+    (void)lib_file;
+    // if(!lib_file.empty())
+    //     run_pass(stringf("read_verilog -overwrite %s", lib_file), design_copy);
+    // run_pass(stringf("hierarchy -top %s", mod->name.str()), design_copy);
+    // run_pass(stringf("flatten"), design_copy);
+    // run_pass(stringf("proc"), design_copy);
+    // run_pass(stringf("techmap"), design_copy);
+    // run_pass(stringf("dffunmap"), design_copy);
     run_pass(stringf("write_blif -blackbox -top %s %s", mod_name, blif_file), design_copy);
     delete design_copy;
     log_files = log_files_backup;
@@ -454,7 +1290,7 @@ static string dump_smt2(RTLIL::Design* design, const string &dir_name, std::pair
                     gold_mod->name.str(), gate_mod->name.str(), mod_name), design_copy);
     run_pass(stringf("hierarchy -top %s", mod_name), design_copy);
     run_pass(stringf("techmap"), design_copy);
-    run_pass(stringf("write_verilog 1.v"), design_copy);
+    // run_pass(stringf("write_verilog 1.v"), design_copy);
     run_pass(stringf("prep -top %s", mod_name), design_copy);
     run_pass(stringf("write_smt2 -wires %s", smt2_file), design_copy);
     delete design_copy;
@@ -589,12 +1425,15 @@ static bool abc_cec_module(const CheckConfig &conf){
     auto gate_file = dump_blif_module(design, conf.tempdir_name, gate_mod, conf.lib_file);
 
     bool has_dff = false;
+    int gate_dff_cnt = 0;
+    int gold_dff_cnt = 0;
     bool has_submodule = false;
     for(auto cells: conf.gold_mod->cells()){
         if(cells->type == ID($ff) || cells->type == ID($dff) || cells->type == ID($dffe)|| 
            cells->type == ID($_DFF_P_) || cells->type == ID($_DFF_N_) || cells->type == ID($_DFFE_PN) ||
            cells->type == ID($_DFFE_PP)){
-            has_dff = true;
+            
+            gold_dff_cnt++;
         } 
         auto submod = conf.design->module(cells->type);
         if (submod != nullptr && !(submod->attributes.count(ID::blackbox))) {
@@ -605,9 +1444,24 @@ static bool abc_cec_module(const CheckConfig &conf){
         }
     }
 
+    for(auto cells: conf.gate_mod->cells()){
+        if(cells->type.contains("DFF") || cells->type == ID($ff) || cells->type == ID($dff) || cells->type == ID($dffe)|| 
+           cells->type == ID($_DFF_P_) || cells->type == ID($_DFF_N_) || cells->type == ID($_DFFE_PN) ||
+           cells->type == ID($_DFFE_PP)){
+            has_dff = true;
+            gate_dff_cnt++;
+        } 
+    }
 
-    string abc_cmd = //(has_dff) ? stringf("dsec %s %s", gold_file, gate_file) :
-                                                stringf("cec %s %s", gold_file, gate_file);
+    log("Gold DFF count: %d, Gate DFF count: %d\n", gold_dff_cnt, gate_dff_cnt);
+
+    has_dff = (gate_dff_cnt !=0 || gold_dff_cnt !=0);
+
+
+    string match_file = conf.tempdir_name + "/match_" + RTLIL::unescape_id(gold_mod->name) + "_" + RTLIL::unescape_id(gate_mod->name) + ".txt";
+    // string abc_cmd = (has_dff) ? stringf("dsec -n %s %s", gold_file, gate_file) :
+    //                                             stringf("cec -M %s -n %s %s", match_file, gold_file, gate_file);
+    string abc_cmd = stringf("cec -M %s %s %s", match_file, gate_file, gold_file);
     string cmd = stringf("%s -c '%s'", conf.abc_exe_file, abc_cmd);
     bool correct = false;
     log("Executing ABC command: '%s'\n", abc_cmd);
@@ -615,24 +1469,41 @@ static bool abc_cec_module(const CheckConfig &conf){
     if (abc_ret != 0) {
         log_error("Error executing ABC command: %s\n", cmd);
     }
+    if (!correct) {
+        abc_cmd = stringf("cec -n %s %s", gate_file, gold_file);
+        cmd = stringf("%s -c '%s'", conf.abc_exe_file, abc_cmd);
+        log("Executing ABC command: '%s'\n", abc_cmd);
+        abc_ret = exectue_and_check(cmd, correct, "Networks are equivalent");
+        if(abc_ret != 0) {
+            log_error("Error executing ABC command: %s\n", cmd);
+        }
+    }
+    if (!correct) {
+        abc_cmd = stringf("dsec %s %s", gate_file, gold_file);
+        cmd = stringf("%s -c '%s'", conf.abc_exe_file, abc_cmd);
+        log("Executing ABC command: '%s'\n", abc_cmd);
+        abc_ret = exectue_and_check(cmd, correct, "Networks are equivalent");
+        if(abc_ret != 0) {
+            log_error("Error executing ABC command: %s\n", cmd);
+        }
+    }
     return correct;
 }
     
 
-static bool abc_cec(const CheckConfig &conf){
+static std::vector<std::pair<RTLIL::IdString, bool>> abc_cec(const CheckConfig &conf){
     // find equivalence-checking pair
     auto design = conf.design;
 
     vector<std::pair<RTLIL::IdString, RTLIL::IdString>> equiv_mods;
 
     for( auto mod : design->modules()){
+        if(mod->get_blackbox_attribute())
+            continue;
         if (mod->name.begins_with(RTLIL::escape_id(conf.gold_prefix)) ||
             mod->name == conf.gold_mod->name ) {
-            RTLIL::IdString original_name = 
-                mod->name == conf.gold_mod->name ? 
-                conf.gold_mod->name :
-                RTLIL::escape_id(strip_backslash(mod->name).substr(conf.gold_prefix.size()));
-            
+            RTLIL::IdString original_name = get_orignal_mod_name(
+                mod->name, conf.gold_mod->name, conf.gold_prefix);
             RTLIL::IdString gate_name = mod->name == conf.gold_mod->name ?
                 conf.gate_mod->name :
                 RTLIL::escape_id(conf.gate_prefix + strip_backslash(original_name));
@@ -662,6 +1533,8 @@ static bool abc_cec(const CheckConfig &conf){
         .seq_check_cfg = conf.seq_check_cfg
     };
 
+    std::vector<std::pair<RTLIL::IdString, bool>> results;
+
     for(auto mod_pair : equiv_mods){
         auto gold_name = mod_pair.first;
         auto gate_name = mod_pair.second;
@@ -681,22 +1554,22 @@ static bool abc_cec(const CheckConfig &conf){
         bool cec_result = abc_cec_module(conf_);
 
         delete design_;
-        
-        if(!cec_result){
-            log("\nGUIDE_CHECK failed for module pair: gold=%s vs gate=%s\n", 
-                log_id(gold_name), log_id(gate_name));
-            return false;
-        }
-        else 
-        {
-            log("\nGUIDE_CHECK passed for module pair: gold=%s vs gate=%s\n", 
-                log_id(gold_name), log_id(gate_name));
-        }
+        results.push_back({get_orignal_mod_name(gold_name, gate_name, conf.gold_prefix), cec_result});
+
+        // if(!cec_result){
+        //     log("\nGUIDE_CHECK failed for module pair: gold=%s vs gate=%s\n", 
+        //         log_id(gold_name), log_id(gate_name));
+        // }
+        // else 
+        // {
+        //     log("\nGUIDE_CHECK passed for module pair: gold=%s vs gate=%s\n", 
+        //         log_id(gold_name), log_id(gate_name));
+        // }
 
 
     }
-    
-    return true;    
+    return results;
+    //return true;    
 }
 // static bool abc_dsec(const CheckConfig &conf){
 //     return abc_check(conf, true, "dsec");
@@ -775,6 +1648,61 @@ static std::vector<RTLIL::Module*> topo_sort_modules(RTLIL::Design *design)
     return ts.sorted;
 }
 
+static std::vector<RTLIL::Module*> topo_sort_modules(RTLIL::Design *design, const RTLIL::IdString& root){
+    TopoSort<RTLIL::Module*,RTLIL::IdString::compare_ptr_by_name<RTLIL::Module>> ts;
+    ts.analyze_loops = true;
+
+
+    // get related modules
+    std::set<RTLIL::Module*,RTLIL::IdString::compare_ptr_by_name<RTLIL::Module>> related_mods;
+    std::function<void(RTLIL::Module*)> dfs = [&](RTLIL::Module* mod){
+        if(related_mods.count(mod)){
+            return;
+        }
+        related_mods.insert(mod);
+        for(auto cell : mod->cells()){
+            RTLIL::Module *child = design->module(cell->type);
+            if (!child) continue;
+            dfs(child);
+        }
+    };
+    RTLIL::Module* root_mod = design->module(root);
+    if(!root_mod){
+        log_error("Root Module %s not found in the design.\n", log_id(root));
+    }
+    dfs(root_mod);
+
+    log("Related modules count: %zu\n", related_mods.size());
+    for(auto mod : related_mods){
+        log("  Related module: %s\n", log_id(mod->name));
+    }
+
+    for (auto m : related_mods) {
+        ts.node(m);
+    }
+
+    for (auto parent : related_mods) {
+        for (auto cell : parent->cells()) {
+            RTLIL::Module *child = design->module(cell->type);
+            if (!child) continue;
+            if(related_mods.count(child) ==0){
+                continue;
+            }
+            ts.edge(child, parent);
+        }
+    }
+
+    bool ok = ts.sort();
+    if (!ok) {
+        for (const auto &loop : ts.loops) {
+            std::string s;
+            for (auto id : loop) s += " " + id->name.str();
+            log_warning("Module instantiation loop:%s\n", s.c_str());
+        }
+    }
+
+    return ts.sorted;
+}
 
 
 bool check_retime(const CheckConfig &conf,
@@ -1248,10 +2176,6 @@ struct GuideCheckPass : public Pass {
             break;
         }
 
-        auto design_backup = design; 
-        
-        design = clone_design_for_passes(design_backup);
-
         if (argidx + 2 == args.size()) {
             gold_top_mod_name = args[argidx++];
             gate_top_mod_name = args[argidx++];
@@ -1274,6 +2198,8 @@ struct GuideCheckPass : public Pass {
             log_cmd_error("Can't find gold module %s.\n", gold_top_mod_name);
         if (gate_mod == nullptr)
             log_cmd_error("Can't find gate module %s.\n", gate_top_mod_name);
+        const RTLIL::IdString gold_mod_name_id = gold_mod->name;
+        const RTLIL::IdString gate_mod_name_id = gate_mod->name;
 
         string tempdir_name;
         if(nocleanup)
@@ -1285,6 +2211,32 @@ struct GuideCheckPass : public Pass {
         tempdir_name = make_temp_dir(tempdir_name);
         log("Creating temporary directory %s for GUIDE_CHECK pass.\n", tempdir_name);
 
+
+
+        auto design_backup = design; 
+        design = clone_design_for_passes(design);
+
+
+        // Load library if specified
+        RTLIL::Design *lib_design = nullptr;
+        if(!lib_file.empty()){
+            lib_design = empty_design();
+
+            if(lib_file.size() > 4 && lib_file.substr(lib_file.size() - 4) == ".lib"){
+                run_pass("read_liberty -overwrite " + lib_file, lib_design);
+            }
+            else if (lib_file.size() > 2 && lib_file.substr(lib_file.size() - 2) == ".v"){
+                run_pass("read_verilog -overwrite " + lib_file, lib_design);
+                run_pass("proc", lib_design);
+                run_pass("techmap", lib_design);
+            }
+            else {
+                design = design_backup;
+                log_error("Unsupported library file format: %s\n", lib_file);
+            }
+            
+        }
+        
         SeqCheckConfig seq_conf = {
             .k_induct = k_induct,
             .step_skip = step_skip,
@@ -1303,65 +2255,127 @@ struct GuideCheckPass : public Pass {
             .gate_prefix = gate_prefix,
             .lib_file = lib_file,
             .seq_check_cfg = seq_conf,
+            .lib_design = lib_design,
         };
 
+        vector<std::pair<RTLIL::IdString,bool>> cec_result_mod;
         bool multi_result = false, cec_result = false, retime_result;
-        
-        if(!lib_file.empty()){
-            run_pass("read_verilog -overwrite " + lib_file, design);
+
+        if(lib_design){
+            lib_import_to_design(design, lib_design);
+            flatten_std_cells(design, lib_design);
+            for(auto mod : lib_design->modules()){
+                auto mod_ = design->module(mod->name);
+                if(mod_) {
+                    design->remove(mod_);
+                }
+            }
         }
+        
+
         run_pass("proc", design);
         run_pass("memory_map", design);
         run_pass("opt_expr", design);
+        run_pass("techmap", design);
+        run_pass("dffunmap", design);
+        
+        auto mod_map = hier_mod_map(design, conf);
+    
+
+        // remove_subclk(design, conf);
 
 
-        std::vector<RTLIL::Module*> multi_mods;
-        auto all_mods = design->all_selected_modules();
-        for(auto mod : all_mods)
-        {
-            multi_result = check_extract_multi(design, mod, tempdir_name, multi_mods, lib_file);
-            if(!multi_result)
-            {
-                log("GUIDE_CHECK multi-module check failed.\n");
-                goto check_failed;
+        // formalff -clk2ff -ff2anyinit gate
+
+        // for(auto mod: design-> modules()){
+        //     run_pass(stringf("async2sync %s", mod->name), design);
+        //     run_pass(stringf("formalff -clk2ff %s", (mod->name)), design);
+        // }
+
+        run_pass("opt_clean", design);
+
+        auto gold2cutpoints = match_signals(design, conf, mod_map);
+
+        // remove_subclk(design,conf);
+        // RTLIL::Design *design_check = empty_design();
+
+        // run_pass("write_verilog 1.v", design_check );
+        // partition_design_for_check(design, design_check, conf, mod_map, gold2cutpoints);
+
+        // propagate_child_ports(design_check);
+
+        // conf.design = design_check;
+        cec_result_mod = abc_cec(conf);
+
+        cec_result = true; 
+        for(auto r: cec_result_mod){
+
+    
+            log("GUIDE_CHECK result for module : %s : %s\n",
+                log_id(r.first),
+                r.second ? "\033[1;32mPASSED\033[0m" : "\033[1;31mFAILED\033[0m");
+
+            if(!r.second){
+                cec_result = false;
             }
         }
-        log("GUIDE_CHECK multi-module check passed.\n");
+        // run_pass("opt_clean", design_check);
+        // run_pass("check", design_check);
+        // run_pass("write_verilog 1.v", design_check );
+        // system("yosys -q -p 'read_verilog 1.v; proc; opt_expr; techmap; show -colors 1 -prefix gold gold_bbox'");
+        // system("yosys -q -p 'read_verilog bbox.v; proc; opt_expr; techmap; show -colors 1 -prefix test bbox'");
+        // return;
+        // std::vector<RTLIL::Module*> multi_mods;
 
-        (void)multi_mods;
+        (void) multi_result;
 
-        retime_result = check_extract_retime(conf);
+        // auto all_mods = design->all_selected_modules();
+        // for(auto mod : all_mods)
+        // {
+        //     multi_result = check_extract_multi(design, mod, tempdir_name, multi_mods, lib_file);
+        //     if(!multi_result)
+        //     {
+        //         log("GUIDE_CHECK multi-module check failed.\n");
+        //         goto check_failed;
+        //     }
+        // }
+        // log("GUIDE_CHECK multi-module check passed.\n");
 
-        if(!retime_result)
-        {
-            log("GUIDE_CHECK retime check failed.\n");
-            goto check_failed;
-        }
-        log("GUIDE_CHECK retime check passed.\n");
+        // (void)multi_mods;
+
+        (void) retime_result;
+        // retime_result = check_extract_retime(conf);
+
+        // if(!retime_result)
+        // {
+        //     log("GUIDE_CHECK retime check failed.\n");
+        //     goto check_failed;
+        // }
+        // log("GUIDE_CHECK retime check passed.\n");
 
 
-        cec_result = abc_cec(conf);
+        
         if(!cec_result)
         {
             log("GUIDE_CHECK cec check failed.\n");
             goto check_failed;
         }
 
-        log("\nGUIDE_CHECK PASSED: Modules %s and %s are equivalent.\n", 
-            log_id(gold_mod->name), log_id(gate_mod->name));
+        log("\nGUIDE_CHECK PASSED: Modules %s and %s are equivalent.\n",
+            log_id(gold_mod_name_id), log_id(gate_mod_name_id));
         
         goto end_pass;
 
 check_failed:
         if(assert_mode)
         {
-            log_cmd_error("\nGUIDE_CHECK FAILED: Modules %s and %s are NOT equivalent.\n", 
-                log_id(gold_mod->name), log_id(gate_mod->name));
+            log_cmd_error("\nGUIDE_CHECK FAILED: Modules %s and %s are NOT equivalent.\n",
+                log_id(gold_mod_name_id), log_id(gate_mod_name_id));
         }
         else
         {
-            log("\nGUIDE_CHECK FAILED: Modules %s and %s are NOT equivalent.\n", 
-                log_id(gold_mod->name), log_id(gate_mod->name));
+            log("\nGUIDE_CHECK FAILED: Modules %s and %s are NOT equivalent.\n",
+                log_id(gold_mod_name_id), log_id(gate_mod_name_id));
         }
 end_pass:
         if (!conf.nocleanup) {
