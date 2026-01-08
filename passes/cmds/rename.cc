@@ -216,18 +216,18 @@ static std::string renamed_unescaped(const std::string& str)
 	return new_str;
 }
 
-static bool is_lib_cell_module(const RTLIL::Module *module)
-{
-	return module->get_bool_attribute(ID::blackbox) || module->get_bool_attribute(ID::whitebox);
-}
+// static bool is_lib_cell_module(const RTLIL::Module *module)
+// {
+// 	return module->get_bool_attribute(ID::blackbox) || module->get_bool_attribute(ID::whitebox);
+// }
 
 static void add_prefix_recursively(RTLIL::Design* design, std::string prefix, RTLIL::Module *module,
 		pool<RTLIL::Module *> &visited, dict<RTLIL::IdString, RTLIL::IdString> &renamed)
 {
 	if (visited.count(module))
 		return;
-	if (is_lib_cell_module(module))
-		return;
+	// if (is_lib_cell_module(module))
+	// 	return;
 	visited.insert(module);
 
 	RTLIL::IdString old_name = module->name;
@@ -444,10 +444,10 @@ struct RenamePass : public Pass {
 			RTLIL::Module *module = design->module(mod_name);
 			if (module == nullptr)
 				log_cmd_error("No such module found: %s\n", mod_name.c_str());
-			if (is_lib_cell_module(module)) {
-				log_warning("Skipping rename of standard-cell module %s.\n", log_id(module));
-				return;
-			}
+			// if (is_lib_cell_module(module)) {
+			// 	log_warning("Skipping rename of standard-cell module %s.\n", log_id(module));
+			// 	return;
+			// }
 
 			pool<RTLIL::Module *> visited;
 			dict<RTLIL::IdString, RTLIL::IdString> renamed;
