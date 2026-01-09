@@ -35,6 +35,7 @@
 #include <tuple>
 #include <chrono>
 #include "kernel/modtools.h"
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -1016,6 +1017,40 @@ static int exectue_and_check(const std::string & cmd, bool & correct,
     return status;
 }
 
+
+static int exectue_and_check(const std::string & cmd, int & result, 
+                    const std::vector<std::pair<std::string, int>>& target_result) {
+    char buffer[1024];
+    std::string output;
+
+    FILE *pipe = popen(cmd.c_str(), "r");
+    if (!pipe) {
+        log_error("Error executing command: ");
+        return -1;
+    }
+
+    while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
+        output += buffer;
+        log("%s", buffer);
+    }
+
+    for(auto it: target_result) {
+        if (output.find(it.first) != std::string::npos) {
+            result = it.second;
+            break;
+        }
+    }
+    
+    int status = pclose(pipe);
+    if (WIFEXITED(status)) {
+        status = WEXITSTATUS(status);
+    } else {
+        status = -1; 
+    }
+
+    return status;
+}
+
 static bool valid_internal_multiplier_cell(RTLIL::Cell *cell)
 {
     if(cell->type != ID($mul))
@@ -1556,35 +1591,52 @@ static bool abc_cec_module(const CheckConfig &conf){
     //                                             stringf("cec -M %s -n %s %s", match_file, gold_file, gate_file);
     string abc_cmd = stringf("cec -M %s %s %s", match_file, gate_file, gold_file);
     string cmd = stringf("%s -c '%s'", conf.abc_exe_file, abc_cmd);
-    bool correct = false;
+    int result = 0;
+    vector<std::pair<std::string , int>> out2result = 
+            {{"Networks are equivalent", 1},
+             {"Networks are NOT EQUIVALENT", 2},
+             {"Miter computation has failed", 3}};
+
     log("Executing ABC command: '%s'\n", abc_cmd);
-    bool abc_ret = exectue_and_check(cmd, correct, "Networks are equivalent");
-    if (abc_ret != 0) {
+    bool abc_ret = exectue_and_check(cmd, result, out2result);
+    if (abc_ret != 0 || result == 0) {
         log_error("Error executing ABC command: %s\n", cmd);
     }
-    if (!correct) {
+
+    // it's not a good idea
+    if (result != 1 && result != 2) {
         abc_cmd = stringf("cec -n %s %s", gate_file, gold_file);
         cmd = stringf("%s -c '%s'", conf.abc_exe_file, abc_cmd);
         log("Executing ABC command: '%s'\n", abc_cmd);
-        abc_ret = exectue_and_check(cmd, correct, "Networks are equivalent");
+        bool abc_ret = exectue_and_check(cmd, result, out2result);
         if(abc_ret != 0) {
             log_error("Error executing ABC command: %s\n", cmd);
         }
     }
-    if (!correct) {
-        abc_cmd = stringf("dsec %s %s", gate_file, gold_file);
+    if (result != 1 && result != 2) {
+        abc_cmd = stringf("dsec -M %s %s %s", match_file, gate_file, gold_file);
         cmd = stringf("%s -c '%s'", conf.abc_exe_file, abc_cmd);
         log("Executing ABC command: '%s'\n", abc_cmd);
-        abc_ret = exectue_and_check(cmd, correct, "Networks are equivalent");
+        bool abc_ret = exectue_and_check(cmd, result, out2result);
         if(abc_ret != 0) {
             log_error("Error executing ABC command: %s\n", cmd);
         }
     }
 
+    // it's not a good idea
+    if (result != 1 && result != 2) {
+        abc_cmd = stringf("dsec -n %s %s", gate_file, gold_file);
+        cmd = stringf("%s -c '%s'", conf.abc_exe_file, abc_cmd);
+        log("Executing ABC command: '%s'\n", abc_cmd);
+        bool abc_ret = exectue_and_check(cmd, result, out2result);
+        if(abc_ret != 0) {
+            log_error("Error executing ABC command: %s\n", cmd);
+        }
+    }
     auto t1 = clock::now();
     timing_stat.abc_cec_ms += std::chrono::duration_cast<std::chrono::milliseconds>(t1-t0).count();
 
-    return correct;
+    return result == 1;
 }
     
 
