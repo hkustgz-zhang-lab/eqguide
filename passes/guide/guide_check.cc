@@ -18,6 +18,7 @@
  */
 
 #include "kernel/celltypes.h"
+#include "kernel/drivertools.h"
 #include "kernel/mem.h"
 #include "kernel/register.h"
 #include "kernel/rtlil.h"
@@ -89,13 +90,19 @@ struct ModMap{
     pool<RTLIL::IdString> unmapped_mods_gold;
 };
 
+
+#define MATCHTYPE_FIELDS(X)       \
+    X(NONE)                       \
+    X(PO)                         \
+    X(PI)                         \
+    X(DFF)                        \
+    X(DFF_PO)                     \
+    X(SUBCKT_PIPO)
+
 enum class MatchType {
-    NONE,
-    PO,
-    PI,
-    DFF,
-    DFF_PO,
-    SUBCKT_PIPO,
+#define DECL_FIELD(name) name,
+    MATCHTYPE_FIELDS(DECL_FIELD)
+#undef DECL_FIELD
 };
 
 struct CutPoint{
@@ -118,7 +125,7 @@ struct NamedSig {
     int bit_index = 0;
 };
 
-inline void print_timing_stat(const TimingStat& s) {
+static inline void print_timing_stat(const TimingStat& s) {
     std::uint64_t t_total = 0;
     log("Timing Stastics:\n");
 #define PRINT_FIELD(name) if(s.name) log("    %s: %.3lf s.\n", #name, s.name/1000.0);
@@ -128,6 +135,16 @@ inline void print_timing_stat(const TimingStat& s) {
     TIMINGSTAT_FIELDS(ACC_FIELD)
 #undef ACC_FIELD
     log("    Total accounting time: %.3lf s.\n",t_total/1000.0);
+}
+
+static inline string get_match_type_str(const MatchType& t) {
+    switch (t) {
+#define CASE(name) case MatchType::name: return #name;
+        MATCHTYPE_FIELDS(CASE)
+#undef CASE
+    }
+    assert(0);
+    return "UNKNOWN";
 }
 
 static std::string strip_backslash(const RTLIL::IdString &id)
@@ -428,7 +445,6 @@ static dict<RTLIL::IdString, NamedSig> build_named_sigs(RTLIL::Design* design, R
     dict<RTLIL::SigBit, RTLIL::Cell*> ff_q_bits_map;
 
     for (auto cell : m->cells()) {
-
         // subckt
         if (!yosys_celltypes.cell_known(cell->type)){
             subckts.insert(cell);
@@ -524,6 +540,48 @@ static dict<RTLIL::IdString, NamedSig> build_named_sigs(RTLIL::Design* design, R
             }
         }
     }
+
+    for(auto subckt: subckts) { 
+        for(auto conn: subckt->connections()){
+            auto name = conn.first;
+            auto sig = conn.second;
+            if(!subckt->hasPort(name)){
+                continue;
+            }
+
+            sig = sigmap(sig);
+            log("%s -- %s\n", name, log_signal(sig));
+            
+            int width = GetSize(sig);
+
+            for (int i = 0; i < width; i++) {
+                RTLIL::SigBit b = sig[i];
+                RTLIL::SigBit bm = sigmap(b);
+
+                RTLIL::IdString bit_name;
+                if(width == 1){
+                    bit_name = RTLIL::IdString(stringf("%s.%s", subckt->name, name));
+                }
+                else{
+                    bit_name = RTLIL::IdString(stringf("%s.%s[%d]", subckt->name, name, i));
+                }
+                
+                bool is_ff = ff_conn_bits.count(bm);
+
+                NamedSig entry;
+                entry.sig = bm;
+                entry.type = MatchType::SUBCKT_PIPO;
+                entry.wire_name = name;
+                entry.bit_index = i;
+                out[bit_name] = entry;
+                if(is_ff){
+                    ff_q_map[bm] = ff_conn_bits[bm];
+                }
+            }
+        }
+    }
+    
+
     return out;
 
 }
@@ -561,19 +619,14 @@ static std::vector<CutPoint> match_signals_module(RTLIL::Design *design, RTLIL::
         
 
         log("Matched signal %s: gold %s gate %s, Type %s\n",
-            name.c_str(), log_signal(gsig), log_signal(ksig), gentry.type == MatchType::DFF ? "DFF" :
-                                gentry.type == MatchType::DFF_PO ? "DFF_PO" :
-                                gentry.type == MatchType::PO ? "PO" : 
-                                gentry.type == MatchType::PI ? "PI" : "NONE");
+            name.c_str(), log_signal(gsig), log_signal(ksig), get_match_type_str(gentry.type));
 
         // Don't dump NONE type
         // if(gentry.type != MatchType::NONE){
         if(1){
             fprintf(f, "Matched signal %s: gold %s gate %s, Type %s\n",
-                name.c_str(), log_signal(gsig).c_str(), log_signal(ksig).c_str(), gentry.type == MatchType::DFF ? "DFF" :
-                                gentry.type == MatchType::DFF_PO ? "DFF_PO" :
-                                gentry.type == MatchType::PO ? "PO" : 
-                                gentry.type == MatchType::PI ? "PI" : "NONE");
+                name.c_str(), log_signal(gsig).c_str(), log_signal(ksig).c_str(), 
+                get_match_type_str(gentry.type).c_str());
         }
         cut_points.push_back(CutPoint{name, gsig, ksig, gentry.type,
                 gold_ff_q_map.count(gsig) ? gold_ff_q_map[gsig] : nullptr,
