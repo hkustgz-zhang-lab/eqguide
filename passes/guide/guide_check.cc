@@ -551,7 +551,6 @@ static dict<RTLIL::IdString, NamedSig> build_named_sigs(RTLIL::Design* design, R
             }
 
             sig = sigmap(sig);
-            log("%s -- %s\n", name, log_signal(sig));
             
             int width = GetSize(sig);
 
@@ -601,9 +600,9 @@ static std::vector<CutPoint> match_signals_module(RTLIL::Design *design, RTLIL::
 
     auto gold = build_named_sigs(design, gold_mod, gold_ff_q_map);
     auto gate = build_named_sigs(design, gate_mod, gate_ff_q_map);
-    log("---------------------------------------------\n");
-    log("Matching signals between Gold module %s and Gate module %s\n",
-        log_id(gold_mod), log_id(gate_mod));
+    // log("---------------------------------------------\n");
+    // log("Matching signals between Gold module %s and Gate module %s\n",
+    //     log_id(gold_mod), log_id(gate_mod));
 
     string match_file = tempdir + "/match_" + RTLIL::unescape_id(gold_mod->name) + "_" + RTLIL::unescape_id(gate_mod->name) + ".txt";
     FILE *f = fopen(match_file.c_str(), "w");
@@ -1605,8 +1604,9 @@ static bool abc_cec_module(const CheckConfig &conf){
         log_error("Error executing ABC command: %s\n", cmd);
     }
 
-    // it's not a good idea
-    if (result != 1 && result != 2) {
+    // it's not a good idea to use `-n`
+    // use -n flag when 'Miter computation failed'
+    if (result == 3) {
         abc_cmd = stringf("cec -n %s %s", gate_file, gold_file);
         cmd = stringf("%s -c '%s'", conf.abc_exe_file, abc_cmd);
         log("Executing ABC command: '%s'\n", abc_cmd);
@@ -1615,7 +1615,7 @@ static bool abc_cec_module(const CheckConfig &conf){
             log_error("Error executing ABC command: %s\n", cmd);
         }
     }
-    if (result != 1 && result != 2) {
+    if (result == 2 || result == 3) {
         abc_cmd = stringf("dsec -M %s %s %s", match_file, gate_file, gold_file);
         cmd = stringf("%s -c '%s'", conf.abc_exe_file, abc_cmd);
         log("Executing ABC command: '%s'\n", abc_cmd);
@@ -1625,8 +1625,9 @@ static bool abc_cec_module(const CheckConfig &conf){
         }
     }
 
-    // it's not a good idea
-    if (result != 1 && result != 2) {
+    // it's not a good idea to use `-n`
+    // use -n flag when 'Miter computation failed'
+    if (result == 3) {
         abc_cmd = stringf("dsec -n %s %s", gate_file, gold_file);
         cmd = stringf("%s -c '%s'", conf.abc_exe_file, abc_cmd);
         log("Executing ABC command: '%s'\n", abc_cmd);
