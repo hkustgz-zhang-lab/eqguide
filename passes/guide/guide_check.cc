@@ -32,12 +32,30 @@
 #include <cstring>
 #include <string>
 #include <tuple>
+#include <chrono>
 #include "kernel/modtools.h"
 #include <utility>
 #include <vector>
 
 USING_YOSYS_NAMESPACE
 PRIVATE_NAMESPACE_BEGIN
+
+
+#define TIMINGSTAT_FIELDS(X)            \
+    X(abc_cec_ms)                       \
+    X(prep_ms)                          \
+    X(dump_blif_ms)                     \
+    X(read_lib_ms)
+
+struct TimingStat {
+#define DECL_FIELD(name) std::uint64_t name = 0;
+    TIMINGSTAT_FIELDS(DECL_FIELD)
+#undef DECL_FIELD
+
+    TimingStat() {}
+};
+
+TimingStat timing_stat;
 
 struct SeqCheckConfig
 {
@@ -99,6 +117,18 @@ struct NamedSig {
     RTLIL::IdString wire_name;
     int bit_index = 0;
 };
+
+inline void print_timing_stat(const TimingStat& s) {
+    std::uint64_t t_total = 0;
+    log("Timing Stastics:\n");
+#define PRINT_FIELD(name) if(s.name) log("    %s: %.3lf s.\n", #name, s.name/1000.0);
+    TIMINGSTAT_FIELDS(PRINT_FIELD)
+#undef PRINT_FIELD
+#define ACC_FIELD(name) t_total += s.name;
+    TIMINGSTAT_FIELDS(ACC_FIELD)
+#undef ACC_FIELD
+    log("    Total accounting time: %.3lf s.\n",t_total/1000.0);
+}
 
 static std::string strip_backslash(const RTLIL::IdString &id)
 {
@@ -1218,6 +1248,9 @@ static string dump_blif(RTLIL::Design* design, const string &dir_name, RTLIL::Mo
 }
 
 static string dump_blif_module(RTLIL::Design* design, const string &dir_name, RTLIL::Module *mod, const string& lib_file){
+
+    auto t_start = std::chrono::steady_clock::now();
+
     string blif_file = dir_name + "/" 
         + strip_backslash(mod->name)
         + ".blif";
@@ -1258,6 +1291,10 @@ static string dump_blif_module(RTLIL::Design* design, const string &dir_name, RT
     delete design_copy;
     log_files = log_files_backup;
     log_streams = log_streams_backup;
+
+    auto t_end = std::chrono::steady_clock::now();
+    timing_stat.dump_blif_ms += std::chrono::duration_cast<std::chrono::milliseconds>(t_end-t_start).count();
+
     return blif_file;
 }
 
@@ -1457,6 +1494,9 @@ static bool abc_cec_module(const CheckConfig &conf){
 
     has_dff = (gate_dff_cnt !=0 || gold_dff_cnt !=0);
 
+    using clock = std::chrono::steady_clock;
+
+    auto t0 = clock::now();
 
     string match_file = conf.tempdir_name + "/match_" + RTLIL::unescape_id(gold_mod->name) + "_" + RTLIL::unescape_id(gate_mod->name) + ".txt";
     // string abc_cmd = (has_dff) ? stringf("dsec -n %s %s", gold_file, gate_file) :
@@ -1487,6 +1527,10 @@ static bool abc_cec_module(const CheckConfig &conf){
             log_error("Error executing ABC command: %s\n", cmd);
         }
     }
+
+    auto t1 = clock::now();
+    timing_stat.abc_cec_ms += std::chrono::duration_cast<std::chrono::milliseconds>(t1-t0).count();
+
     return correct;
 }
     
@@ -2136,7 +2180,7 @@ struct GuideCheckPass : public Pass {
         int k_induct = 20;
         int step_skip = 0;
         bool no_init = false;
-
+        
         size_t argidx;
         for (argidx = 1; argidx < args.size(); argidx++)
         {
@@ -2175,6 +2219,8 @@ struct GuideCheckPass : public Pass {
             }
             break;
         }
+
+        timing_stat = TimingStat();
 
         if (argidx + 2 == args.size()) {
             gold_top_mod_name = args[argidx++];
@@ -2216,6 +2262,8 @@ struct GuideCheckPass : public Pass {
         auto design_backup = design; 
         design = clone_design_for_passes(design);
 
+
+        auto t_lib_start = std::chrono::steady_clock::now();
 
         // Load library if specified
         RTLIL::Design *lib_design = nullptr;
@@ -2272,12 +2320,17 @@ struct GuideCheckPass : public Pass {
             }
         }
         
+        auto t_lib_end = std::chrono::steady_clock::now();
 
+        timing_stat.read_lib_ms += std::chrono::duration_cast<std::chrono::milliseconds>(t_lib_end-t_lib_start).count();
+
+        auto t_prep_start = std::chrono::steady_clock::now();
         run_pass("proc", design);
         run_pass("memory_map", design);
         run_pass("opt_expr", design);
         run_pass("techmap", design);
         run_pass("dffunmap", design);
+
         
         auto mod_map = hier_mod_map(design, conf);
     
@@ -2293,6 +2346,9 @@ struct GuideCheckPass : public Pass {
         // }
 
         run_pass("opt_clean", design);
+
+        auto t_prep_end = std::chrono::steady_clock::now();
+        timing_stat.prep_ms += std::chrono::duration_cast<std::chrono::milliseconds>(t_prep_end-t_prep_start).count();
 
         auto gold2cutpoints = match_signals(design, conf, mod_map);
 
@@ -2319,6 +2375,9 @@ struct GuideCheckPass : public Pass {
                 cec_result = false;
             }
         }
+
+        print_timing_stat(timing_stat);
+
         // run_pass("opt_clean", design_check);
         // run_pass("check", design_check);
         // run_pass("write_verilog 1.v", design_check );
