@@ -619,12 +619,14 @@ static std::vector<CutPoint> match_signals_module(RTLIL::Design *design, RTLIL::
         RTLIL::SigBit ksig = kentry.sig;
         
 
-        log("Matched signal %s: gold %s gate %s, Type %s\n",
-            name.c_str(), log_signal(gsig), log_signal(ksig), get_match_type_str(gentry.type));
+        // log("Matched signal %s: gold %s gate %s, Type %s\n",
+        //     name.c_str(), log_signal(gsig), log_signal(ksig), get_match_type_str(gentry.type));
 
         // Don't dump NONE type
-        // if(gentry.type != MatchType::NONE){
-        if(1){
+        // TODO: Warning: NONE type gentry may has the same signal name with DFF/other type's.
+        // This will lead to overwriting in name mapping in ABC. If didn't solve this in 
+        // ABC. Please DO NOT dump NONE type entries!
+        if(gentry.type != MatchType::NONE){
             fprintf(f, "Matched signal %s: gold %s gate %s, Type %s\n",
                 name.c_str(), log_signal(gsig).c_str(), log_signal(ksig).c_str(), 
                 get_match_type_str(gentry.type).c_str());
