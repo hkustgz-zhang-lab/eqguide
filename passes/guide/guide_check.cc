@@ -57,7 +57,12 @@ TODO: support latch?
     X(abc_cec_ms)                       \
     X(prep_ms)                          \
     X(dump_blif_ms)                     \
-    X(read_lib_ms)
+    X(read_lib_ms)                      \
+    X(hier_mod_map_ms)                  \
+    X(signal_map_ms)                    \
+    X(check_mul_ms)                     \
+    X(mul_map_ms)                       \
+    X(check_retime_ms)                  
 
 struct TimingStat {
 #define DECL_FIELD(name) std::uint64_t name = 0;
@@ -150,7 +155,7 @@ struct NamedSig {
 
 static inline void print_timing_stat(const TimingStat& s) {
     std::uint64_t t_total = 0;
-    log("Timing Stastics:\n");
+    log("Timing Statistics:\n");
 #define PRINT_FIELD(name) if(s.name) log("    %s: %.3lf s.\n", #name, s.name/1000.0);
     TIMINGSTAT_FIELDS(PRINT_FIELD)
 #undef PRINT_FIELD
@@ -302,6 +307,9 @@ ModMap hier_mod_map(RTLIL::Design *design, CheckConfig& conf)
     assert(design);
     ModMap mod_map;
     
+    auto t_start = std::chrono::steady_clock::now();
+    
+
     auto gold2gate = &mod_map.mod_map_gold;
     auto gate2gold = &mod_map.mod_map_gate;
     
@@ -359,6 +367,10 @@ ModMap hier_mod_map(RTLIL::Design *design, CheckConfig& conf)
     for(const auto &mod_name : mod_map.unmapped_mods_gate){
         log_warning("Gate module %s has no matching gold module.\n", log_id(mod_name));
     }
+
+    auto t_end = std::chrono::steady_clock::now();
+    timing_stat.hier_mod_map_ms += std::chrono::duration_cast<std::chrono::milliseconds>(t_end-t_start).count();
+
     return mod_map;
 }
 
@@ -1527,6 +1539,8 @@ static bool check_multi(RTLIL::Design* design, RTLIL::Module* mod, const string&
 
 static std::vector<std::pair<RTLIL::IdString, bool>> check_extract_multi(RTLIL::Design* design, MultiMap& mm, const string& tempdir_name){
 
+    auto t_start = std::chrono::steady_clock::now();
+    
     pool<Module*> mod_to_check;
     
     pool<Module*> mod_to_extract;
@@ -1571,12 +1585,16 @@ static std::vector<std::pair<RTLIL::IdString, bool>> check_extract_multi(RTLIL::
     for(auto mod: mod_to_blackbox) {
         mod->set_bool_attribute(ID(blackbox), true);
     }
-    
+    auto t_end = std::chrono::steady_clock::now();
+    timing_stat.check_mul_ms += std::chrono::duration_cast<std::chrono::milliseconds>(t_end-t_start).count();
     return results;
 }
 
 
 static MultiMap get_multi_map(RTLIL::Design* design, const ModMap &mod_map) {
+    
+    auto t_start = std::chrono::steady_clock::now();
+    
     auto mmap = mod_map.mod_map_gold;
 
     struct Multi {
@@ -1678,6 +1696,11 @@ static MultiMap get_multi_map(RTLIL::Design* design, const ModMap &mod_map) {
         }
         
     }
+
+    auto t_end = std::chrono::steady_clock::now();
+    timing_stat.mul_map_ms += std::chrono::duration_cast<std::chrono::milliseconds>(t_end-t_start).count();
+
+
     print_MultiMap(map);
     return map;
 }
@@ -2162,7 +2185,9 @@ Results check_extract_retime(const ModMap& mmap, const CheckConfig &conf)
 {
 
     std::set<std::pair<RTLIL::IdString, RTLIL::IdString>> retimed_mods;
-
+    auto t_start = std::chrono::steady_clock::now();
+    
+        
     // TODO: Maybe we should reconstruct the check_retime.
     // In check_retime(), the function construct the module-mapping relations
     // however, we already have this relationship.
@@ -2200,7 +2225,8 @@ Results check_extract_retime(const ModMap& mmap, const CheckConfig &conf)
             }
         }
     }
-
+    auto t_end = std::chrono::steady_clock::now();
+    timing_stat.check_retime_ms += std::chrono::duration_cast<std::chrono::milliseconds>(t_end-t_start).count();
     return results;
 }
 
@@ -2642,11 +2668,15 @@ struct GuideCheckPass : public Pass {
 
         timing_stat.read_lib_ms += std::chrono::duration_cast<std::chrono::milliseconds>(t_lib_end-t_lib_start).count();
 
-        auto t_prep_start = std::chrono::steady_clock::now();
+        auto t_prep_start1 = std::chrono::steady_clock::now();
         run_pass("proc", design);
         run_pass("memory_map", design);
         run_pass("opt_expr", design);
         run_pass("wreduce", design);
+        auto t_prep_end1 = std::chrono::steady_clock::now();
+        timing_stat.prep_ms += std::chrono::duration_cast<std::chrono::milliseconds>(t_prep_end1-t_prep_start1).count();
+
+
         ModMap mod_map = hier_mod_map(design, conf);
         MultiMap multi_map = get_multi_map(design, mod_map);
         auto multi_results = check_extract_multi(design, multi_map, tempdir_name);
@@ -2662,11 +2692,12 @@ struct GuideCheckPass : public Pass {
         if(!multi_result) { 
             log("GUIDE_CHECK multiplier check failed.\n");
         }
-        
+        auto t_prep_start2 = std::chrono::steady_clock::now();
         run_pass("techmap", design);
         run_pass("async2sync", design); // ! Warning: May cause side effects. Maybe we can move match_signals before this.
         run_pass("dffunmap", design);
-
+        auto t_prep_end2 = std::chrono::steady_clock::now();
+        timing_stat.prep_ms += std::chrono::duration_cast<std::chrono::milliseconds>(t_prep_end2-t_prep_start2).count();
         
 
         // remove_subclk(design, conf);
@@ -2696,8 +2727,7 @@ struct GuideCheckPass : public Pass {
         }
 
 
-        auto t_prep_end = std::chrono::steady_clock::now();
-        timing_stat.prep_ms += std::chrono::duration_cast<std::chrono::milliseconds>(t_prep_end-t_prep_start).count();
+        
 
         auto gold2cutpoints = match_signals(design, conf, mod_map);
 
