@@ -19,6 +19,7 @@
 
 #include "kernel/celltypes.h"
 #include "kernel/drivertools.h"
+#include "kernel/hashlib.h"
 #include "kernel/mem.h"
 #include "kernel/register.h"
 #include "kernel/rtlil.h"
@@ -26,11 +27,13 @@
 #include "kernel/ff.h"
 #include "kernel/sigtools.h"
 #include "kernel/yosys.h"
+#include <algorithm>
 #include <cassert>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <set>
 #include <string>
 #include <tuple>
 #include <chrono>
@@ -98,6 +101,16 @@ struct ModMap{
     pool<RTLIL::IdString> unmapped_mods_gold;
 };
 
+// the xx_cell under xx_mod. 
+struct MultiMapEntry{
+    RTLIL::IdString gold_mod;
+    RTLIL::IdString gate_mod;
+    RTLIL::IdString gold_cell; 
+    RTLIL::IdString gate_cell; 
+    bool is_multi_mod;  // means that the whole module is a multiplier
+};
+
+using MultiMap = std::vector<MultiMapEntry>;
 
 #define MATCHTYPE_FIELDS(X)       \
     X(NONE)                       \
@@ -153,6 +166,31 @@ static inline string get_match_type_str(const MatchType& t) {
     }
     assert(0);
     return "UNKNOWN";
+}
+
+static void print_MultiMap(const MultiMap &mm)
+{
+    log("MultiMap entries: %zu\n", mm.size());
+    for (size_t i = 0; i < mm.size(); ++i) {
+        const auto &e = mm[i];
+        if(!e.is_multi_mod){
+            log("  [%zu] gold_mod=%s gate_mod=%s gold_cell=%s gate_cell=%s is_multi_mod=%d\n",
+                i,
+                log_id(e.gold_mod),
+                log_id(e.gate_mod),
+                log_id(e.gold_cell),
+                log_id(e.gate_cell),
+                int(e.is_multi_mod));
+        }
+        else { 
+            log("  [%zu] gold_mod=%s gate_mod=%s is_multi_mod=%d\n",
+                i,
+                log_id(e.gold_mod),
+                log_id(e.gate_mod),
+                int(e.is_multi_mod));
+        }
+    }
+    
 }
 
 static std::string strip_backslash(const RTLIL::IdString &id)
@@ -1205,6 +1243,31 @@ static void replace_mul_with_commutative_stub(RTLIL::Design *design, RTLIL::Modu
     mod->remove(cell);
 }
 
+
+// Must ensure the cell is a multiplier.
+static std::pair<int,bool> get_multiplier_width_sign(RTLIL::Design *design, RTLIL::Cell *cell) 
+{   
+    bool sign;
+    int width;
+    RTLIL::SigSpec op1, op2;
+    pick_operands(design, cell, op1, op2);
+    assert(op1.size() == op2.size());
+    
+    width = op1.size();
+
+    if(cell->type == ID($mul)) {
+        sign = cell->parameters[ID::A_SIGNED].as_bool();
+    }
+    else {
+        auto mod = design->module(cell->type);
+        assert(mod);
+        sign = mod->get_bool_attribute(ID(is_signed));
+    }
+    
+    return {width, sign};
+}
+
+
 static void extract_multi(RTLIL::Design *design, RTLIL::Module *mod)
 {
     std::vector<RTLIL::Cell*> cells = mod->cells();
@@ -1297,10 +1360,12 @@ static string dump_aig(RTLIL::Design* design, const string &dir_name, RTLIL::Mod
         run_pass(stringf("read_verilog -overwrite %s", lib_file), design_copy);
     run_pass("hierarchy -top " + mod->name.str(), design_copy);
     run_pass(stringf("flatten %s", mod->name.str()), design_copy);
-    run_pass(stringf("opt"), design_copy);
-    run_pass(stringf("proc"), design_copy);
-    run_pass(stringf("techmap"), design_copy);
+    // run_pass(stringf("opt"), design_copy);
+    // run_pass(stringf("proc"), design_copy);
+    // run_pass("setundef -undriven -zero", design);
     run_pass(stringf("opt_expr"), design_copy);
+    run_pass(stringf("techmap"), design_copy);
+    // run_pass(stringf("opt_expr"), design_copy);
     run_pass(stringf("aigmap"), design_copy);
     run_pass(stringf("write_aiger %s", aig_file), design_copy);
     
@@ -1433,7 +1498,7 @@ static string dump_smt2(RTLIL::Design* design, const string &dir_name, std::pair
 }
 
 
-static bool check_multi(RTLIL::Design* design, RTLIL::Module* mod, string& tempdir_name, const string& lib_file){
+static bool check_multi(RTLIL::Design* design, RTLIL::Module* mod, const string& tempdir_name, const string& lib_file){
     log_assert(mod->get_bool_attribute(ID(multiplier)));
     bool is_signed = mod->get_bool_attribute(ID(is_signed));    
     auto aig_file = dump_aig(design, tempdir_name, mod, lib_file);
@@ -1459,26 +1524,162 @@ static bool check_multi(RTLIL::Design* design, RTLIL::Module* mod, string& tempd
         return true;
 }
 
-static bool check_extract_multi(RTLIL::Design* design, RTLIL::Module* mod, string& tempdir_name, std::vector<RTLIL::Module*> &multi_mods,
-                                const string& lib_file){
-    if(mod->get_bool_attribute(ID(multiplier))){
-        multi_mods.push_back(mod);
-        return check_multi(design, mod, tempdir_name, lib_file);
+static std::vector<std::pair<RTLIL::IdString, bool>> check_extract_multi(RTLIL::Design* design, MultiMap& mm, const string& tempdir_name){
+
+    pool<Module*> mod_to_check;
+    
+    pool<Module*> mod_to_extract;
+    pool<Module*> mod_to_blackbox;
+
+    std::vector<std::pair<RTLIL::IdString, bool>> results;
+    
+    for(auto &e : mm) {
+        if(e.is_multi_mod){
+            auto goldm = design->module(e.gold_mod);
+            auto gatem = design->module(e.gate_mod);
+            mod_to_check.insert(goldm);
+            mod_to_check.insert(gatem);
+            mod_to_blackbox.insert(goldm);
+            mod_to_blackbox.insert(gatem);
+        }
+        else { 
+            auto goldm = design->module(e.gold_mod);
+            auto gatem = design->module(e.gate_mod);
+            assert(goldm); assert(gatem);
+            auto goldc = goldm->cell(e.gold_cell);
+            auto gatec = gatem->cell(e.gate_cell);
+            assert(goldc); assert(gatec);
+            auto gold_mul = design->module(goldc->type);
+            auto gate_mul = design->module(gatec->type);
+            if(goldc->type.isPublic() || goldc->type.begins_with("$paramod")) mod_to_check.insert(gold_mul);
+            if(gatec->type.isPublic() || gatec->type.begins_with("$paramod")) mod_to_check.insert(gate_mul);
+            mod_to_extract.insert(goldm);
+            mod_to_extract.insert(gatem);
+        }
     }
-    else 
-    {
-        auto log_files_backup = log_files;
-        auto log_streams_backup = log_streams;
-        log_files.clear();
-	    log_streams.clear();
-        run_pass(string("wreduce ") + mod->name.str(), design);
+
+    for(auto mod: mod_to_check){
+        bool result = check_multi(design, mod, tempdir_name, "");
+        results.push_back({mod->name,result});
+    }
+
+    for(auto mod: mod_to_extract) {
         extract_multi(design, mod);
-        log_files = log_files_backup;
-        log_streams = log_streams_backup;
     }
-    return true;
+
+    for(auto mod: mod_to_blackbox) {
+        mod->set_bool_attribute(ID(blackbox), true);
+    }
+    
+    return results;
 }
 
+
+static MultiMap get_multi_map(RTLIL::Design* design, const ModMap &mod_map) {
+    auto mmap = mod_map.mod_map_gold;
+
+    struct Multi {
+        int width;
+        bool sign;
+        RTLIL::IdString type;
+        Cell* cell;
+        bool operator<(const Multi& other) const {
+            if(sign != other.sign) return sign < other.sign; 
+            return width < other.width;
+        }
+
+        bool param_equal(const Multi& other) const {
+            return (width == other.width) && (sign == other.sign);
+        }
+    };
+
+    vector<Multi> gold_multi;
+    vector<Multi> gate_multi;
+
+    MultiMap map;
+    
+
+    for(const auto& [gold_mod_name, gate_mod_name]: mmap) {
+        auto gold_mod = design->module(gold_mod_name);
+        auto gate_mod = design->module(gate_mod_name);
+        assert(gold_mod);
+        assert(gate_mod);
+
+        // Module map
+        bool gold_is_mulmod = gold_mod->get_bool_attribute(ID(multiplier));
+        bool gate_is_mulmod = gate_mod->get_bool_attribute(ID(multiplier));
+
+        if (gold_is_mulmod || gate_is_mulmod) {
+            if (gold_is_mulmod && gate_is_mulmod) {
+                MultiMapEntry e;
+                e.gold_mod = gold_mod_name;
+                e.gate_mod = gate_mod_name;
+                e.gold_cell = "";
+                e.gate_cell = "";
+                e.is_multi_mod = true;
+                map.push_back(e);
+            } else {
+                log_warning("Can not map multiplier %s and %s: One of them is not multiplier!\n",
+                            log_id(gold_mod_name), log_id(gate_mod_name));
+            }
+            continue;
+        }
+
+
+
+        // Cell map;
+        gold_multi.clear();
+        gate_multi.clear();    
+        for(auto cell: gold_mod->cells()) { 
+            if(is_multiplier_cell(design,cell)) {
+                auto w_s = get_multiplier_width_sign(design, cell);
+                gold_multi.push_back({w_s.first,w_s.second,cell->type,cell});
+            }
+        }
+        for(auto cell: gate_mod->cells()){
+            if(is_multiplier_cell(design,cell)) {
+                auto w_s = get_multiplier_width_sign(design, cell);
+                gate_multi.push_back({w_s.first,w_s.second,cell->type,cell});
+            }
+        }
+
+        if(gold_multi.size() != gate_multi.size()) { 
+            log_warning("Module %s and %s have different number of multipliers! Skip...\n", 
+                gold_mod->name, gate_mod->name);
+            continue;
+        }
+        if(gold_multi.empty() || gate_multi.empty()) {
+            continue;
+        }
+        std::sort(gold_multi.begin(),gold_multi.end());
+        std::sort(gate_multi.begin(),gate_multi.end());
+        bool map_failed = false;
+        MultiMap map_tmp;
+        for(size_t i=0; i<gold_multi.size(); i++) {
+            auto &mul_gold = gold_multi[i];
+            auto &mul_gate = gate_multi[i];
+            if(!mul_gold.param_equal(mul_gate)){
+                log_warning("Cell %s in Module %s has different parameter with Cell %s in Module %s! Skip this two module!\n",
+                    mul_gold.cell->name, gold_mod_name, mul_gate.cell->name, gate_mod_name);
+                map_failed = true;
+                break;
+            }
+            MultiMapEntry entry;
+            entry.gold_mod  = gold_mod_name;
+            entry.gate_mod  = gate_mod_name;
+            entry.gold_cell = mul_gold.cell->name;
+            entry.gate_cell = mul_gate.cell->name;
+            entry.is_multi_mod = false;
+            map_tmp.push_back(entry);
+        }
+        if(!map_failed) {
+            map.insert(map.end(), map_tmp.begin(), map_tmp.end());
+        }
+        
+    }
+    print_MultiMap(map);
+    return map;
+}
 
 static bool abc_check(const CheckConfig &conf, bool use_blif=false, string check_cmd="cec"){
     auto gold_mod = conf.gold_mod;
@@ -2055,22 +2256,24 @@ struct GuideCheckMultiPass : public Pass {
         tempdir_name += proc_program_prefix() + "yosys-guide-check-XXXXXX";
         tempdir_name = make_temp_dir(tempdir_name);
         std::vector<RTLIL::Module*> multi_mods;
-        for(auto mod : modules)
-        {
-            log("Checking module %s for multiplier extraction.\n", mod->name.str());
-            bool multi_result = false;
-            multi_result = check_extract_multi(design, mod, tempdir_name, multi_mods, lib_file);
-            if(!multi_result)
-            {
-                log("\nGUIDE_CHECK_MULTI failed for module %s.\n", log_id(mod->name));
-            }
-            else 
-            {
-                log("\nGUIDE_CHECK_MULTI passed for module %s.\n", log_id(mod->name));
-            }
-        }
 
-        (void)multi_mods;
+        log_error("This command has been deprecated!\n");
+        // for(auto mod : modules)
+        // {
+        //     log("Checking module %s for multiplier extraction.\n", mod->name.str());
+        //     bool multi_result = false;
+        //     multi_result = check_extract_multi(design, mod, tempdir_name, multi_mods, lib_file);
+        //     if(!multi_result)
+        //     {
+        //         log("\nGUIDE_CHECK_MULTI failed for module %s.\n", log_id(mod->name));
+        //     }
+        //     else 
+        //     {
+        //         log("\nGUIDE_CHECK_MULTI passed for module %s.\n", log_id(mod->name));
+        //     }
+        // }
+
+        // (void)multi_mods;
         // for(auto mod : multi_mods)
         // {
         //     if(design->top_module() != mod)
@@ -2422,7 +2625,7 @@ struct GuideCheckPass : public Pass {
         };
 
         vector<std::pair<RTLIL::IdString,bool>> cec_result_mod;
-        bool multi_result = false, cec_result = false, retime_result;
+        bool multi_result = true, cec_result = false, retime_result;
 
         if(lib_design){
             lib_import_to_design(design, lib_design);
@@ -2443,22 +2646,58 @@ struct GuideCheckPass : public Pass {
         run_pass("proc", design);
         run_pass("memory_map", design);
         run_pass("opt_expr", design);
+        run_pass("wreduce", design);
+        ModMap mod_map = hier_mod_map(design, conf);
+        MultiMap multi_map = get_multi_map(design, mod_map);
+        auto mod_tmp = design->module(multi_map[0].gold_mod);
+        log("Find Module %s\n",mod_tmp->name);
+        auto cell_tmp = mod_tmp->cell(multi_map[0].gold_cell);
+        assert(cell_tmp);
+        log("Find Cell %s\n", cell_tmp->name);
+        auto multi_results = check_extract_multi(design, multi_map, tempdir_name);
+        for(auto r: multi_results){
+            log("GUIDE_CHECK for multiplier module : %s : %s\n",
+                log_id(r.first),
+                r.second ? "\033[1;32mPASSED\033[0m" : "\033[1;31mFAILED\033[0m");
+            if (!r.second) {
+                multi_result = false;
+            }
+        }
+        if(!multi_result) { 
+            log("GUIDE_CHECK multiplier check failed.\n");
+        }
+        
         run_pass("techmap", design);
         run_pass("async2sync", design); // ! Warning: May cause side effects. Maybe we can move match_signals before this.
         run_pass("dffunmap", design);
 
         
-        auto mod_map = hier_mod_map(design, conf);
-    
 
         // remove_subclk(design, conf);
 
-
-        // formalff -clk2ff -ff2anyinit gate
-
-        
-
         run_pass("opt_clean", design);
+
+
+        // run_pass("opt_clean", design_check);
+        // run_pass("check", design_check);
+        // run_pass("write_verilog 1.v", design_check );
+        // system("yosys -q -p 'read_verilog 1.v; proc; opt_expr; techmap; show -colors 1 -prefix gold gold_bbox'");
+        // system("yosys -q -p 'read_verilog bbox.v; proc; opt_expr; techmap; show -colors 1 -prefix test bbox'");
+        // return;
+
+
+        // (void)multi_mods;
+
+        (void) retime_result;
+        // retime_result = check_extract_retime(conf);
+
+        // if(!retime_result)
+        // {
+        //     log("GUIDE_CHECK retime check failed.\n");
+        //     goto check_failed;
+        // }
+        // log("GUIDE_CHECK retime check passed.\n");
+
 
         auto t_prep_end = std::chrono::steady_clock::now();
         timing_stat.prep_ms += std::chrono::duration_cast<std::chrono::milliseconds>(t_prep_end-t_prep_start).count();
@@ -2478,87 +2717,90 @@ struct GuideCheckPass : public Pass {
 
         cec_result = true; 
         for(auto r: cec_result_mod){
-
-    
-            log("GUIDE_CHECK result for module : %s : %s\n",
-                log_id(r.first),
-                r.second ? "\033[1;32mPASSED\033[0m" : "\033[1;31mFAILED\033[0m");
-
             if(!r.second){
                 cec_result = false;
             }
         }
 
+        report(gold_mod_name_id, gate_mod_name_id,
+                multi_results,cec_result_mod);
+
         print_timing_stat(timing_stat);
 
-        // run_pass("opt_clean", design_check);
-        // run_pass("check", design_check);
-        // run_pass("write_verilog 1.v", design_check );
-        // system("yosys -q -p 'read_verilog 1.v; proc; opt_expr; techmap; show -colors 1 -prefix gold gold_bbox'");
-        // system("yosys -q -p 'read_verilog bbox.v; proc; opt_expr; techmap; show -colors 1 -prefix test bbox'");
-        // return;
-        // std::vector<RTLIL::Module*> multi_mods;
-
-        (void) multi_result;
-
-        // auto all_mods = design->all_selected_modules();
-        // for(auto mod : all_mods)
-        // {
-        //     multi_result = check_extract_multi(design, mod, tempdir_name, multi_mods, lib_file);
-        //     if(!multi_result)
-        //     {
-        //         log("GUIDE_CHECK multi-module check failed.\n");
-        //         goto check_failed;
-        //     }
-        // }
-        // log("GUIDE_CHECK multi-module check passed.\n");
-
-        // (void)multi_mods;
-
-        (void) retime_result;
-        // retime_result = check_extract_retime(conf);
-
-        // if(!retime_result)
-        // {
-        //     log("GUIDE_CHECK retime check failed.\n");
-        //     goto check_failed;
-        // }
-        // log("GUIDE_CHECK retime check passed.\n");
-
-
         
-        if(!cec_result)
-        {
-            log("GUIDE_CHECK cec check failed.\n");
-            goto check_failed;
-        }
-
-        log("\nGUIDE_CHECK PASSED: Modules %s and %s are equivalent.\n",
-            log_id(gold_mod_name_id), log_id(gate_mod_name_id));
-        
-        goto end_pass;
-
-check_failed:
-        if(assert_mode)
-        {
-            log_cmd_error("\nGUIDE_CHECK FAILED: Modules %s and %s are NOT equivalent.\n",
-                log_id(gold_mod_name_id), log_id(gate_mod_name_id));
-        }
-        else
-        {
-            log("\nGUIDE_CHECK FAILED: Modules %s and %s are NOT equivalent.\n",
-                log_id(gold_mod_name_id), log_id(gate_mod_name_id));
-        }
-end_pass:
+    
         if (!conf.nocleanup) {
 			log("Removing temp directory.\n");
 			remove_directory(conf.tempdir_name);
 		}
 
+        bool succ = cec_result && multi_result;
+        if(assert_mode && !succ){
+            log_error("GUIDE_CHECK Assertion Failed!\n");
+        }
+
         delete design;
         design = design_backup;
         log_pop();
 	}
+    bool report(RTLIL::IdString gold_mod_name_id, RTLIL::IdString gate_mod_name_id,
+                    const std::vector<std::pair<RTLIL::IdString,bool>> &mul_results,
+                    const std::vector<std::pair<RTLIL::IdString,bool>> &cec_results)
+    {
+        auto ok_str = [](bool ok) {
+            return ok ? "\033[1;32mPASSED\033[0m" : "\033[1;31mFAILED\033[0m";
+        };
+
+        auto print_sep = [](int w1, int w2, int w3) {
+            log("+-%.*s-+-%.*s-+-%.*s-+\n",
+                w1, "------------------------------------------------------------",
+                w2, "------------------------------------------------------------",
+                w3, "------------------------------------------------------------");
+        };
+
+        auto print_row = [](int w1, int w2, int w3,
+                            const char *c1, const char *c2, const char *c3) {
+            log("| %-*s | %-*s | %-*s |\n", w1, c1, w2, c2, w3, c3);
+        };
+
+        const int W_CAT = 12;
+        const int W_MOD = 35;
+        const int W_RES = 6;
+
+        bool mul_ok = true;
+        bool cec_ok = true;
+
+        log("\n================== Equivalence Checking Report ================\n");
+
+        print_sep(W_CAT, W_MOD, W_RES);
+        print_row(W_CAT, W_MOD, W_RES, "Category", "Module", "Result");
+        print_sep(W_CAT, W_MOD, W_RES);
+
+        for (const auto &r : mul_results) {
+            print_row(W_CAT, W_MOD, W_RES, "MULTIPLIER", log_id(r.first), ok_str(r.second));
+            if (!r.second) mul_ok = false;
+        }
+
+        for (const auto &r : cec_results) {
+            print_row(W_CAT, W_MOD, W_RES, "CEC/SEC", log_id(r.first), ok_str(r.second));
+            if (!r.second) cec_ok = false;
+        }
+
+        print_sep(W_CAT, W_MOD, W_RES);
+
+        bool succ = mul_ok && cec_ok;
+
+        if (!succ) {
+            log("\nGUIDE_CHECK FAILED: Modules %s and %s are NOT equivalent.\n",
+                log_id(gold_mod_name_id), log_id(gate_mod_name_id));
+        } else {
+            log("\nGUIDE_CHECK PASSED: Modules %s and %s are equivalent.\n",
+                log_id(gold_mod_name_id), log_id(gate_mod_name_id));
+        }
+
+        log("===============================================================\n");
+        return succ;
+    }
 } GuideCheckPass;
 
 
