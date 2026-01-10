@@ -2437,6 +2437,7 @@ struct GuideCheckPass : public Pass {
         run_pass("memory_map", design);
         run_pass("opt_expr", design);
         run_pass("techmap", design);
+        run_pass("async2sync", design); // TODO: Warning: May cause side effects. Maybe we can move match_signals before this.
         run_pass("dffunmap", design);
 
         
@@ -2448,10 +2449,7 @@ struct GuideCheckPass : public Pass {
 
         // formalff -clk2ff -ff2anyinit gate
 
-        // for(auto mod: design-> modules()){
-        //     run_pass(stringf("async2sync %s", mod->name), design);
-        //     run_pass(stringf("formalff -clk2ff %s", (mod->name)), design);
-        // }
+        
 
         run_pass("opt_clean", design);
 
