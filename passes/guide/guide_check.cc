@@ -69,6 +69,8 @@ struct TimingStat {
 
 TimingStat timing_stat;
 
+using Results = std::vector<std::pair<RTLIL::IdString, bool>>;
+
 struct SeqCheckConfig
 {
     int k_induct = 20;
@@ -1482,13 +1484,12 @@ static string dump_smt2(RTLIL::Design* design, const string &dir_name, std::pair
         run_pass(stringf("read_verilog -overwrite %s", lib_file), design_copy);
     run_pass(stringf("flatten %s", gold_mod->name.str()), design_copy);
     run_pass(stringf("flatten %s", gate_mod->name.str()), design_copy);
-    run_pass(stringf("proc %s", gold_mod->name.str()), design_copy);
-    run_pass(stringf("proc %s", gate_mod->name.str()), design_copy);
+    // run_pass(stringf("proc %s", gold_mod->name.str()), design_copy);
+    // run_pass(stringf("proc %s", gate_mod->name.str()), design_copy);
     run_pass(stringf("miter -equiv -make_assert -flatten %s %s %s",
                     gold_mod->name.str(), gate_mod->name.str(), mod_name), design_copy);
     run_pass(stringf("hierarchy -top %s", mod_name), design_copy);
-    run_pass(stringf("techmap"), design_copy);
-    // run_pass(stringf("write_verilog 1.v"), design_copy);
+    // run_pass(stringf("techmap"), design_copy);
     run_pass(stringf("prep -top %s", mod_name), design_copy);
     run_pass(stringf("write_smt2 -wires %s", smt2_file), design_copy);
     delete design_copy;
@@ -1939,7 +1940,7 @@ static bool bmcinduct_check(const CheckConfig &conf){
     std::string gold_name = strip_backslash(conf.gold_mod->name);
     std::string gate_name = strip_backslash(conf.gate_mod->name);
 
-    auto smt2_file = dump_smt2(conf.design, conf.tempdir_name, {conf.gold_mod, conf.gate_mod},  conf.lib_file);
+    auto smt2_file = dump_smt2(conf.design, conf.tempdir_name, {conf.gold_mod, conf.gate_mod}, "");
 
     string cmd = proc_self_dirname() + proc_program_prefix() + "yosys-smtbmc ";
 
@@ -2064,117 +2065,110 @@ static std::vector<RTLIL::Module*> topo_sort_modules(RTLIL::Design *design, cons
     return ts.sorted;
 }
 
-
-bool check_retime(const CheckConfig &conf,
+// maybe we should reconstruct  the check_retime.
+Results check_retime(const CheckConfig &conf,
                   std::set<std::pair<RTLIL::IdString, RTLIL::IdString>>&retimed_mods)
 {
+    Results results;
     auto sorted_mods = topo_sort_modules(conf.design);
+    std::vector<RTLIL::Module*> gate_mods;
+    std::map<RTLIL::IdString, RTLIL::Module*> gold_mods;
 
-        std::vector<RTLIL::Module*> gate_mods;
-        std::map<RTLIL::IdString, RTLIL::Module*> gold_mods;
-
-        for(auto mod : sorted_mods)
+    for(auto mod : sorted_mods)
+    {
+        if((mod->name.begins_with(RTLIL::escape_id(conf.gate_prefix)) || mod->name == conf.gate_mod->name )
+            && mod->get_bool_attribute(ID(retime)))
         {
-            if((mod->name.begins_with(RTLIL::escape_id(conf.gate_prefix)) || mod->name == conf.gate_mod->name )
-                && mod->get_bool_attribute(ID(retime)))
-            {
-                gate_mods.push_back(mod);
-            }
-            else 
-            if((mod->name.begins_with(RTLIL::escape_id(conf.gold_prefix)) || mod->name == conf.gold_mod->name ))
-            {
-                gold_mods[mod->name] = mod;
-            }
+            gate_mods.push_back(mod);
         }
-
-        for(auto gate_m : gate_mods)
+        else 
+        if((mod->name.begins_with(RTLIL::escape_id(conf.gold_prefix)) || mod->name == conf.gold_mod->name ))
         {
-            string original_name = gate_m ->name == conf.gate_mod->name ? 
-                RTLIL::unescape_id(conf.gold_mod->name) :
-                RTLIL::unescape_id(gate_m->name).substr(conf.gate_prefix.size()
-            );
-            
-            auto gold_m_it = gold_mods.find(
-                original_name == conf.gold_mod->name.str() ?
-                conf.gold_mod->name :
-                RTLIL::escape_id(conf.gold_prefix + original_name)
-            );
-            if(gold_m_it == gold_mods.end())
-            {
-                
-                for(auto gm_pair : gold_mods)
-                {
-                    log("Available gold module: %s\n", log_id(gm_pair.first));
-                }
-                for(auto gm : gate_mods)
-                {
-                    log("Available gate module: %s\n", log_id(gm->name));
-                }
-                log_error("Can't find the corresponding gold module for gate module %s.\n", log_id(gate_m->name));
-                continue;
-            }
-            auto gold_m = gold_m_it->second;
-
-            retimed_mods.insert({gold_m->name, gate_m->name});
+            gold_mods[mod->name] = mod;
         }
+    }
 
-        bool final_result = true;
-
-        for (auto mod_pair : retimed_mods)
+    for(auto gate_m : gate_mods)
+    {
+        string original_name = gate_m ->name == conf.gate_mod->name ? 
+            RTLIL::unescape_id(conf.gold_mod->name) :
+            RTLIL::unescape_id(gate_m->name).substr(conf.gate_prefix.size()
+        );
+        
+        auto gold_m_it = gold_mods.find(
+            original_name == conf.gold_mod->name.str() ?
+            conf.gold_mod->name :
+            RTLIL::escape_id(conf.gold_prefix + original_name)
+        );
+        if(gold_m_it == gold_mods.end())
         {
-            auto gold_name = mod_pair.first;
-            auto gate_name = mod_pair.second;
-            auto gold_m = conf.design->module(gold_name);
-            auto gate_m = conf.design->module(gate_name);
-            if (!gold_m || !gate_m) {
-                log_warning("Skipping retime check for missing module pair: gold=%s vs gate=%s\n",
-                    log_id(gold_name), log_id(gate_name));
-                final_result = false;
-                continue;
-            }
-            log("Checking retimed module pair: gold=%s vs gate=%s\n", log_id(gold_name), log_id(gate_name));
-            CheckConfig conf_ = {
-                .nocleanup = conf.nocleanup,
-                .abc_exe_file = conf.abc_exe_file,
-                .tempdir_name = conf.tempdir_name,
-                .design = conf.design,
-                .gold_mod = gold_m,
-                .gate_mod = gate_m,
-                .gold_prefix = conf.gold_prefix,
-                .gate_prefix = conf.gate_prefix,
-                .lib_file = conf.lib_file,
-                .seq_check_cfg = conf.seq_check_cfg
-            };
-
-            //bool dsec_result = abc_dsec(conf_);
-            bool dsec_result = bmcinduct_check(conf_);
-
-            if(!dsec_result)
-            {
-                log("\nGUIDE_CHECK_RETIME failed for module pair: gold=%s vs gate=%s\n", 
-                    log_id(gold_name), log_id(gate_name));
-                final_result = false;
-                break;
-            }
-            else 
-            {
-                log("\nGUIDE_CHECK_RETIME passed for module pair: gold=%s vs gate=%s\n", 
-                    log_id(gold_name), log_id(gate_name));
-            }
             
-            
+            for(auto gm_pair : gold_mods)
+            {
+                log("Available gold module: %s\n", log_id(gm_pair.first));
+            }
+            for(auto gm : gate_mods)
+            {
+                log("Available gate module: %s\n", log_id(gm->name));
+            }
+            log_error("Can't find the corresponding gold module for gate module %s.\n", log_id(gate_m->name));
+            continue;
         }
+        auto gold_m = gold_m_it->second;
 
-        return final_result;
+        retimed_mods.insert({gold_m->name, gate_m->name});
+    }
+
+
+    for (auto mod_pair : retimed_mods)
+    {
+        auto gold_name = mod_pair.first;
+        auto gate_name = mod_pair.second;
+        auto gold_m = conf.design->module(gold_name);
+        auto gate_m = conf.design->module(gate_name);
+        if (!gold_m || !gate_m) {
+            log_warning("Skipping retime check for missing module pair: gold=%s vs gate=%s\n",
+                log_id(gold_name), log_id(gate_name));
+            continue;
+        }
+        log("Checking retimed module pair: gold=%s vs gate=%s\n", log_id(gold_name), log_id(gate_name));
+        CheckConfig conf_ = {
+            .nocleanup = conf.nocleanup,
+            .abc_exe_file = conf.abc_exe_file,
+            .tempdir_name = conf.tempdir_name,
+            .design = conf.design,
+            .gold_mod = gold_m,
+            .gate_mod = gate_m,
+            .gold_prefix = conf.gold_prefix,
+            .gate_prefix = conf.gate_prefix,
+            .lib_file = conf.lib_file,
+            .seq_check_cfg = conf.seq_check_cfg
+        };
+
+        //bool dsec_result = abc_dsec(conf_);
+        bool result = bmcinduct_check(conf_);
+
+        
+        results.push_back({get_orignal_mod_name(gold_m->name, conf.gold_mod->name, conf.gold_prefix),
+                        result});
+        
+    }
+
+    return results;
 }
 
 
-bool check_extract_retime(const CheckConfig &conf)
+Results check_extract_retime(const ModMap& mmap, const CheckConfig &conf)
 {
 
     std::set<std::pair<RTLIL::IdString, RTLIL::IdString>> retimed_mods;
 
-    bool check_result = check_retime(conf, retimed_mods);
+    // TODO: Maybe we should reconstruct the check_retime.
+    // In check_retime(), the function construct the module-mapping relations
+    // however, we already have this relationship.
+    // It is caused by historical reason.
+    (void)mmap;
+    Results results = check_retime(conf, retimed_mods);
     
     std::set<RTLIL::IdString> blackbox_mods;
 
@@ -2207,7 +2201,7 @@ bool check_extract_retime(const CheckConfig &conf)
         }
     }
 
-    return check_result;
+    return results;
 }
 
 struct GuideCheckMultiPass : public Pass {
@@ -2406,7 +2400,12 @@ struct GuideCheckRetimePass : public Pass {
         tempdir_name = make_temp_dir(tempdir_name);
         log("Creating temporary directory %s for GUIDE_CHECK pass.\n", tempdir_name);
         
-        bool result = check_extract_retime(CheckConfig{
+    
+        log_error("This command has been deprecated!\n");
+
+        ModMap map;
+        bool result =false;
+        auto results = check_extract_retime(map,CheckConfig{
             nocleanup,
             abc_exe_file,
             tempdir_name,
@@ -2421,12 +2420,13 @@ struct GuideCheckRetimePass : public Pass {
                 step_skip,
                 weak_mode,
                 no_init
-            }
+            },
+            nullptr
         });
 
-        if(!nocleanup){
-            remove_directory(tempdir_name);
-        }
+        // if(!nocleanup){
+        //     remove_directory(tempdir_name);
+        // }
 
         if(result){
             log("\nGUIDE_CHECK_RETIME PASSED: Retimed design is equivalent to the gold design.\n");
@@ -2625,7 +2625,7 @@ struct GuideCheckPass : public Pass {
         };
 
         vector<std::pair<RTLIL::IdString,bool>> cec_result_mod;
-        bool multi_result = true, cec_result = false, retime_result;
+        bool multi_result = true, cec_result = true, retime_result = true;
 
         if(lib_design){
             lib_import_to_design(design, lib_design);
@@ -2649,11 +2649,6 @@ struct GuideCheckPass : public Pass {
         run_pass("wreduce", design);
         ModMap mod_map = hier_mod_map(design, conf);
         MultiMap multi_map = get_multi_map(design, mod_map);
-        auto mod_tmp = design->module(multi_map[0].gold_mod);
-        log("Find Module %s\n",mod_tmp->name);
-        auto cell_tmp = mod_tmp->cell(multi_map[0].gold_cell);
-        assert(cell_tmp);
-        log("Find Cell %s\n", cell_tmp->name);
         auto multi_results = check_extract_multi(design, multi_map, tempdir_name);
         for(auto r: multi_results){
             log("GUIDE_CHECK for multiplier module : %s : %s\n",
@@ -2661,6 +2656,7 @@ struct GuideCheckPass : public Pass {
                 r.second ? "\033[1;32mPASSED\033[0m" : "\033[1;31mFAILED\033[0m");
             if (!r.second) {
                 multi_result = false;
+                break;
             }
         }
         if(!multi_result) { 
@@ -2688,15 +2684,16 @@ struct GuideCheckPass : public Pass {
 
         // (void)multi_mods;
 
-        (void) retime_result;
-        // retime_result = check_extract_retime(conf);
+        
+        auto retime_results = check_extract_retime(mod_map, conf);
 
-        // if(!retime_result)
-        // {
-        //     log("GUIDE_CHECK retime check failed.\n");
-        //     goto check_failed;
-        // }
-        // log("GUIDE_CHECK retime check passed.\n");
+        retime_result = true;
+        for(auto &r: retime_results) {
+            if(!r.second) {
+                retime_result = false;
+                break;
+            }
+        }
 
 
         auto t_prep_end = std::chrono::steady_clock::now();
@@ -2719,11 +2716,12 @@ struct GuideCheckPass : public Pass {
         for(auto r: cec_result_mod){
             if(!r.second){
                 cec_result = false;
+                break;
             }
         }
 
         report(gold_mod_name_id, gate_mod_name_id,
-                multi_results,cec_result_mod);
+                multi_results,retime_results, cec_result_mod);
 
         print_timing_stat(timing_stat);
 
@@ -2734,7 +2732,7 @@ struct GuideCheckPass : public Pass {
 			remove_directory(conf.tempdir_name);
 		}
 
-        bool succ = cec_result && multi_result;
+        bool succ = cec_result && multi_result && retime_result;
         if(assert_mode && !succ){
             log_error("GUIDE_CHECK Assertion Failed!\n");
         }
@@ -2743,9 +2741,11 @@ struct GuideCheckPass : public Pass {
         design = design_backup;
         log_pop();
 	}
+
     bool report(RTLIL::IdString gold_mod_name_id, RTLIL::IdString gate_mod_name_id,
-                    const std::vector<std::pair<RTLIL::IdString,bool>> &mul_results,
-                    const std::vector<std::pair<RTLIL::IdString,bool>> &cec_results)
+                    Results &mul_results,
+                    Results &retime_results,
+                    Results &cec_results)
     {
         auto ok_str = [](bool ok) {
             return ok ? "\033[1;32mPASSED\033[0m" : "\033[1;31mFAILED\033[0m";
@@ -2769,6 +2769,7 @@ struct GuideCheckPass : public Pass {
 
         bool mul_ok = true;
         bool cec_ok = true;
+        bool retime_ok = true;
 
         log("\n================== Equivalence Checking Report ================\n");
 
@@ -2781,6 +2782,11 @@ struct GuideCheckPass : public Pass {
             if (!r.second) mul_ok = false;
         }
 
+        for (const auto &r : retime_results) {
+            print_row(W_CAT, W_MOD, W_RES, "RETIMING", log_id(r.first), ok_str(r.second));
+            if (!r.second) retime_ok = false;
+        }
+
         for (const auto &r : cec_results) {
             print_row(W_CAT, W_MOD, W_RES, "CEC/SEC", log_id(r.first), ok_str(r.second));
             if (!r.second) cec_ok = false;
@@ -2788,7 +2794,7 @@ struct GuideCheckPass : public Pass {
 
         print_sep(W_CAT, W_MOD, W_RES);
 
-        bool succ = mul_ok && cec_ok;
+        bool succ = mul_ok && cec_ok && retime_ok;
 
         if (!succ) {
             log("\nGUIDE_CHECK FAILED: Modules %s and %s are NOT equivalent.\n",
