@@ -42,6 +42,13 @@
 USING_YOSYS_NAMESPACE
 PRIVATE_NAMESPACE_BEGIN
 
+/*
+
+TODO: async2sync: still has bugs.
+TODO: support latch? 
+
+*/
+
 
 #define TIMINGSTAT_FIELDS(X)            \
     X(abc_cec_ms)                       \
@@ -622,7 +629,7 @@ static std::vector<CutPoint> match_signals_module(RTLIL::Design *design, RTLIL::
         //     name.c_str(), log_signal(gsig), log_signal(ksig), get_match_type_str(gentry.type));
 
         // Don't dump NONE type
-        // TODO: Warning: NONE type gentry may has the same signal name with DFF/other type's.
+        // ! Warning: NONE type gentry may has the same signal name with DFF/other type's.
         // This will lead to overwriting in name mapping in ABC. If didn't solve this in 
         // ABC. Please DO NOT dump NONE type entries!
         if(gentry.type != MatchType::NONE){
@@ -2437,7 +2444,7 @@ struct GuideCheckPass : public Pass {
         run_pass("memory_map", design);
         run_pass("opt_expr", design);
         run_pass("techmap", design);
-        run_pass("async2sync", design); // TODO: Warning: May cause side effects. Maybe we can move match_signals before this.
+        run_pass("async2sync", design); // ! Warning: May cause side effects. Maybe we can move match_signals before this.
         run_pass("dffunmap", design);
 
         
