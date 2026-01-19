@@ -1415,11 +1415,68 @@ static string dump_blif(RTLIL::Design* design, const string &dir_name, RTLIL::Mo
     run_pass(stringf("memory_map"), design_copy);
     run_pass(stringf("techmap"), design_copy);
     run_pass(stringf("dffunmap"), design_copy);
-    run_pass(stringf("write_blif -blackbox -top %s %s", mod_name, blif_file), design_copy);
+    run_pass(stringf("write_blif -impltf -blackbox -top %s %s", mod_name, blif_file), design_copy);
     delete design_copy;
     log_files = log_files_backup;
     log_streams = log_streams_backup;
     return blif_file;
+}
+
+static void materialize_blackbox_input_consts(RTLIL::Design *design, RTLIL::Module *mod)
+{
+    if (design == nullptr || mod == nullptr)
+        return;
+
+    int inserted = 0;
+
+    for (auto *cell : mod->cells()) {
+        RTLIL::Module *submod = design->module(cell->type);
+        if (submod == nullptr || !submod->get_bool_attribute(ID(blackbox)))
+            continue;
+
+        std::vector<std::pair<RTLIL::IdString, RTLIL::SigSpec>> updates;
+
+        for (auto &conn : cell->connections()) {
+            RTLIL::IdString port = conn.first;
+            RTLIL::Wire *port_wire = submod->wire(port);
+            if (port_wire == nullptr || !port_wire->port_input || port_wire->port_output)
+                continue;
+
+            RTLIL::SigSpec sig = conn.second;
+            bool changed = false;
+
+            for (int i = 0; i < GetSize(sig); i++) {
+                RTLIL::SigBit bit = sig[i];
+                if (bit.wire != nullptr)
+                    continue;
+
+                std::string cell_name = RTLIL::unescape_id(cell->name);
+                std::string port_name = RTLIL::unescape_id(port);
+                std::string wire_name = stringf("$bbconst$%s$%s$%d",
+                    cell_name.c_str(), port_name.c_str(), i);
+
+                RTLIL::IdString wire_id = RTLIL::escape_id(wire_name);
+                RTLIL::Wire *w = mod->wire(wire_id);
+                if (w == nullptr)
+                    w = mod->addWire(wire_id, 1);
+
+                mod->connect(RTLIL::SigSpec(w), RTLIL::SigSpec(bit));
+                sig[i] = RTLIL::SigBit(w, 0);
+                changed = true;
+                inserted++;
+            }
+
+            if (changed)
+                updates.emplace_back(port, sig);
+        }
+
+        for (const auto &update : updates)
+            cell->setPort(update.first, update.second);
+    }
+
+    if (inserted > 0)
+        log("Inserted %d constant nets on blackbox inputs in module %s.\n",
+            inserted, log_id(mod->name));
 }
 
 static string dump_blif_module(RTLIL::Design* design, const string &dir_name, RTLIL::Module *mod, const string& lib_file){
@@ -1454,6 +1511,9 @@ static string dump_blif_module(RTLIL::Design* design, const string &dir_name, RT
             // log("Current Module: %s, Set Module `%s` to blackbox.\n", mod->name.str(), mod_->name.str());
         }
     }
+    RTLIL::Module *target_mod = design_copy->module(mod->name);
+    if (target_mod != nullptr)
+        materialize_blackbox_input_consts(design_copy, target_mod);
     (void)lib_file;
     // if(!lib_file.empty())
     //     run_pass(stringf("read_verilog -overwrite %s", lib_file), design_copy);
@@ -1462,8 +1522,12 @@ static string dump_blif_module(RTLIL::Design* design, const string &dir_name, RT
     // run_pass(stringf("proc"), design_copy);
     // run_pass(stringf("techmap"), design_copy);
     // run_pass(stringf("dffunmap"), design_copy);
-    run_pass(stringf("write_blif -blackbox -top %s %s", mod_name, blif_file), design_copy);
-    delete design_copy;
+    // run_pass(stringf("write_blif -impltf -blackbox -top %s %s", mod_name, blif_file), design_copy);
+    run_pass(stringf(
+        "write_blif -blackbox -top %s -false + __const0 -true + __const1 -undef + __constx %s",
+        mod_name, blif_file),
+        design_copy);
+
     log_files = log_files_backup;
     log_streams = log_streams_backup;
 
@@ -1847,7 +1911,7 @@ static bool abc_cec_module(const CheckConfig &conf){
             log_error("Error executing ABC command: %s\n", cmd);
         }
     }
-    if (result == 2 || result == 3) {
+    if ((result == 2 || result == 3) && has_dff) {
         abc_cmd = stringf("dsec -M %s %s %s", match_file, gate_file, gold_file);
         cmd = stringf("%s -c '%s'", conf.abc_exe_file, abc_cmd);
         log("Executing ABC command: '%s'\n", abc_cmd);
@@ -1859,7 +1923,7 @@ static bool abc_cec_module(const CheckConfig &conf){
 
     // it's not a good idea to use `-n`
     // use -n flag when 'Miter computation failed'
-    if (result == 3) {
+    if (result == 3 && has_dff) {
         abc_cmd = stringf("dsec -n %s %s", gate_file, gold_file);
         cmd = stringf("%s -c '%s'", conf.abc_exe_file, abc_cmd);
         log("Executing ABC command: '%s'\n", abc_cmd);
