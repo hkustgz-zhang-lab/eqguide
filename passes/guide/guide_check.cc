@@ -1374,12 +1374,12 @@ static string dump_aig(RTLIL::Design* design, const string &dir_name, RTLIL::Mod
         run_pass(stringf("read_verilog -overwrite %s", lib_file), design_copy);
     run_pass("hierarchy -top " + mod->name.str(), design_copy);
     run_pass(stringf("flatten %s", mod->name.str()), design_copy);
-    // run_pass(stringf("opt"), design_copy);
+    run_pass(stringf("opt"), design_copy);
     // run_pass(stringf("proc"), design_copy);
-    // run_pass("setundef -undriven -zero", design);
+    run_pass("setundef -undriven -zero", design);
     run_pass(stringf("opt_expr"), design_copy);
     run_pass(stringf("techmap"), design_copy);
-    // run_pass(stringf("opt_expr"), design_copy);
+    run_pass(stringf("opt_expr"), design_copy);
     run_pass(stringf("aigmap"), design_copy);
     run_pass(stringf("write_aiger %s", aig_file), design_copy);
     
@@ -1575,30 +1575,40 @@ static string dump_smt2(RTLIL::Design* design, const string &dir_name, std::pair
 }
 
 
-static bool check_multi(RTLIL::Design* design, RTLIL::Module* mod, const string& tempdir_name, const string& lib_file){
+static bool check_multi(RTLIL::Design* design, RTLIL::Module* mod, const string& tempdir_name, const string& lib_file,
+    bool amulet = true){
     log_assert(mod->get_bool_attribute(ID(multiplier)));
     bool is_signed = mod->get_bool_attribute(ID(is_signed));    
     auto aig_file = dump_aig(design, tempdir_name, mod, lib_file);
 
-    log("Using amulet to verify the multiplier.\n");
-        auto miter_tmp_file = tempdir_name + "/" 
-            + strip_backslash(mod->name)
-            + ".miter.cnf";
-        auto rewritten_tmp_file = tempdir_name + "/" 
-            + strip_backslash(mod->name)
-            + ".rewritten.aig";
+    amulet = true; // Uses Amulet now.
+    if(amulet){
+        log("Using amulet to verify the multiplier.\n");
+            auto miter_tmp_file = tempdir_name + "/" 
+                + strip_backslash(mod->name)
+                + ".miter.cnf";
+            auto rewritten_tmp_file = tempdir_name + "/" 
+                + strip_backslash(mod->name)
+                + ".rewritten.aig";
 
-        auto amulet_sub_cmd = "amulet -substitute " + aig_file + " " + miter_tmp_file  + " " + rewritten_tmp_file + (is_signed? " -signed" : "");
-        std::cout << "Running amulet: " << amulet_sub_cmd << std::endl;
-        auto ret = system(amulet_sub_cmd.c_str());
-        auto amulet_veri_cmd = "amulet -verify " + rewritten_tmp_file + (is_signed ? " -signed" : "");
-        std::cout << "Running amulet: " << amulet_veri_cmd << std::endl;
-        ret = system(amulet_veri_cmd.c_str());
-         if(WEXITSTATUS(ret) != 1){
-            log("Amulet Verify failed.\n");
-            return false;
-        }
-        return true;
+            auto amulet_sub_cmd = "amulet -substitute " + aig_file + " " + miter_tmp_file  + " " + rewritten_tmp_file + (is_signed? " -signed" : "");
+            std::cout << "Running amulet: " << amulet_sub_cmd << std::endl;
+            auto ret = system(amulet_sub_cmd.c_str());
+            auto amulet_veri_cmd = "amulet -verify " + rewritten_tmp_file + (is_signed ? " -signed" : "");
+            std::cout << "Running amulet: " << amulet_veri_cmd << std::endl;
+            ret = system(amulet_veri_cmd.c_str());
+            if(WEXITSTATUS(ret) != 1){
+                log("Amulet Verify failed.\n");
+                return false;
+            }
+            return true;
+    } else {
+        bool correct = false; 
+        log("Using dynphaseorderopt to verify the multiplier.\n");
+        auto cmd = "dynphaseorderopt " + aig_file;
+        exectue_and_check(cmd, correct, "CIRCUIT IS CORRECT");
+        return correct;
+    }
 }
 
 static std::vector<std::pair<RTLIL::IdString, bool>> check_extract_multi(RTLIL::Design* design, MultiMap& mm, const string& tempdir_name){
@@ -1886,6 +1896,10 @@ static bool abc_cec_module(const CheckConfig &conf){
     string match_file = conf.tempdir_name + "/match_" + RTLIL::unescape_id(gold_mod->name) + "_" + RTLIL::unescape_id(gate_mod->name) + ".txt";
     // string abc_cmd = (has_dff) ? stringf("dsec -n %s %s", gold_file, gate_file) :
     //                                             stringf("cec -M %s -n %s %s", match_file, gold_file, gate_file);
+
+    log("Running ABC.\n");
+    fflush(stdout);
+
     string abc_cmd = stringf("cec -M %s %s %s", match_file, gate_file, gold_file);
     string cmd = stringf("%s -c '%s'", conf.abc_exe_file, abc_cmd);
     int result = 0;
