@@ -1313,9 +1313,9 @@ int exec_cmd(const string &cmd){
         status = -1; 
     }
 
-    if(status != 0){
-        log_error("Error executing command: %s", cmd);
-    }
+    // if(status != 0){
+    //     log_error("Error executing command: %s", cmd);
+    // }
     return status;
 }
 

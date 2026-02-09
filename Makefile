@@ -189,6 +189,11 @@ bumpversion:
 	sed -i "/^YOSYS_VER := / s/+[0-9][0-9]*$$/+`git log --oneline 5bafeb7.. | wc -l`/;" Makefile
 
 ABCMKARGS = CC="$(CXX)" CXX="$(CXX)" ABC_USE_LIBSTDCXX=1 ABC_USE_NAMESPACE=abc VERBOSE=$(Q)
+# Track abc sources so local edits trigger rebuilds.
+ABCSRCFILES :=
+ifneq ($(wildcard abc),)
+ABCSRCFILES := $(sort $(addprefix abc/,$(shell git -C abc ls-files 2>/dev/null)))
+endif
 
 # set ABCEXTERNAL = <abc-command> to use an external ABC instance
 # Note: The in-tree ABC (yosys-abc) will not be installed when ABCEXTERNAL is set.
@@ -818,42 +823,42 @@ $(PROGRAM_PREFIX)yosys-config: misc/yosys-config.in $(YOSYS_SRC)/Makefile
 .PHONY: check-git-abc
 
 check-git-abc:
-	@if [ ! -d "$(YOSYS_SRC)/abc" ] && git -C "$(YOSYS_SRC)" status >/dev/null 2>&1; then \
-		echo "Error: The 'abc' directory does not exist."; \
-		echo "Initialize the submodule: Run 'git submodule update --init' to set up 'abc' as a submodule."; \
-		exit 1; \
-	elif git -C "$(YOSYS_SRC)" submodule status abc 2>/dev/null | grep -q '^ '; then \
-		exit 0; \
-	elif [ -f "$(YOSYS_SRC)/abc/.gitcommit" ] && ! grep -q '\$$Format:%[hH]\$$' "$(YOSYS_SRC)/abc/.gitcommit"; then \
-		echo "'abc' comes from a tarball. Continuing."; \
-		exit 0; \
-	elif git -C "$(YOSYS_SRC)" submodule status abc 2>/dev/null | grep -q '^+'; then \
-		echo "'abc' submodule does not match expected commit."; \
-		echo "Run 'git submodule update' to check out the correct version."; \
-		echo "Note: If testing a different version of abc, call 'git commit abc' in the Yosys source directory to update the expected commit."; \
-		exit 1; \
-	elif git -C "$(YOSYS_SRC)" submodule status abc 2>/dev/null | grep -q '^U'; then \
-		echo "'abc' submodule has merge conflicts."; \
-		echo "Please resolve merge conflicts before continuing."; \
-		exit 1; \
-	elif [ -f "$(YOSYS_SRC)/abc/.gitcommit" ] && grep -q '\$$Format:%[hH]\$$' "$(YOSYS_SRC)/abc/.gitcommit"; then \
-		echo "Error: 'abc' is not configured as a git submodule."; \
-		echo "To resolve this:"; \
-		echo "1. Back up your changes: Save any modifications from the 'abc' directory to another location."; \
-		echo "2. Remove the existing 'abc' directory: Delete the 'abc' directory and all its contents."; \
-		echo "3. Initialize the submodule: Run 'git submodule update --init' to set up 'abc' as a submodule."; \
-		echo "4. Reapply your changes: Move your saved changes back to the 'abc' directory, if necessary."; \
-		exit 1; \
-	elif ! git -C "$(YOSYS_SRC)" status >/dev/null 2>&1; then \
-		echo "$(realpath $(YOSYS_SRC)) is not configured as a git repository, and 'abc' folder is missing."; \
-		echo "If you already have ABC, set 'ABCEXTERNAL' make variable to point to ABC executable."; \
-		echo "Otherwise, download release archive 'yosys.tar.gz' from https://github.com/YosysHQ/yosys/releases."; \
-		echo "    ('Source code' archive does not contain submodules.)"; \
-		exit 1; \
-	else \
-		echo "Initialize the submodule: Run 'git submodule update --init' to set up 'abc' as a submodule."; \
-		exit 1; \
-	fi
+#	@if [ ! -d "$(YOSYS_SRC)/abc" ] && git -C "$(YOSYS_SRC)" status >/dev/null 2>&1; then \
+#		echo "Error: The 'abc' directory does not exist."; \
+#		echo "Initialize the submodule: Run 'git submodule update --init' to set up 'abc' as a submodule."; \
+#		exit 1; \
+#	elif git -C "$(YOSYS_SRC)" submodule status abc 2>/dev/null | grep -q '^ '; then \
+#		exit 0; \
+#	elif [ -f "$(YOSYS_SRC)/abc/.gitcommit" ] && ! grep -q '\$$Format:%[hH]\$$' "$(YOSYS_SRC)/abc/.gitcommit"; then \
+#		echo "'abc' comes from a tarball. Continuing."; \
+#		exit 0; \
+#	elif git -C "$(YOSYS_SRC)" submodule status abc 2>/dev/null | grep -q '^+'; then \
+#		echo "'abc' submodule does not match expected commit."; \
+#		echo "Run 'git submodule update' to check out the correct version."; \
+#		echo "Note: If testing a different version of abc, call 'git commit abc' in the Yosys source directory to update the expected commit."; \
+#		exit 1; \
+#	elif git -C "$(YOSYS_SRC)" submodule status abc 2>/dev/null | grep -q '^U'; then \
+#		echo "'abc' submodule has merge conflicts."; \
+#		echo "Please resolve merge conflicts before continuing."; \
+#		exit 1; \
+#	elif [ -f "$(YOSYS_SRC)/abc/.gitcommit" ] && grep -q '\$$Format:%[hH]\$$' "$(YOSYS_SRC)/abc/.gitcommit"; then \
+#		echo "Error: 'abc' is not configured as a git submodule."; \
+#		echo "To resolve this:"; \
+#		echo "1. Back up your changes: Save any modifications from the 'abc' directory to another location."; \
+#		echo "2. Remove the existing 'abc' directory: Delete the 'abc' directory and all its contents."; \
+#		echo "3. Initialize the submodule: Run 'git submodule update --init' to set up 'abc' as a submodule."; \
+#		echo "4. Reapply your changes: Move your saved changes back to the 'abc' directory, if necessary."; \
+#		exit 1; \
+#	elif ! git -C "$(YOSYS_SRC)" status >/dev/null 2>&1; then \
+#		echo "$(realpath $(YOSYS_SRC)) is not configured as a git repository, and 'abc' folder is missing."; \
+#		echo "If you already have ABC, set 'ABCEXTERNAL' make variable to point to ABC executable."; \
+#		echo "Otherwise, download release archive 'yosys.tar.gz' from https://github.com/YosysHQ/yosys/releases."; \
+#		echo "    ('Source code' archive does not contain submodules.)"; \
+#		exit 1; \
+#	else \
+#		echo "Initialize the submodule: Run 'git submodule update --init' to set up 'abc' as a submodule."; \
+#		exit 1; \
+#	fi
 
 .git-abc-submodule-hash: FORCE
 	@new=$$(cd abc 2>/dev/null && git rev-parse HEAD 2>/dev/null || echo none); \
@@ -862,15 +867,20 @@ check-git-abc:
 		echo "$$new" > .git-abc-submodule-hash; \
 	fi
 
-abc/abc$(EXE) abc/libabc.a: .git-abc-submodule-hash | check-git-abc
+abc/abc$(EXE) abc/libabc.a: $(ABCSRCFILES) .git-abc-submodule-hash | check-git-abc
 	@if [ "$$(cd abc 2>/dev/null && git rev-parse HEAD 2>/dev/null)" != "$$(cat ../.git-abc-submodule-hash 2>/dev/null || echo none)" ]; then \
 		rm -f abc/abc$(EXE); \
 	fi
 	$(P)
 	$(Q) mkdir -p abc && $(MAKE) -C $(PROGRAM_PREFIX)abc -f "$(realpath $(YOSYS_SRC)/abc/Makefile)" ABCSRC="$(realpath $(YOSYS_SRC)/abc/)" $(S) $(ABCMKARGS) $(if $(filter %.a,$@),PROG="abc",PROG="abc$(EXE)") MSG_PREFIX="$(eval P_OFFSET = 5)$(call P_SHOW)$(eval P_OFFSET = 10) ABC: " $(if $(filter %.a,$@),libabc.a)
 
-$(PROGRAM_PREFIX)yosys-abc$(EXE): abc/abc$(EXE)
-	$(P) cp $< $(PROGRAM_PREFIX)yosys-abc$(EXE)
+#$(PROGRAM_PREFIX)yosys-abc$(EXE): abc/abc$(EXE)
+#	$(P) cp $< $(PROGRAM_PREFIX)yosys-abc$(EXE)
+
+$(PROGRAM_PREFIX)yosys-abc$(EXE): $(ABCSRCFILES) .git-abc-submodule-hash | check-git-abc
+	make -C abc
+	$(P) cp ./abc/abc $(PROGRAM_PREFIX)yosys-abc$(EXE)
+
 
 $(PROGRAM_PREFIX)yosys-libabc.a: abc/libabc.a
 	$(P) cp $< $(PROGRAM_PREFIX)yosys-libabc.a
