@@ -1,7 +1,6 @@
 # EqGuide: EqGuide: Guiding  Equivalence Checking in Open-Source Logic Synthesis Flow
 
-EqGuide is implemented as a set of new front-end commands and analysis passes in Yosys, together with
-a lightweight extension to the ABC import flow to apply an explicit name mapping for circuit interfaces.
+EqGuide is implemented as a set of new front-end commands and analysis passes in [Yosys](https://github.com/YosysHQ/yosys), together with a lightweight extension to the [ABC](https://github.com/berkeley-abc/abc) import flow to apply an explicit name mapping for circuit interfaces.
 
 ## Simplest Usage Example 
 
