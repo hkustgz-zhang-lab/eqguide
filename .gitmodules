@@ -1,7 +1,7 @@
 [submodule "abc"]
 	path = abc
 	#url = ssh://git@eptansuo.life:2233/home/git/abc-guide.git
-	url = ssh://git@github.com:hkustgz-zhang-lab/eqguide-abc.git
+	url = git@github.com:hkustgz-zhang-lab/eqguide-abc.git
 
 # Don't use paths as names to avoid git archive problems
 [submodule "cxxopts"]
