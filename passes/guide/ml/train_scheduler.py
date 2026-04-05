@@ -5,7 +5,12 @@ import json
 import math
 from typing import Any
 
-from sklearn.ensemble import GradientBoostingRegressor
+try:
+    from lightgbm import LGBMRegressor
+except ImportError as exc:
+    raise SystemExit(
+        "lightgbm is required. Use the repo venv: ./venv/bin/python -m pip install lightgbm scikit-learn"
+    ) from exc
 
 
 PAIR_FEATURES = [
@@ -60,6 +65,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-depth", type=int, default=4, help="Maximum depth of each tree.")
     parser.add_argument("--learning-rate", type=float, default=0.05, help="Boosting learning rate.")
     parser.add_argument("--min-samples-leaf", type=int, default=20, help="Minimum samples per leaf.")
+    parser.add_argument("--num-leaves", type=int, default=15, help="Maximum number of leaves per tree.")
     parser.add_argument("--random-state", type=int, default=7, help="Random seed.")
     return parser.parse_args()
 
@@ -125,48 +131,59 @@ def build_samples(rows: list[dict[str, Any]], par_ms: float, par_factor: float) 
     return x_rows, y_rows
 
 
-def float_constant(model: GradientBoostingRegressor) -> float:
-    constant = model.init_.constant_
-    if hasattr(constant, "flat"):
-        return float(next(iter(constant.flat)))
-    if isinstance(constant, (list, tuple)):
-        return float(constant[0])
-    return float(constant)
-
-
-def export_tree(tree: Any, learning_rate: float) -> dict[str, Any]:
-    nodes = []
-    for idx in range(tree.node_count):
-        left = int(tree.children_left[idx])
-        right = int(tree.children_right[idx])
-        is_leaf = left == -1 and right == -1
-        value = float(tree.value[idx][0][0]) * learning_rate if is_leaf else 0.0
-        nodes.append(
-            {
-                "feature_index": int(tree.feature[idx]) if not is_leaf else -1,
-                "threshold": float(tree.threshold[idx]) if not is_leaf else 0.0,
-                "left": left,
-                "right": right,
-                "value": value,
-                "is_leaf": is_leaf,
-            }
-        )
-    return {"nodes": nodes}
-
-
-def train_model(x_rows: list[list[float]], y_rows: list[float], args: argparse.Namespace) -> GradientBoostingRegressor:
+def train_model(x_rows: list[list[float]], y_rows: list[float], args: argparse.Namespace) -> LGBMRegressor:
     effective_min_samples_leaf = min(args.min_samples_leaf, max(1, len(x_rows) // 4))
-    model = GradientBoostingRegressor(
-        loss="squared_error",
+    model = LGBMRegressor(
+        objective="regression",
         learning_rate=args.learning_rate,
         n_estimators=args.n_estimators,
         max_depth=args.max_depth,
+        num_leaves=args.num_leaves,
         min_samples_leaf=effective_min_samples_leaf,
         random_state=args.random_state,
+        verbose=-1,
     )
     model.fit(x_rows, y_rows)
     model.guide_effective_min_samples_leaf = effective_min_samples_leaf
     return model
+
+
+def flatten_tree(node: dict[str, Any], nodes: list[dict[str, Any]]) -> int:
+    index = len(nodes)
+    if "leaf_value" in node:
+        nodes.append(
+            {
+                "feature_index": -1,
+                "threshold": 0.0,
+                "left": -1,
+                "right": -1,
+                "value": float(node["leaf_value"]),
+                "is_leaf": True,
+            }
+        )
+        return index
+
+    nodes.append(
+        {
+            "feature_index": int(node["split_feature"]),
+            "threshold": float(node["threshold"]),
+            "left": -1,
+            "right": -1,
+            "value": 0.0,
+            "is_leaf": False,
+        }
+    )
+    left = flatten_tree(node["left_child"], nodes)
+    right = flatten_tree(node["right_child"], nodes)
+    nodes[index]["left"] = left
+    nodes[index]["right"] = right
+    return index
+
+
+def export_tree(tree_info: dict[str, Any]) -> dict[str, Any]:
+    nodes: list[dict[str, Any]] = []
+    flatten_tree(tree_info["tree_structure"], nodes)
+    return {"nodes": nodes}
 
 
 def main() -> int:
@@ -177,21 +194,24 @@ def main() -> int:
         raise SystemExit("No scheduler samples found in input JSONL.")
 
     model = train_model(x_rows, y_rows, args)
+    booster = model.booster_
+    dump = booster.dump_model()
 
     trees = [
-        export_tree(stage[0].tree_, args.learning_rate)
-        for stage in model.estimators_
+        export_tree(tree_info)
+        for tree_info in dump["tree_info"]
     ]
 
     output = {
         "model_type": "guide_sched_gbdt_v1",
         "feature_names": FEATURE_NAMES,
-        "base_score": float_constant(model),
+        "base_score": 0.0,
         "learning_rate": 1.0,
         "par_ms": args.par_ms,
         "par_factor": args.par_factor,
         "n_estimators": args.n_estimators,
         "max_depth": args.max_depth,
+        "num_leaves": args.num_leaves,
         "min_samples_leaf": int(model.guide_effective_min_samples_leaf),
         "num_rows": len(x_rows),
         "trees": trees,

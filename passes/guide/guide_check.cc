@@ -158,6 +158,17 @@ struct GuideSchedTree
     std::vector<GuideSchedTreeNode> nodes;
 };
 
+struct GuideMatchModel
+{
+    bool loaded = false;
+    string path;
+    string model_type;
+    std::vector<string> feature_names;
+    double base_score = 0;
+    double learning_rate = 1.0;
+    std::vector<GuideSchedTree> trees;
+};
+
 struct GuideSchedModel
 {
     bool loaded = false;
@@ -213,9 +224,11 @@ struct CheckConfig
     string gate_prefix;
     string lib_file;
     string sched_model_file;
+    string match_model_file;
     SeqCheckConfig seq_check_cfg;
     MlDumpConfig dump_cfg;
     GuideSchedModel *sched_model = nullptr;
+    GuideMatchModel *match_model = nullptr;
     GuideTelemetry *telemetry = nullptr;
     RTLIL::Design *lib_design = nullptr;
 };
@@ -611,6 +624,73 @@ static double tree_predict(const GuideSchedTree &tree, const std::vector<double>
     return 0;
 }
 
+static bool load_tree_model_common(const string &path, const string &expected_type,
+                                   GuideSchedModel *sched_model, GuideMatchModel *match_model)
+{
+    std::ifstream handle(path);
+    if (!handle.is_open())
+        log_error("Cannot open model file %s.\n", path.c_str());
+
+    std::stringstream buffer;
+    buffer << handle.rdbuf();
+    string error;
+    Json json = Json::parse(buffer.str(), error);
+    if (!error.empty())
+        log_error("Cannot parse model file %s: %s\n", path.c_str(), error.c_str());
+
+    string model_type = json["model_type"].string_value();
+    if (model_type != expected_type)
+        log_error("Unexpected model type in %s: got %s expected %s\n",
+                  path.c_str(), model_type.c_str(), expected_type.c_str());
+
+    std::vector<string> feature_names;
+    for (auto &item : json["feature_names"].array_items())
+        if (item.is_string())
+            feature_names.push_back(item.string_value());
+
+    std::vector<GuideSchedTree> trees;
+    for (auto &tree_json : json["trees"].array_items()) {
+        GuideSchedTree tree;
+        for (auto &node_json : tree_json["nodes"].array_items()) {
+            GuideSchedTreeNode node;
+            node.feature_index = node_json["feature_index"].int_value();
+            node.threshold = node_json["threshold"].number_value();
+            node.left = node_json["left"].int_value();
+            node.right = node_json["right"].int_value();
+            node.value = node_json["value"].number_value();
+            node.is_leaf = node_json["is_leaf"].bool_value();
+            tree.nodes.push_back(node);
+        }
+        if (tree.nodes.empty())
+            log_error("Model %s contains an empty tree.\n", path.c_str());
+        trees.push_back(tree);
+    }
+
+    if (sched_model != nullptr) {
+        *sched_model = GuideSchedModel();
+        sched_model->path = path;
+        sched_model->model_type = model_type;
+        sched_model->feature_names = feature_names;
+        sched_model->base_score = json["base_score"].number_value();
+        sched_model->learning_rate = json["learning_rate"].number_value();
+        sched_model->trees = trees;
+        sched_model->loaded = true;
+    }
+
+    if (match_model != nullptr) {
+        *match_model = GuideMatchModel();
+        match_model->path = path;
+        match_model->model_type = model_type;
+        match_model->feature_names = feature_names;
+        match_model->base_score = json["base_score"].number_value();
+        match_model->learning_rate = json["learning_rate"].number_value();
+        match_model->trees = trees;
+        match_model->loaded = true;
+    }
+
+    return true;
+}
+
 static bool load_sched_model(const string &path, GuideSchedModel &model)
 {
     if (path.empty())
@@ -618,29 +698,25 @@ static bool load_sched_model(const string &path, GuideSchedModel &model)
     if (model.loaded && model.path == path)
         return true;
 
-    std::ifstream handle(path);
-    if (!handle.is_open())
-        log_error("Cannot open scheduler model file %s.\n", path.c_str());
-
-    std::stringstream buffer;
-    buffer << handle.rdbuf();
-    string error;
-    Json json = Json::parse(buffer.str(), error);
-    if (!error.empty())
-        log_error("Cannot parse scheduler model file %s: %s\n", path.c_str(), error.c_str());
-
-    model = GuideSchedModel();
-    model.path = path;
-    model.model_type = json["model_type"].string_value();
-    model.base_score = json["base_score"].number_value();
-    model.learning_rate = json["learning_rate"].number_value();
-
-    auto feature_names = json["feature_names"].array_items();
-    for (auto &item : feature_names)
-        if (item.is_string())
-            model.feature_names.push_back(item.string_value());
-
     if (model.model_type == "guide_sched_linear_v1") {
+        std::ifstream handle(path);
+        if (!handle.is_open())
+            log_error("Cannot open scheduler model file %s.\n", path.c_str());
+        std::stringstream buffer;
+        buffer << handle.rdbuf();
+        string error;
+        Json json = Json::parse(buffer.str(), error);
+        if (!error.empty())
+            log_error("Cannot parse scheduler model file %s: %s\n", path.c_str(), error.c_str());
+
+        model = GuideSchedModel();
+        model.path = path;
+        model.model_type = json["model_type"].string_value();
+        model.base_score = json["base_score"].number_value();
+        model.learning_rate = json["learning_rate"].number_value();
+        for (auto &item : json["feature_names"].array_items())
+            if (item.is_string())
+                model.feature_names.push_back(item.string_value());
         for (auto &it : json["actions"].object_items()) {
             GuideSchedLinearAction action_model;
             action_model.bias = it.second["bias"].number_value();
@@ -649,45 +725,23 @@ static bool load_sched_model(const string &path, GuideSchedModel &model)
             model.linear_actions[it.first] = action_model;
         }
     } else
-    if (model.model_type == "guide_sched_gbdt_v1") {
-        for (auto &tree_json : json["trees"].array_items()) {
-            GuideSchedTree tree;
-            for (auto &node_json : tree_json["nodes"].array_items()) {
-                GuideSchedTreeNode node;
-                node.feature_index = node_json["feature_index"].int_value();
-                node.threshold = node_json["threshold"].number_value();
-                node.left = node_json["left"].int_value();
-                node.right = node_json["right"].int_value();
-                node.value = node_json["value"].number_value();
-                node.is_leaf = node_json["is_leaf"].bool_value();
-                tree.nodes.push_back(node);
-            }
-            model.trees.push_back(tree);
-        }
-    } else
-        log_error("Unsupported scheduler model type in %s: %s\n", path.c_str(), model.model_type.c_str());
-
-    if (model.model_type == "guide_sched_gbdt_v1" && model.feature_names.empty())
-        log_error("Scheduler model %s has no feature names.\n", path.c_str());
-    if (model.model_type == "guide_sched_gbdt_v1" && model.trees.empty())
-        log_error("Scheduler model %s has no trees.\n", path.c_str());
-
-    if (model.model_type == "guide_sched_linear_v1" && model.linear_actions.empty())
-        log_error("Scheduler model %s has no action weights.\n", path.c_str());
-
-    if (model.learning_rate == 0)
-        model.learning_rate = 1.0;
-    if (model.model_type == "guide_sched_linear_v1" && model.base_score == 0)
-        model.base_score = 0;
-
-    if (model.model_type == "guide_sched_gbdt_v1") {
-        for (auto &tree : model.trees)
-            if (tree.nodes.empty())
-                log_error("Scheduler model %s contains an empty tree.\n", path.c_str());
-    }
+    if (path.empty())
+        return false;
+    else
+        load_tree_model_common(path, "guide_sched_gbdt_v1", &model, nullptr);
 
     model.loaded = true;
     return true;
+}
+
+static bool load_match_model(const string &path, GuideMatchModel &model)
+{
+    if (path.empty())
+        return false;
+    if (model.loaded && model.path == path)
+        return true;
+
+    return load_tree_model_common(path, "guide_match_gbdt_v1", nullptr, &model);
 }
 
 static double predict_sched_cost(const GuideSchedModel &model, const string &action,
@@ -1295,6 +1349,44 @@ static int score_match_candidate(const NamedSig &gold_sig, const NamedSig &gate_
     return score;
 }
 
+static dict<string, double> match_candidate_features(const NamedSig &gold_sig, const NamedSig &gate_sig)
+{
+    dict<string, double> features;
+    features["bit_index_equal"] = gold_sig.bit_index == gate_sig.bit_index ? 1.0 : 0.0;
+    features["bit_index_absdiff"] = std::abs(gold_sig.bit_index - gate_sig.bit_index);
+    features["wire_name_exact"] = gold_sig.wire_name == gate_sig.wire_name ? 1.0 : 0.0;
+    features["wire_name_norm_exact"] =
+        normalize_match_name(gold_sig.wire_name) == normalize_match_name(gate_sig.wire_name) ? 1.0 : 0.0;
+    features["same_last_token"] = last_match_token(gold_sig.wire_name) == last_match_token(gate_sig.wire_name) ? 1.0 : 0.0;
+    features["heuristic_score"] = score_match_candidate(gold_sig, gate_sig);
+    features["gold_name_len"] = strip_backslash(gold_sig.wire_name).size();
+    features["gate_name_len"] = strip_backslash(gate_sig.wire_name).size();
+    features["name_len_absdiff"] = std::abs(int(strip_backslash(gold_sig.wire_name).size()) - int(strip_backslash(gate_sig.wire_name).size()));
+    features["type_pi"] = gold_sig.type == MatchType::PI ? 1.0 : 0.0;
+    features["type_po"] = gold_sig.type == MatchType::PO ? 1.0 : 0.0;
+    features["type_dff"] = gold_sig.type == MatchType::DFF ? 1.0 : 0.0;
+    features["type_dff_po"] = gold_sig.type == MatchType::DFF_PO ? 1.0 : 0.0;
+    features["type_subckt_pipo"] = gold_sig.type == MatchType::SUBCKT_PIPO ? 1.0 : 0.0;
+    return features;
+}
+
+static double predict_match_score(const GuideMatchModel &model, const NamedSig &gold_sig, const NamedSig &gate_sig)
+{
+    if (!model.loaded)
+        return score_match_candidate(gold_sig, gate_sig);
+
+    dict<string, double> features_by_name = match_candidate_features(gold_sig, gate_sig);
+    std::vector<double> features(GetSize(model.feature_names), 0.0);
+    for (int i = 0; i < GetSize(model.feature_names); i++)
+        if (features_by_name.count(model.feature_names[i]))
+            features[i] = features_by_name.at(model.feature_names[i]);
+
+    double score = model.base_score;
+    for (auto &tree : model.trees)
+        score += tree_predict(tree, features);
+    return score;
+}
+
 static void write_match_suggestions(const string &path, const Json::array &suggestions)
 {
     FILE *f = fopen(path.c_str(), "w");
@@ -1405,7 +1497,7 @@ static MatchResult match_signals_module(RTLIL::Design *design, RTLIL::Module *go
                 continue;
             }
 
-            std::vector<std::pair<int, RTLIL::IdString>> candidates;
+            std::vector<std::pair<double, RTLIL::IdString>> candidates;
             for (auto &gt : gate) {
                 auto gate_name = gt.first;
                 const auto &kentry = gt.second;
@@ -1417,7 +1509,9 @@ static MatchResult match_signals_module(RTLIL::Design *design, RTLIL::Module *go
                     continue;
                 if (gentry.bit_index != kentry.bit_index)
                     continue;
-                int score = score_match_candidate(gentry, kentry);
+                double score = conf.match_model != nullptr && conf.match_model->loaded ?
+                    predict_match_score(*conf.match_model, gentry, kentry) :
+                    score_match_candidate(gentry, kentry);
                 candidates.push_back({score, gate_name});
                 append_jsonl(conf.dump_cfg.match_jsonl, Json::object {
                     {"pair_id", pair_id},
@@ -1437,7 +1531,7 @@ static MatchResult match_signals_module(RTLIL::Design *design, RTLIL::Module *go
             }
 
             std::sort(candidates.begin(), candidates.end(),
-                [](const std::pair<int, RTLIL::IdString> &lhs, const std::pair<int, RTLIL::IdString> &rhs) {
+                [](const std::pair<double, RTLIL::IdString> &lhs, const std::pair<double, RTLIL::IdString> &rhs) {
                     if (lhs.first != rhs.first)
                         return lhs.first > rhs.first;
                     return lhs.second.str() < rhs.second.str();
@@ -2900,9 +2994,11 @@ static std::vector<std::pair<RTLIL::IdString, bool>> abc_cec(const CheckConfig &
         .gate_prefix = conf.gate_prefix,
         .lib_file = conf.lib_file,
         .sched_model_file = conf.sched_model_file,
+        .match_model_file = conf.match_model_file,
         .seq_check_cfg = conf.seq_check_cfg,
         .dump_cfg = conf.dump_cfg,
         .sched_model = conf.sched_model,
+        .match_model = conf.match_model,
         .telemetry = conf.telemetry,
         .lib_design = conf.lib_design
     };
@@ -3171,9 +3267,11 @@ Results check_retime(const CheckConfig &conf,
             .gate_prefix = conf.gate_prefix,
             .lib_file = conf.lib_file,
             .sched_model_file = conf.sched_model_file,
+            .match_model_file = conf.match_model_file,
             .seq_check_cfg = conf.seq_check_cfg,
             .dump_cfg = conf.dump_cfg,
             .sched_model = conf.sched_model,
+            .match_model = conf.match_model,
             .telemetry = conf.telemetry,
             .lib_design = conf.lib_design
         };
@@ -3454,6 +3552,7 @@ struct GuideCheckRetimePass : public Pass {
             .gate_prefix = gate_prefix,
             .lib_file = lib_file,
             .sched_model_file = "",
+            .match_model_file = "",
             .seq_check_cfg = SeqCheckConfig{
                 .k_induct = k_induct,
                 .step_skip = step_skip,
@@ -3462,6 +3561,7 @@ struct GuideCheckRetimePass : public Pass {
             },
             .dump_cfg = MlDumpConfig(),
             .sched_model = nullptr,
+            .match_model = nullptr,
             .telemetry = nullptr,
             .lib_design = nullptr
         });
@@ -3537,6 +3637,9 @@ struct GuideCheckPass : public Pass {
         log("    -guide-sched-model <file>\n");
         log("        load a scheduler model JSON file and use it to rank ABC actions.\n");
         log("\n");
+        log("    -guide-match-model <file>\n");
+        log("        load a matching model JSON file and use it to score match suggestions.\n");
+        log("\n");
 	}
 	void execute(std::vector<std::string> args, RTLIL::Design *design) override
 	{
@@ -3553,6 +3656,7 @@ struct GuideCheckPass : public Pass {
         int step_skip = 0;
         bool no_init = false;
         string sched_model_file;
+        string match_model_file;
         MlDumpConfig dump_cfg;
         
         size_t argidx;
@@ -3608,6 +3712,10 @@ struct GuideCheckPass : public Pass {
             }
             if (args[argidx] == "-guide-sched-model" && argidx + 1 < args.size()) {
                 sched_model_file = args[++argidx];
+                continue;
+            }
+            if (args[argidx] == "-guide-match-model" && argidx + 1 < args.size()) {
+                match_model_file = args[++argidx];
                 continue;
             }
             break;
@@ -3692,6 +3800,9 @@ struct GuideCheckPass : public Pass {
         GuideSchedModel sched_model;
         if (!sched_model_file.empty())
             load_sched_model(sched_model_file, sched_model);
+        GuideMatchModel match_model;
+        if (!match_model_file.empty())
+            load_match_model(match_model_file, match_model);
 
         CheckConfig conf = {
             .nocleanup = nocleanup,
@@ -3704,9 +3815,11 @@ struct GuideCheckPass : public Pass {
             .gate_prefix = gate_prefix,
             .lib_file = lib_file,
             .sched_model_file = sched_model_file,
+            .match_model_file = match_model_file,
             .seq_check_cfg = seq_conf,
             .dump_cfg = dump_cfg,
             .sched_model = &sched_model,
+            .match_model = &match_model,
             .telemetry = &telemetry,
             .lib_design = lib_design,
         };
@@ -3816,8 +3929,20 @@ struct GuideCheckPass : public Pass {
         report(gold_mod_name_id, gate_mod_name_id,
                 multi_results,retime_results, cec_result_mod);
 
-        if (dump_cfg.dump_match)
+        if (dump_cfg.dump_match) {
             write_match_suggestions(match_suggestions_path(dump_cfg.match_jsonl), telemetry.match_suggestions);
+            log("Matching sidecar hint:\n");
+            log("  python3 passes/guide/ml/infer_matching.py %s --model <match_ranker.cbm> -o %s\n",
+                dump_cfg.match_jsonl.c_str(),
+                match_suggestions_path(dump_cfg.match_jsonl).c_str());
+        }
+        if (dump_cfg.dump_fail) {
+            log("Failure explainer hint:\n");
+            log("  python3 passes/guide/ml/run_failure_explainer.py %s\n",
+                dump_cfg.fail_jsonl.c_str());
+            log("  python3 passes/guide/ml/run_failure_explainer.py %s --use-openai\n",
+                dump_cfg.fail_jsonl.c_str());
+        }
 
         print_timing_stat(timing_stat);
 
