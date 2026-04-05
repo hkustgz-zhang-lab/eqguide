@@ -86,3 +86,6 @@ __pycache__
 /qtcreator.creator
 /qtcreator.creator.user
 /compile_commands.json
+
+*.md
+!README.md
