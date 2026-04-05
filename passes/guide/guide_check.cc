@@ -207,6 +207,7 @@ struct CommandResult
 struct GuideTelemetry
 {
     std::map<string, MatchStats> pair_match_stats;
+    dict<string, int> pair_applied_match_suggestions;
     pool<RTLIL::IdString> retimed_mods;
     pool<RTLIL::IdString> multiplier_mods;
     Json::array match_suggestions;
@@ -225,6 +226,7 @@ struct CheckConfig
     string lib_file;
     string sched_model_file;
     string match_model_file;
+    string accept_match_suggestions_file;
     SeqCheckConfig seq_check_cfg;
     MlDumpConfig dump_cfg;
     GuideSchedModel *sched_model = nullptr;
@@ -1408,6 +1410,26 @@ static string match_suggestions_path(const string &match_jsonl)
     return match_jsonl.substr(0, pos + 1) + "match_suggestions.json";
 }
 
+static Json::array load_match_suggestions_file(const string &path)
+{
+    if (path.empty())
+        return Json::array();
+
+    std::ifstream handle(path);
+    if (!handle.is_open())
+        log_error("Cannot open match suggestions file %s.\n", path.c_str());
+
+    std::stringstream buffer;
+    buffer << handle.rdbuf();
+    string error;
+    Json json = Json::parse(buffer.str(), error);
+    if (!error.empty())
+        log_error("Cannot parse match suggestions file %s: %s\n", path.c_str(), error.c_str());
+    if (!json.is_array())
+        log_error("Match suggestions file %s must contain a JSON array.\n", path.c_str());
+    return json.array_items();
+}
+
 static MatchResult match_signals_module(RTLIL::Design *design, RTLIL::Module *gold_mod, RTLIL::Module *gate_mod,
                                         const CheckConfig &conf, bool emit_match_file, const string &snapshot_name)
 {
@@ -1464,11 +1486,67 @@ static MatchResult match_signals_module(RTLIL::Design *design, RTLIL::Module *go
                 kentry.wire_name, kentry.bit_index});
     }
 
-    if (f != nullptr)
-        fclose(f);
-
     result.stats.unmatched_gold = GetSize(gold) - GetSize(matched_gold);
     result.stats.unmatched_gate = GetSize(gate) - GetSize(matched_gate);
+
+    int applied_suggestions = 0;
+    if (emit_match_file && !conf.accept_match_suggestions_file.empty()) {
+        Json::array accepted = load_match_suggestions_file(conf.accept_match_suggestions_file);
+        for (auto &item : accepted) {
+            if (!item.is_object())
+                continue;
+            if (item["pair_id"].string_value() != pair_id)
+                continue;
+            if (item["snapshot"].string_value() != "pre_async")
+                continue;
+            if (item["score_margin"].number_value() <= 0)
+                continue;
+
+            RTLIL::IdString gold_name = RTLIL::escape_id(item["gold_name"].string_value());
+            RTLIL::IdString gate_name = RTLIL::escape_id(item["suggested_gate_name"].string_value());
+            if (!gold.count(gold_name) || !gate.count(gate_name))
+                continue;
+            if (matched_gold.count(gold_name) || matched_gate.count(gate_name))
+                continue;
+
+            const auto &gentry = gold.at(gold_name);
+            const auto &kentry = gate.at(gate_name);
+            if (gentry.type != kentry.type)
+                continue;
+            if (gentry.type == MatchType::NONE)
+                continue;
+
+            RTLIL::SigBit gsig = gentry.sig;
+            RTLIL::SigBit ksig = kentry.sig;
+            if (f != nullptr) {
+                fprintf(f, "Matched signal %s: gold %s gate %s, Type %s\n",
+                    gold_name.c_str(), log_signal(gsig).c_str(), log_signal(ksig).c_str(),
+                    get_match_type_str(gentry.type).c_str());
+            }
+
+            matched_gold.insert(gold_name);
+            matched_gate.insert(gate_name);
+            result.stats.exact_total++;
+            update_match_stats(result.stats, gentry.type);
+            result.cut_points.push_back(CutPoint{gold_name, gsig, ksig, gentry.type,
+                    gold_ff_q_map.count(gsig) ? gold_ff_q_map[gsig] : nullptr,
+                    gate_ff_q_map.count(ksig) ? gate_ff_q_map[ksig] : nullptr,
+                    gentry.wire_name, gentry.bit_index,
+                    kentry.wire_name, kentry.bit_index});
+            applied_suggestions++;
+        }
+
+        result.stats.unmatched_gold = GetSize(gold) - GetSize(matched_gold);
+        result.stats.unmatched_gate = GetSize(gate) - GetSize(matched_gate);
+        if (conf.telemetry != nullptr && applied_suggestions > 0)
+            conf.telemetry->pair_applied_match_suggestions[pair_id] = applied_suggestions;
+        if (applied_suggestions > 0)
+            log("Applied %d match suggestions for pair %s.\n",
+                applied_suggestions, pair_id.c_str());
+    }
+
+    if (f != nullptr)
+        fclose(f);
 
     if (conf.dump_cfg.dump_match) {
         Json::array suggestions;
@@ -2995,6 +3073,7 @@ static std::vector<std::pair<RTLIL::IdString, bool>> abc_cec(const CheckConfig &
         .lib_file = conf.lib_file,
         .sched_model_file = conf.sched_model_file,
         .match_model_file = conf.match_model_file,
+        .accept_match_suggestions_file = conf.accept_match_suggestions_file,
         .seq_check_cfg = conf.seq_check_cfg,
         .dump_cfg = conf.dump_cfg,
         .sched_model = conf.sched_model,
@@ -3268,6 +3347,7 @@ Results check_retime(const CheckConfig &conf,
             .lib_file = conf.lib_file,
             .sched_model_file = conf.sched_model_file,
             .match_model_file = conf.match_model_file,
+            .accept_match_suggestions_file = conf.accept_match_suggestions_file,
             .seq_check_cfg = conf.seq_check_cfg,
             .dump_cfg = conf.dump_cfg,
             .sched_model = conf.sched_model,
@@ -3553,6 +3633,7 @@ struct GuideCheckRetimePass : public Pass {
             .lib_file = lib_file,
             .sched_model_file = "",
             .match_model_file = "",
+            .accept_match_suggestions_file = "",
             .seq_check_cfg = SeqCheckConfig{
                 .k_induct = k_induct,
                 .step_skip = step_skip,
@@ -3640,6 +3721,9 @@ struct GuideCheckPass : public Pass {
         log("    -guide-match-model <file>\n");
         log("        load a matching model JSON file and use it to score match suggestions.\n");
         log("\n");
+        log("    -guide-accept-match-suggestions <file>\n");
+        log("        append accepted suggestions from the JSON file into match_file.\n");
+        log("\n");
 	}
 	void execute(std::vector<std::string> args, RTLIL::Design *design) override
 	{
@@ -3657,6 +3741,7 @@ struct GuideCheckPass : public Pass {
         bool no_init = false;
         string sched_model_file;
         string match_model_file;
+        string accept_match_suggestions_file;
         MlDumpConfig dump_cfg;
         
         size_t argidx;
@@ -3716,6 +3801,10 @@ struct GuideCheckPass : public Pass {
             }
             if (args[argidx] == "-guide-match-model" && argidx + 1 < args.size()) {
                 match_model_file = args[++argidx];
+                continue;
+            }
+            if (args[argidx] == "-guide-accept-match-suggestions" && argidx + 1 < args.size()) {
+                accept_match_suggestions_file = args[++argidx];
                 continue;
             }
             break;
@@ -3816,6 +3905,7 @@ struct GuideCheckPass : public Pass {
             .lib_file = lib_file,
             .sched_model_file = sched_model_file,
             .match_model_file = match_model_file,
+            .accept_match_suggestions_file = accept_match_suggestions_file,
             .seq_check_cfg = seq_conf,
             .dump_cfg = dump_cfg,
             .sched_model = &sched_model,
@@ -3906,6 +3996,12 @@ struct GuideCheckPass : public Pass {
 
         auto gold2cutpoints = match_signals(design, conf, mod_map, true, "post_async");
         (void)gold2cutpoints;
+        int total_applied_match_suggestions = 0;
+        for (auto &it : telemetry.pair_applied_match_suggestions)
+            total_applied_match_suggestions += it.second;
+        if (total_applied_match_suggestions > 0)
+            log("Applied %d match suggestions into match_file(s).\n",
+                total_applied_match_suggestions);
 
         // remove_subclk(design,conf);
         // RTLIL::Design *design_check = empty_design();
@@ -3934,6 +4030,9 @@ struct GuideCheckPass : public Pass {
             log("Matching sidecar hint:\n");
             log("  python3 passes/guide/ml/infer_matching.py %s --model <match_ranker.cbm> -o %s\n",
                 dump_cfg.match_jsonl.c_str(),
+                match_suggestions_path(dump_cfg.match_jsonl).c_str());
+            log("Suggestion accept hint:\n");
+            log("  guide_check ... -guide-accept-match-suggestions %s\n",
                 match_suggestions_path(dump_cfg.match_jsonl).c_str());
         }
         if (dump_cfg.dump_fail) {
