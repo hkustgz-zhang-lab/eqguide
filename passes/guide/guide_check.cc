@@ -25,14 +25,19 @@
 #include "kernel/rtlil.h"
 #include "kernel/log.h"
 #include "kernel/ff.h"
+#include "libs/json11/json11.hpp"
 #include "kernel/sigtools.h"
 #include "kernel/yosys.h"
 #include <algorithm>
 #include <cassert>
+#include <cctype>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <map>
+#include <sstream>
 #include <set>
 #include <string>
 #include <tuple>
@@ -44,6 +49,8 @@
 
 USING_YOSYS_NAMESPACE
 PRIVATE_NAMESPACE_BEGIN
+
+using json11::Json;
 
 /*
 
@@ -84,6 +91,116 @@ struct SeqCheckConfig
     bool no_init = false;
 };
 
+struct MlDumpConfig
+{
+    bool dump_sched = false;
+    bool dump_match = false;
+    bool dump_fail = false;
+    string sched_jsonl;
+    string match_jsonl;
+    string fail_jsonl;
+};
+
+struct PairRecord
+{
+    string pair_id;
+    string gold_mod;
+    string gate_mod;
+    int gold_dff_cnt = 0;
+    int gate_dff_cnt = 0;
+    bool has_submodule = false;
+    bool retimed = false;
+    bool touched_by_multiplier = false;
+    int const_blackbox_inputs_inserted = 0;
+};
+
+struct MatchStats
+{
+    int exact_total = 0;
+    int pi_cnt = 0;
+    int po_cnt = 0;
+    int dff_cnt = 0;
+    int dff_po_cnt = 0;
+    int subckt_cnt = 0;
+    int unmatched_gold = 0;
+    int unmatched_gate = 0;
+    string match_file;
+};
+
+struct RunRecord
+{
+    string pair_id;
+    string action;
+    int exit_status = -1;
+    int result_code = 0;
+    double runtime_ms = 0;
+    string log_file;
+};
+
+struct GuideSchedLinearAction
+{
+    double bias = 0;
+    dict<string, double> weights;
+};
+
+struct GuideSchedTreeNode
+{
+    int feature_index = -1;
+    double threshold = 0;
+    int left = -1;
+    int right = -1;
+    double value = 0;
+    bool is_leaf = false;
+};
+
+struct GuideSchedTree
+{
+    std::vector<GuideSchedTreeNode> nodes;
+};
+
+struct GuideSchedModel
+{
+    bool loaded = false;
+    string path;
+    string model_type;
+    std::vector<string> feature_names;
+    double base_score = 0;
+    double learning_rate = 1.0;
+    dict<string, GuideSchedLinearAction> linear_actions;
+    std::vector<GuideSchedTree> trees;
+};
+
+struct FailurePacket
+{
+    string pair_id;
+    string stage;
+    string action;
+    std::vector<string> clues;
+    MatchStats match;
+    int exit_status = -1;
+    int result_code = 0;
+    double runtime_ms = 0;
+    string log_file;
+    std::vector<string> recent_actions;
+};
+
+struct CommandResult
+{
+    int exit_status = -1;
+    int result_code = 0;
+    double runtime_ms = 0;
+    string output;
+    string log_file;
+};
+
+struct GuideTelemetry
+{
+    std::map<string, MatchStats> pair_match_stats;
+    pool<RTLIL::IdString> retimed_mods;
+    pool<RTLIL::IdString> multiplier_mods;
+    Json::array match_suggestions;
+};
+
 struct CheckConfig
 {
     bool nocleanup = false;
@@ -95,7 +212,11 @@ struct CheckConfig
     string gold_prefix;
     string gate_prefix;
     string lib_file;
+    string sched_model_file;
     SeqCheckConfig seq_check_cfg;
+    MlDumpConfig dump_cfg;
+    GuideSchedModel *sched_model = nullptr;
+    GuideTelemetry *telemetry = nullptr;
     RTLIL::Design *lib_design = nullptr;
 };
 
@@ -133,6 +254,13 @@ enum class MatchType {
 #undef DECL_FIELD
 };
 
+enum class ActionKind {
+    CEC_MAP,
+    CEC_NOMAP,
+    DSEC_MAP,
+    DSEC_NOMAP
+};
+
 struct CutPoint{
     RTLIL::IdString name;
     RTLIL::SigBit gold_sig;
@@ -144,6 +272,12 @@ struct CutPoint{
     int gold_bit_index = 0;
     RTLIL::IdString gate_wire_name;
     int gate_bit_index = 0;
+};
+
+struct MatchResult
+{
+    std::vector<CutPoint> cut_points;
+    MatchStats stats;
 };
 
 struct NamedSig {
@@ -173,6 +307,22 @@ static inline string get_match_type_str(const MatchType& t) {
     }
     assert(0);
     return "UNKNOWN";
+}
+
+static inline string get_action_name(ActionKind action)
+{
+    switch (action) {
+    case ActionKind::CEC_MAP:
+        return "cec_map";
+    case ActionKind::CEC_NOMAP:
+        return "cec_nomap";
+    case ActionKind::DSEC_MAP:
+        return "dsec_map";
+    case ActionKind::DSEC_NOMAP:
+        return "dsec_nomap";
+    }
+    assert(0);
+    return "unknown";
 }
 
 static void print_MultiMap(const MultiMap &mm)
@@ -211,6 +361,446 @@ static RTLIL::Design *empty_design()
     auto *design = new RTLIL::Design;
     design->push_full_selection();
     return design;
+}
+
+static string sanitize_filename(const string &s)
+{
+    string out = s;
+    for (char &ch : out)
+        if (!std::isalnum(static_cast<unsigned char>(ch)) && ch != '_' && ch != '-' && ch != '.')
+            ch = '_';
+    return out;
+}
+
+static string get_pair_id(const RTLIL::IdString &gold_mod, const RTLIL::IdString &gate_mod)
+{
+    return strip_backslash(gold_mod) + "__vs__" + strip_backslash(gate_mod);
+}
+
+static Json match_stats_to_json(const MatchStats &stats)
+{
+    return Json::object {
+        {"exact_total", stats.exact_total},
+        {"pi_cnt", stats.pi_cnt},
+        {"po_cnt", stats.po_cnt},
+        {"dff_cnt", stats.dff_cnt},
+        {"dff_po_cnt", stats.dff_po_cnt},
+        {"subckt_cnt", stats.subckt_cnt},
+        {"unmatched_gold", stats.unmatched_gold},
+        {"unmatched_gate", stats.unmatched_gate},
+        {"match_file", stats.match_file}
+    };
+}
+
+static Json pair_record_to_json(const PairRecord &record)
+{
+    return Json::object {
+        {"pair_id", record.pair_id},
+        {"gold_mod", record.gold_mod},
+        {"gate_mod", record.gate_mod},
+        {"gold_dff_cnt", record.gold_dff_cnt},
+        {"gate_dff_cnt", record.gate_dff_cnt},
+        {"has_submodule", record.has_submodule},
+        {"retimed", record.retimed},
+        {"touched_by_multiplier", record.touched_by_multiplier},
+        {"const_blackbox_inputs_inserted", record.const_blackbox_inputs_inserted}
+    };
+}
+
+static Json run_record_to_json(const RunRecord &record)
+{
+    return Json::object {
+        {"pair_id", record.pair_id},
+        {"action", record.action},
+        {"exit_status", record.exit_status},
+        {"result_code", record.result_code},
+        {"runtime_ms", record.runtime_ms},
+        {"log_file", record.log_file}
+    };
+}
+
+static void append_jsonl(const string &path, const Json &json)
+{
+    if (path.empty())
+        return;
+
+    FILE *f = fopen(path.c_str(), "a");
+    if (f == nullptr)
+        log_error("Cannot open JSONL file %s for append.\n", path.c_str());
+
+    fprintf(f, "%s\n", json.dump().c_str());
+    fclose(f);
+}
+
+static string make_command_log_file(const string &tempdir_name, const string &tag)
+{
+    string dir_name = tempdir_name.empty() ? get_base_tmpdir() : tempdir_name;
+    string log_file = dir_name + "/" + sanitize_filename(tag) + "-XXXXXX.log";
+    return make_temp_file(log_file);
+}
+
+static std::vector<string> extract_failure_clues(const string &output)
+{
+    std::vector<string> clues;
+    const std::vector<string> known_clues = {
+        "Networks are NOT EQUIVALENT",
+        "Miter computation has failed",
+        "BMC-Induct failed in weak mode",
+        "BMC-Induct failed in BMC phase",
+        "BMC-Induct failed in Induct phase",
+        "Amulet Verify failed"
+    };
+
+    for (auto &clue : known_clues)
+        if (output.find(clue) != string::npos)
+            clues.push_back(clue);
+
+    return clues;
+}
+
+static CommandResult exec_capture(const string &cmd, const string &tempdir_name, const string &tag)
+{
+    CommandResult result;
+    string cmd_with_stderr = cmd + " 2>&1";
+    string log_file = make_command_log_file(tempdir_name, tag);
+    FILE *log_f = fopen(log_file.c_str(), "w");
+
+    char buffer[1024];
+    auto t_start = std::chrono::steady_clock::now();
+    FILE *pipe = popen(cmd_with_stderr.c_str(), "r");
+    if (!pipe) {
+        if (log_f != nullptr)
+            fclose(log_f);
+        log_error("Error executing command: %s\n", cmd.c_str());
+        return result;
+    }
+
+    while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
+        result.output += buffer;
+        log("%s", buffer);
+        if (log_f != nullptr)
+            fputs(buffer, log_f);
+    }
+
+    int status = pclose(pipe);
+    auto t_end = std::chrono::steady_clock::now();
+    result.runtime_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_end - t_start).count();
+    result.log_file = log_file;
+
+    if (log_f != nullptr)
+        fclose(log_f);
+
+    if (WIFEXITED(status))
+        result.exit_status = WEXITSTATUS(status);
+    else
+        result.exit_status = -1;
+
+    return result;
+}
+
+static MatchStats get_match_stats(const CheckConfig &conf)
+{
+    if (conf.telemetry == nullptr)
+        return MatchStats();
+
+    string pair_id = get_pair_id(conf.gold_mod->name, conf.gate_mod->name);
+    auto it = conf.telemetry->pair_match_stats.find(pair_id);
+    if (it == conf.telemetry->pair_match_stats.end())
+        return MatchStats();
+    return it->second;
+}
+
+static int typed_match_total(const MatchStats &stats)
+{
+    return stats.pi_cnt + stats.po_cnt + stats.dff_cnt + stats.dff_po_cnt + stats.subckt_cnt;
+}
+
+static bool module_has_submodule(RTLIL::Design *design, RTLIL::Module *mod)
+{
+    for (auto cell : mod->cells()) {
+        RTLIL::Module *submod = design->module(cell->type);
+        if (submod != nullptr && !submod->get_bool_attribute(ID(blackbox)))
+            return true;
+    }
+    return false;
+}
+
+static bool module_has_dff(RTLIL::Module *mod, bool gate_side)
+{
+    for (auto cell : mod->cells())
+        if (cell->type == ID($ff) || cell->type == ID($dff) || cell->type == ID($dffe) ||
+            cell->type == ID($_DFF_P_) || cell->type == ID($_DFF_N_) || cell->type == ID($_DFFE_PN) ||
+            cell->type == ID($_DFFE_PP) || (gate_side && cell->type.contains("DFF")))
+            return true;
+    return false;
+}
+
+static std::pair<string, std::vector<string>> failure_teacher(const std::vector<string> &clues)
+{
+    for (auto &clue : clues) {
+        if (clue == "Miter computation has failed")
+            return {"abc_miter_failed", {"try -n fallback", "inspect match density"}};
+        if (clue == "BMC-Induct failed in weak mode" || clue == "BMC-Induct failed in BMC phase" ||
+            clue == "BMC-Induct failed in Induct phase")
+            return {"retime_or_warmup_issue", {"increase -skip", "increase -k", "inspect retimed pair"}};
+        if (clue == "Amulet Verify failed")
+            return {"multiplier_annotation_or_sca_issue", {"check multiplier width/sign", "check blackboxing path"}};
+        if (clue == "Networks are NOT EQUIVALENT")
+            return {"not_equivalent_counterexample", {"inspect counterexample-producing module pair", "check upstream transforms"}};
+    }
+
+    return {"unknown_failure", {"inspect command log", "replay failing action manually"}};
+}
+
+static Json string_array_to_json(const std::vector<string> &values)
+{
+    Json::array out;
+    for (auto &value : values)
+        out.push_back(value);
+    return out;
+}
+
+static dict<string, double> scheduler_pair_features(const PairRecord &pair_record, const MatchStats &match_stats)
+{
+    dict<string, double> features;
+    features["has_dff"] = (pair_record.gold_dff_cnt != 0 || pair_record.gate_dff_cnt != 0) ? 1.0 : 0.0;
+    features["gold_dff_cnt"] = pair_record.gold_dff_cnt;
+    features["gate_dff_cnt"] = pair_record.gate_dff_cnt;
+    features["has_submodule"] = pair_record.has_submodule ? 1.0 : 0.0;
+    features["exact_total"] = match_stats.exact_total;
+    features["pi_cnt"] = match_stats.pi_cnt;
+    features["po_cnt"] = match_stats.po_cnt;
+    features["dff_cnt"] = match_stats.dff_cnt;
+    features["dff_po_cnt"] = match_stats.dff_po_cnt;
+    features["subckt_cnt"] = match_stats.subckt_cnt;
+    features["unmatched_gold"] = match_stats.unmatched_gold;
+    features["unmatched_gate"] = match_stats.unmatched_gate;
+    features["retimed"] = pair_record.retimed ? 1.0 : 0.0;
+    features["touched_by_multiplier"] = pair_record.touched_by_multiplier ? 1.0 : 0.0;
+    features["const_blackbox_inputs_inserted"] = pair_record.const_blackbox_inputs_inserted;
+    return features;
+}
+
+static dict<string, double> scheduler_context_features(const string &action,
+                                                       const PairRecord &pair_record,
+                                                       const MatchStats &match_stats)
+{
+    dict<string, double> features = scheduler_pair_features(pair_record, match_stats);
+    features["act_cec_map"] = action == "cec_map" ? 1.0 : 0.0;
+    features["act_cec_nomap"] = action == "cec_nomap" ? 1.0 : 0.0;
+    features["act_dsec_map"] = action == "dsec_map" ? 1.0 : 0.0;
+    features["act_dsec_nomap"] = action == "dsec_nomap" ? 1.0 : 0.0;
+    features["is_dsec"] = (action == "dsec_map" || action == "dsec_nomap") ? 1.0 : 0.0;
+    features["use_map"] = (action == "cec_map" || action == "dsec_map") ? 1.0 : 0.0;
+    return features;
+}
+
+static double tree_predict(const GuideSchedTree &tree, const std::vector<double> &features)
+{
+    int node_index = 0;
+    while (node_index >= 0 && node_index < GetSize(tree.nodes)) {
+        const auto &node = tree.nodes[node_index];
+        if (node.is_leaf)
+            return node.value;
+
+        double feature_value = 0;
+        if (node.feature_index >= 0 && node.feature_index < GetSize(features))
+            feature_value = features[node.feature_index];
+        node_index = feature_value <= node.threshold ? node.left : node.right;
+    }
+    return 0;
+}
+
+static bool load_sched_model(const string &path, GuideSchedModel &model)
+{
+    if (path.empty())
+        return false;
+    if (model.loaded && model.path == path)
+        return true;
+
+    std::ifstream handle(path);
+    if (!handle.is_open())
+        log_error("Cannot open scheduler model file %s.\n", path.c_str());
+
+    std::stringstream buffer;
+    buffer << handle.rdbuf();
+    string error;
+    Json json = Json::parse(buffer.str(), error);
+    if (!error.empty())
+        log_error("Cannot parse scheduler model file %s: %s\n", path.c_str(), error.c_str());
+
+    model = GuideSchedModel();
+    model.path = path;
+    model.model_type = json["model_type"].string_value();
+    model.base_score = json["base_score"].number_value();
+    model.learning_rate = json["learning_rate"].number_value();
+
+    auto feature_names = json["feature_names"].array_items();
+    for (auto &item : feature_names)
+        if (item.is_string())
+            model.feature_names.push_back(item.string_value());
+
+    if (model.model_type == "guide_sched_linear_v1") {
+        for (auto &it : json["actions"].object_items()) {
+            GuideSchedLinearAction action_model;
+            action_model.bias = it.second["bias"].number_value();
+            for (auto &weight : it.second["weights"].object_items())
+                action_model.weights[weight.first] = weight.second.number_value();
+            model.linear_actions[it.first] = action_model;
+        }
+    } else
+    if (model.model_type == "guide_sched_gbdt_v1") {
+        for (auto &tree_json : json["trees"].array_items()) {
+            GuideSchedTree tree;
+            for (auto &node_json : tree_json["nodes"].array_items()) {
+                GuideSchedTreeNode node;
+                node.feature_index = node_json["feature_index"].int_value();
+                node.threshold = node_json["threshold"].number_value();
+                node.left = node_json["left"].int_value();
+                node.right = node_json["right"].int_value();
+                node.value = node_json["value"].number_value();
+                node.is_leaf = node_json["is_leaf"].bool_value();
+                tree.nodes.push_back(node);
+            }
+            model.trees.push_back(tree);
+        }
+    } else
+        log_error("Unsupported scheduler model type in %s: %s\n", path.c_str(), model.model_type.c_str());
+
+    if (model.model_type == "guide_sched_gbdt_v1" && model.feature_names.empty())
+        log_error("Scheduler model %s has no feature names.\n", path.c_str());
+    if (model.model_type == "guide_sched_gbdt_v1" && model.trees.empty())
+        log_error("Scheduler model %s has no trees.\n", path.c_str());
+
+    if (model.model_type == "guide_sched_linear_v1" && model.linear_actions.empty())
+        log_error("Scheduler model %s has no action weights.\n", path.c_str());
+
+    if (model.learning_rate == 0)
+        model.learning_rate = 1.0;
+    if (model.model_type == "guide_sched_linear_v1" && model.base_score == 0)
+        model.base_score = 0;
+
+    if (model.model_type == "guide_sched_gbdt_v1") {
+        for (auto &tree : model.trees)
+            if (tree.nodes.empty())
+                log_error("Scheduler model %s contains an empty tree.\n", path.c_str());
+    }
+
+    model.loaded = true;
+    return true;
+}
+
+static double predict_sched_cost(const GuideSchedModel &model, const string &action,
+                                 const PairRecord &pair_record, const MatchStats &match_stats)
+{
+    if (!model.loaded)
+        return 0;
+
+    if (model.model_type == "guide_sched_linear_v1") {
+        if (!model.linear_actions.count(action))
+            return 0;
+        dict<string, double> features = scheduler_context_features(action, pair_record, match_stats);
+        double cost = model.linear_actions.at(action).bias;
+        for (auto &weight : model.linear_actions.at(action).weights)
+            cost += weight.second * (features.count(weight.first) ? features.at(weight.first) : 0.0);
+        return cost;
+    }
+
+    dict<string, double> features_by_name = scheduler_context_features(action, pair_record, match_stats);
+    std::vector<double> features(GetSize(model.feature_names), 0.0);
+    for (int i = 0; i < GetSize(model.feature_names); i++)
+        if (features_by_name.count(model.feature_names[i]))
+            features[i] = features_by_name.at(model.feature_names[i]);
+
+    double cost = model.base_score;
+    for (auto &tree : model.trees)
+        cost += tree_predict(tree, features);
+    return cost;
+}
+
+static void emit_failure_packet(const CheckConfig &conf, const string &stage, const string &action,
+                                const CommandResult &command_result, const std::vector<RunRecord> &trace)
+{
+    if (!conf.dump_cfg.dump_fail || conf.dump_cfg.fail_jsonl.empty())
+        return;
+
+    FailurePacket packet;
+    packet.pair_id = get_pair_id(conf.gold_mod->name, conf.gate_mod->name);
+    packet.stage = stage;
+    packet.action = action;
+    packet.clues = extract_failure_clues(command_result.output);
+    packet.match = get_match_stats(conf);
+    packet.exit_status = command_result.exit_status;
+    packet.result_code = command_result.result_code;
+    packet.runtime_ms = command_result.runtime_ms;
+    packet.log_file = command_result.log_file;
+
+    for (auto &item : trace)
+        packet.recent_actions.push_back(item.action);
+
+    std::vector<string> last_2_actions;
+    int start = std::max(0, GetSize(packet.recent_actions) - 2);
+    for (int i = start; i < GetSize(packet.recent_actions); i++)
+        last_2_actions.push_back(packet.recent_actions[i]);
+
+    auto teacher = failure_teacher(packet.clues);
+
+    append_jsonl(conf.dump_cfg.fail_jsonl, Json::object {
+        {"design", strip_backslash(conf.gold_mod->name)},
+        {"gold_mod", strip_backslash(conf.gold_mod->name)},
+        {"gate_mod", strip_backslash(conf.gate_mod->name)},
+        {"pair_id", packet.pair_id},
+        {"stage", packet.stage},
+        {"action", packet.action},
+        {"clues", string_array_to_json(packet.clues)},
+        {"match", match_stats_to_json(packet.match)},
+        {"has_dff", module_has_dff(conf.gold_mod, false) || module_has_dff(conf.gate_mod, true)},
+        {"has_submodule", module_has_submodule(conf.design, conf.gold_mod)},
+        {"exact_match_cnt", packet.match.exact_total},
+        {"typed_match_cnt", typed_match_total(packet.match)},
+        {"exit_status", packet.exit_status},
+        {"result_code", packet.result_code},
+        {"runtime_ms", packet.runtime_ms},
+        {"log_file", packet.log_file},
+        {"recent_actions", string_array_to_json(packet.recent_actions)},
+        {"last_2_actions", string_array_to_json(last_2_actions)},
+        {"teacher_class", teacher.first},
+        {"next_steps", string_array_to_json(teacher.second)}
+    });
+}
+
+static void emit_failure_packet(const MlDumpConfig &dump_cfg, const string &pair_id, const string &stage,
+                                const string &action, const string &gold_mod, const string &gate_mod,
+                                const CommandResult &command_result)
+{
+    if (!dump_cfg.dump_fail || dump_cfg.fail_jsonl.empty())
+        return;
+
+    std::vector<string> clues = extract_failure_clues(command_result.output);
+    auto teacher = failure_teacher(clues);
+
+    append_jsonl(dump_cfg.fail_jsonl, Json::object {
+        {"design", gold_mod},
+        {"gold_mod", gold_mod},
+        {"gate_mod", gate_mod},
+        {"pair_id", pair_id},
+        {"stage", stage},
+        {"action", action},
+        {"clues", string_array_to_json(clues)},
+        {"match", match_stats_to_json(MatchStats())},
+        {"has_dff", false},
+        {"has_submodule", false},
+        {"exact_match_cnt", 0},
+        {"typed_match_cnt", 0},
+        {"exit_status", command_result.exit_status},
+        {"result_code", command_result.result_code},
+        {"runtime_ms", command_result.runtime_ms},
+        {"log_file", command_result.log_file},
+        {"recent_actions", Json::array()},
+        {"last_2_actions", Json::array()},
+        {"teacher_class", teacher.first},
+        {"next_steps", string_array_to_json(teacher.second)}
+    });
 }
 
 static RTLIL::SigSpec resize_u0(RTLIL::SigSpec src, int width);
@@ -646,25 +1236,107 @@ static dict<RTLIL::IdString, NamedSig> build_named_sigs(RTLIL::Design* design, R
 }
 
 
-static std::vector<CutPoint> match_signals_module(RTLIL::Design *design, RTLIL::Module *gold_mod, RTLIL::Module *gate_mod, const string& tempdir)
+static void update_match_stats(MatchStats &stats, MatchType type)
+{
+    switch (type) {
+    case MatchType::PI:
+        stats.pi_cnt++;
+        break;
+    case MatchType::PO:
+        stats.po_cnt++;
+        break;
+    case MatchType::DFF:
+        stats.dff_cnt++;
+        break;
+    case MatchType::DFF_PO:
+        stats.dff_po_cnt++;
+        break;
+    case MatchType::SUBCKT_PIPO:
+        stats.subckt_cnt++;
+        break;
+    case MatchType::NONE:
+        break;
+    }
+}
+
+static string normalize_match_name(const RTLIL::IdString &id)
+{
+    string name = strip_backslash(id);
+    for (char &ch : name)
+        if (!std::isalnum(static_cast<unsigned char>(ch)))
+            ch = '_';
+    return name;
+}
+
+static string last_match_token(const RTLIL::IdString &id)
+{
+    string name = normalize_match_name(id);
+    size_t pos = name.find_last_of('_');
+    if (pos == string::npos)
+        return name;
+    return name.substr(pos + 1);
+}
+
+static int score_match_candidate(const NamedSig &gold_sig, const NamedSig &gate_sig)
+{
+    int score = 0;
+
+    if (gold_sig.type != gate_sig.type)
+        return score;
+    if (gold_sig.bit_index == gate_sig.bit_index)
+        score += 10;
+    if (gold_sig.wire_name == gate_sig.wire_name)
+        score += 100;
+    if (normalize_match_name(gold_sig.wire_name) == normalize_match_name(gate_sig.wire_name))
+        score += 40;
+    if (last_match_token(gold_sig.wire_name) == last_match_token(gate_sig.wire_name))
+        score += 20;
+
+    return score;
+}
+
+static void write_match_suggestions(const string &path, const Json::array &suggestions)
+{
+    FILE *f = fopen(path.c_str(), "w");
+    if (f == nullptr)
+        log_error("Cannot open match suggestions file %s.\n", path.c_str());
+    fprintf(f, "%s\n", Json(suggestions).dump().c_str());
+    fclose(f);
+}
+
+static string match_suggestions_path(const string &match_jsonl)
+{
+    if (match_jsonl.empty())
+        return "match_suggestions.json";
+
+    size_t pos = match_jsonl.find_last_of('/');
+    if (pos == string::npos)
+        return "match_suggestions.json";
+
+    return match_jsonl.substr(0, pos + 1) + "match_suggestions.json";
+}
+
+static MatchResult match_signals_module(RTLIL::Design *design, RTLIL::Module *gold_mod, RTLIL::Module *gate_mod,
+                                        const CheckConfig &conf, bool emit_match_file, const string &snapshot_name)
 {
     assert(design && gold_mod && gate_mod);
 
-    SigMap sigmap_gate(gate_mod);
-    SigMap sigmap_gold(gold_mod);
-
-    std::vector<CutPoint> cut_points;
+    MatchResult result;
     dict<RTLIL::SigBit, RTLIL::Cell*> gold_ff_q_map;
     dict<RTLIL::SigBit, RTLIL::Cell*> gate_ff_q_map;
 
     auto gold = build_named_sigs(design, gold_mod, gold_ff_q_map);
     auto gate = build_named_sigs(design, gate_mod, gate_ff_q_map);
-    // log("---------------------------------------------\n");
-    // log("Matching signals between Gold module %s and Gate module %s\n",
-    //     log_id(gold_mod), log_id(gate_mod));
+    string pair_id = get_pair_id(gold_mod->name, gate_mod->name);
+    string match_file = conf.tempdir_name + "/match_" + RTLIL::unescape_id(gold_mod->name) + "_" + RTLIL::unescape_id(gate_mod->name) + ".txt";
+    result.stats.match_file = match_file;
 
-    string match_file = tempdir + "/match_" + RTLIL::unescape_id(gold_mod->name) + "_" + RTLIL::unescape_id(gate_mod->name) + ".txt";
-    FILE *f = fopen(match_file.c_str(), "w");
+    FILE *f = nullptr;
+    if (emit_match_file)
+        f = fopen(match_file.c_str(), "w");
+
+    pool<RTLIL::IdString> matched_gold;
+    pool<RTLIL::IdString> matched_gate;
 
     for (auto &it : gold) {
         auto name = it.first;
@@ -684,32 +1356,148 @@ static std::vector<CutPoint> match_signals_module(RTLIL::Design *design, RTLIL::
         // ! Warning: NONE type gentry may has the same signal name with DFF/other type's.
         // This will lead to overwriting in name mapping in ABC. If didn't solve this in 
         // ABC. Please DO NOT dump NONE type entries!
-        if(gentry.type != MatchType::NONE){
+        if(gentry.type != MatchType::NONE && f != nullptr){
             fprintf(f, "Matched signal %s: gold %s gate %s, Type %s\n",
                 name.c_str(), log_signal(gsig).c_str(), log_signal(ksig).c_str(), 
                 get_match_type_str(gentry.type).c_str());
         }
-        cut_points.push_back(CutPoint{name, gsig, ksig, gentry.type,
+        matched_gold.insert(name);
+        matched_gate.insert(name);
+        result.stats.exact_total++;
+        update_match_stats(result.stats, gentry.type);
+        result.cut_points.push_back(CutPoint{name, gsig, ksig, gentry.type,
                 gold_ff_q_map.count(gsig) ? gold_ff_q_map[gsig] : nullptr,
                 gate_ff_q_map.count(ksig) ? gate_ff_q_map[ksig] : nullptr,
                 gentry.wire_name, gentry.bit_index,
                 kentry.wire_name, kentry.bit_index});
     }
-    fclose(f);
-    return cut_points;
+
+    if (f != nullptr)
+        fclose(f);
+
+    result.stats.unmatched_gold = GetSize(gold) - GetSize(matched_gold);
+    result.stats.unmatched_gate = GetSize(gate) - GetSize(matched_gate);
+
+    if (conf.dump_cfg.dump_match) {
+        Json::array suggestions;
+        for (auto &it : gold) {
+            auto gold_name = it.first;
+            const auto &gentry = it.second;
+            if (gentry.type == MatchType::NONE)
+                continue;
+
+            if (matched_gold.count(gold_name)) {
+                append_jsonl(conf.dump_cfg.match_jsonl, Json::object {
+                    {"pair_id", pair_id},
+                    {"snapshot", snapshot_name},
+                    {"gold_mod", strip_backslash(gold_mod->name)},
+                    {"gate_mod", strip_backslash(gate_mod->name)},
+                    {"gold_name", strip_backslash(gold_name)},
+                    {"gate_name", strip_backslash(gold_name)},
+                    {"type", get_match_type_str(gentry.type)},
+                    {"gold_wire_name", strip_backslash(gentry.wire_name)},
+                    {"gate_wire_name", strip_backslash(gate.at(gold_name).wire_name)},
+                    {"gold_bit_index", gentry.bit_index},
+                    {"gate_bit_index", gate.at(gold_name).bit_index},
+                    {"score", 1000},
+                    {"label", gentry.type == MatchType::NONE ? 0 : 1}
+                });
+                continue;
+            }
+
+            std::vector<std::pair<int, RTLIL::IdString>> candidates;
+            for (auto &gt : gate) {
+                auto gate_name = gt.first;
+                const auto &kentry = gt.second;
+                if (matched_gate.count(gate_name))
+                    continue;
+                if (kentry.type == MatchType::NONE)
+                    continue;
+                if (gentry.type != kentry.type)
+                    continue;
+                if (gentry.bit_index != kentry.bit_index)
+                    continue;
+                int score = score_match_candidate(gentry, kentry);
+                candidates.push_back({score, gate_name});
+                append_jsonl(conf.dump_cfg.match_jsonl, Json::object {
+                    {"pair_id", pair_id},
+                    {"snapshot", snapshot_name},
+                    {"gold_mod", strip_backslash(gold_mod->name)},
+                    {"gate_mod", strip_backslash(gate_mod->name)},
+                    {"gold_name", strip_backslash(gold_name)},
+                    {"gate_name", strip_backslash(gate_name)},
+                    {"type", get_match_type_str(gentry.type)},
+                    {"gold_wire_name", strip_backslash(gentry.wire_name)},
+                    {"gate_wire_name", strip_backslash(kentry.wire_name)},
+                    {"gold_bit_index", gentry.bit_index},
+                    {"gate_bit_index", kentry.bit_index},
+                    {"score", score},
+                    {"label", 0}
+                });
+            }
+
+            std::sort(candidates.begin(), candidates.end(),
+                [](const std::pair<int, RTLIL::IdString> &lhs, const std::pair<int, RTLIL::IdString> &rhs) {
+                    if (lhs.first != rhs.first)
+                        return lhs.first > rhs.first;
+                    return lhs.second.str() < rhs.second.str();
+                });
+
+            if (!candidates.empty() && candidates.front().first > 0) {
+                auto top_name = candidates.front().second;
+                const auto &top_entry = gate.at(top_name);
+                int score_margin = candidates.front().first;
+                if (GetSize(candidates) > 1)
+                    score_margin = candidates.front().first - candidates[1].first;
+
+                Json suggestion = Json::object {
+                    {"pair_id", pair_id},
+                    {"snapshot", snapshot_name},
+                    {"gold_mod", strip_backslash(gold_mod->name)},
+                    {"gate_mod", strip_backslash(gate_mod->name)},
+                    {"gold_name", strip_backslash(gold_name)},
+                    {"gold_wire_name", strip_backslash(gentry.wire_name)},
+                    {"gold_bit_index", gentry.bit_index},
+                    {"type", get_match_type_str(gentry.type)},
+                    {"suggested_gate_name", strip_backslash(top_name)},
+                    {"suggested_gate_wire_name", strip_backslash(top_entry.wire_name)},
+                    {"suggested_gate_bit_index", top_entry.bit_index},
+                    {"score", candidates.front().first},
+                    {"score_margin", score_margin}
+                };
+                suggestions.push_back(suggestion);
+                if (conf.telemetry != nullptr && snapshot_name == "pre_async")
+                    conf.telemetry->match_suggestions.push_back(suggestion);
+            }
+        }
+
+        if (!suggestions.empty()) {
+            string suggestions_file = conf.tempdir_name + "/match_suggestions_" +
+                snapshot_name + "_" + sanitize_filename(pair_id) + ".json";
+            write_match_suggestions(suggestions_file, suggestions);
+        }
+    }
+
+    return result;
 }
 
-static dict<RTLIL::Module*, std::vector<CutPoint>> match_signals(RTLIL::Design *design, const CheckConfig& conf, ModMap& mod_map)
+static dict<RTLIL::Module*, std::vector<CutPoint>> match_signals(RTLIL::Design *design, const CheckConfig& conf,
+                                                                 ModMap& mod_map, bool emit_match_file,
+                                                                 const string &snapshot_name)
 {
     assert(design);
     auto gold2gate = mod_map.mod_map_gold;
-    auto gate2gold = mod_map.mod_map_gate;
 
     dict<RTLIL::Module*, std::vector<CutPoint>> gold2cutpoints;
 
     for(auto const &[gold, gate] : gold2gate){
-        gold2cutpoints[design->module(gold)] = 
-            match_signals_module(design, design->module(gold), design->module(gate), conf.tempdir_name);
+        auto gold_mod = design->module(gold);
+        auto gate_mod = design->module(gate);
+        MatchResult match_result =
+            match_signals_module(design, gold_mod, gate_mod, conf, emit_match_file, snapshot_name);
+        gold2cutpoints[gold_mod] = match_result.cut_points;
+        if (emit_match_file && conf.telemetry != nullptr)
+            conf.telemetry->pair_match_stats[get_pair_id(gold, gate)] = match_result.stats;
     }
     return gold2cutpoints;
 }
@@ -1047,68 +1835,40 @@ static std::pair<RTLIL::Module*, RTLIL::Module*> partition_module(RTLIL::Design 
     }
 }
 
-static int exectue_and_check(const std::string & cmd, bool & correct, 
-                      const std::string & target_output) {
+static int exectue_and_check(const std::string & cmd, bool & correct,
+                      const std::string & target_output,
+                      const string &tempdir_name = "",
+                      const string &tag = "command",
+                      CommandResult *capture = nullptr) {
     correct = false;
-    char buffer[1024];
-    std::string output;
-
-    FILE *pipe = popen(cmd.c_str(), "r");
-    if (!pipe) {
-        log_error("Error executing command: ");
-        return -1;
-    }
-
-    while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
-        output += buffer;
-        log("%s", buffer);
-        if (output.find(target_output) != std::string::npos) {
-            correct = true;
-        }
-    }
-
-    int status = pclose(pipe);
-    if (WIFEXITED(status)) {
-        status = WEXITSTATUS(status);
-    } else {
-        status = -1; 
-    }
-
-    return status;
+    CommandResult result = exec_capture(cmd, tempdir_name, tag);
+    correct = result.output.find(target_output) != std::string::npos;
+    result.result_code = correct ? 1 : 0;
+    if (capture != nullptr)
+        *capture = result;
+    return result.exit_status;
 }
 
 
-static int exectue_and_check(const std::string & cmd, int & result, 
-                    const std::vector<std::pair<std::string, int>>& target_result) {
-    char buffer[1024];
-    std::string output;
-
-    FILE *pipe = popen(cmd.c_str(), "r");
-    if (!pipe) {
-        log_error("Error executing command: ");
-        return -1;
-    }
-
-    while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
-        output += buffer;
-        log("%s", buffer);
-    }
+static int exectue_and_check(const std::string & cmd, int & result,
+                    const std::vector<std::pair<std::string, int>>& target_result,
+                    const string &tempdir_name = "",
+                    const string &tag = "command",
+                    CommandResult *capture = nullptr) {
+    CommandResult exec_result = exec_capture(cmd, tempdir_name, tag);
+    result = 0;
 
     for(auto it: target_result) {
-        if (output.find(it.first) != std::string::npos) {
+        if (exec_result.output.find(it.first) != std::string::npos) {
             result = it.second;
             break;
         }
     }
-    
-    int status = pclose(pipe);
-    if (WIFEXITED(status)) {
-        status = WEXITSTATUS(status);
-    } else {
-        status = -1; 
-    }
 
-    return status;
+    exec_result.result_code = result;
+    if (capture != nullptr)
+        *capture = exec_result;
+    return exec_result.exit_status;
 }
 
 static bool valid_internal_multiplier_cell(RTLIL::Cell *cell)
@@ -1293,30 +2053,11 @@ static void extract_multi(RTLIL::Design *design, RTLIL::Module *mod)
     mod->fixup_ports();
 }
 
-int exec_cmd(const string &cmd){
-    char buffer[1024];
-
-    FILE *pipe = popen(cmd.c_str(), "r");
-    if (!pipe) {
-        log_error("Error executing command: %s", cmd);
-        return -1;
-    }
-
-    while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
-        log("%s", buffer);
-    }
-
-    int status = pclose(pipe);
-    if (WIFEXITED(status)) {
-        status = WEXITSTATUS(status);
-    } else {
-        status = -1; 
-    }
-
-    // if(status != 0){
-    //     log_error("Error executing command: %s", cmd);
-    // }
-    return status;
+int exec_cmd(const string &cmd, const string &tempdir_name = "", const string &tag = "command", CommandResult *capture = nullptr){
+    CommandResult result = exec_capture(cmd, tempdir_name, tag);
+    if (capture != nullptr)
+        *capture = result;
+    return result.exit_status;
 }
 
 
@@ -1376,7 +2117,7 @@ static string dump_aig(RTLIL::Design* design, const string &dir_name, RTLIL::Mod
     run_pass(stringf("flatten %s", mod->name.str()), design_copy);
     run_pass(stringf("opt"), design_copy);
     // run_pass(stringf("proc"), design_copy);
-    run_pass("setundef -undriven -zero", design);
+    run_pass("setundef -undriven -zero", design_copy);
     run_pass(stringf("opt_expr"), design_copy);
     run_pass(stringf("techmap"), design_copy);
     run_pass(stringf("opt_expr"), design_copy);
@@ -1422,10 +2163,10 @@ static string dump_blif(RTLIL::Design* design, const string &dir_name, RTLIL::Mo
     return blif_file;
 }
 
-static void materialize_blackbox_input_consts(RTLIL::Design *design, RTLIL::Module *mod)
+static int materialize_blackbox_input_consts(RTLIL::Design *design, RTLIL::Module *mod)
 {
     if (design == nullptr || mod == nullptr)
-        return;
+        return 0;
 
     int inserted = 0;
 
@@ -1477,9 +2218,12 @@ static void materialize_blackbox_input_consts(RTLIL::Design *design, RTLIL::Modu
     if (inserted > 0)
         log("Inserted %d constant nets on blackbox inputs in module %s.\n",
             inserted, log_id(mod->name));
+
+    return inserted;
 }
 
-static string dump_blif_module(RTLIL::Design* design, const string &dir_name, RTLIL::Module *mod, const string& lib_file){
+static string dump_blif_module(RTLIL::Design* design, const string &dir_name, RTLIL::Module *mod, const string& lib_file,
+                               int *inserted_bbconsts = nullptr){
 
     auto t_start = std::chrono::steady_clock::now();
 
@@ -1512,8 +2256,11 @@ static string dump_blif_module(RTLIL::Design* design, const string &dir_name, RT
         }
     }
     RTLIL::Module *target_mod = design_copy->module(mod->name);
-    if (target_mod != nullptr)
-        materialize_blackbox_input_consts(design_copy, target_mod);
+    if (target_mod != nullptr) {
+        int inserted = materialize_blackbox_input_consts(design_copy, target_mod);
+        if (inserted_bbconsts != nullptr)
+            *inserted_bbconsts = inserted;
+    }
     (void)lib_file;
     // if(!lib_file.empty())
     //     run_pass(stringf("read_verilog -overwrite %s", lib_file), design_copy);
@@ -1576,7 +2323,8 @@ static string dump_smt2(RTLIL::Design* design, const string &dir_name, std::pair
 
 
 static bool check_multi(RTLIL::Design* design, RTLIL::Module* mod, const string& tempdir_name, const string& lib_file,
-    bool amulet = true){
+    const MlDumpConfig &dump_cfg, const string &pair_id, const string &gold_mod_name,
+    const string &gate_mod_name, bool amulet = true){
     log_assert(mod->get_bool_attribute(ID(multiplier)));
     bool is_signed = mod->get_bool_attribute(ID(is_signed));    
     auto aig_file = dump_aig(design, tempdir_name, mod, lib_file);
@@ -1584,38 +2332,56 @@ static bool check_multi(RTLIL::Design* design, RTLIL::Module* mod, const string&
     amulet = true; // Uses Amulet now.
     if(amulet){
         log("Using amulet to verify the multiplier.\n");
-            auto miter_tmp_file = tempdir_name + "/" 
-                + strip_backslash(mod->name)
-                + ".miter.cnf";
-            auto rewritten_tmp_file = tempdir_name + "/" 
-                + strip_backslash(mod->name)
-                + ".rewritten.aig";
+        auto miter_tmp_file = tempdir_name + "/"
+            + strip_backslash(mod->name)
+            + ".miter.cnf";
+        auto rewritten_tmp_file = tempdir_name + "/"
+            + strip_backslash(mod->name)
+            + ".rewritten.aig";
 
-            auto amulet_sub_cmd = "amulet -substitute " + aig_file + " " + miter_tmp_file  + " " + rewritten_tmp_file + (is_signed? " -signed" : "");
-            std::cout << "Running amulet: " << amulet_sub_cmd << std::endl;
-            auto ret = system(amulet_sub_cmd.c_str());
-            auto amulet_veri_cmd = "amulet -verify " + rewritten_tmp_file + (is_signed ? " -signed" : "");
-            std::cout << "Running amulet: " << amulet_veri_cmd << std::endl;
-            ret = system(amulet_veri_cmd.c_str());
-            if(WEXITSTATUS(ret) != 1){
-                log("Amulet Verify failed.\n");
-                return false;
-            }
-            return true;
+        auto amulet_sub_cmd = "amulet -substitute " + aig_file + " " + miter_tmp_file  + " " + rewritten_tmp_file + (is_signed? " -signed" : "");
+        std::cout << "Running amulet: " << amulet_sub_cmd << std::endl;
+        CommandResult substitute_capture;
+        exec_cmd(amulet_sub_cmd, tempdir_name, "amulet-substitute-" + sanitize_filename(strip_backslash(mod->name)), &substitute_capture);
+        auto amulet_veri_cmd = "amulet -verify " + rewritten_tmp_file + (is_signed ? " -signed" : "");
+        std::cout << "Running amulet: " << amulet_veri_cmd << std::endl;
+        CommandResult verify_capture;
+        auto ret = exec_cmd(amulet_veri_cmd, tempdir_name, "amulet-verify-" + sanitize_filename(strip_backslash(mod->name)), &verify_capture);
+        if(ret != 1){
+            log("Amulet Verify failed.\n");
+            verify_capture.output += "Amulet Verify failed.\n";
+            verify_capture.result_code = ret;
+            emit_failure_packet(dump_cfg, pair_id, "AMULET", "amulet_verify", gold_mod_name, gate_mod_name, verify_capture);
+            return false;
+        }
+        return true;
     } else {
         bool correct = false; 
         log("Using dynphaseorderopt to verify the multiplier.\n");
         auto cmd = "dynphaseorderopt " + aig_file;
-        exectue_and_check(cmd, correct, "CIRCUIT IS CORRECT");
+        CommandResult capture;
+        exectue_and_check(cmd, correct, "CIRCUIT IS CORRECT", tempdir_name,
+                          "dynphaseorderopt-" + sanitize_filename(strip_backslash(mod->name)),
+                          &capture);
+        if (!correct) {
+            capture.result_code = capture.exit_status;
+            emit_failure_packet(dump_cfg, pair_id, "AMULET", "dynphaseorderopt", gold_mod_name, gate_mod_name, capture);
+        }
         return correct;
     }
 }
 
-static std::vector<std::pair<RTLIL::IdString, bool>> check_extract_multi(RTLIL::Design* design, MultiMap& mm, const string& tempdir_name){
+static std::vector<std::pair<RTLIL::IdString, bool>> check_extract_multi(RTLIL::Design* design, MultiMap& mm,
+                                                                         const string& tempdir_name,
+                                                                         const MlDumpConfig &dump_cfg,
+                                                                         pool<RTLIL::IdString> *touched_mods = nullptr){
 
     auto t_start = std::chrono::steady_clock::now();
     
     pool<Module*> mod_to_check;
+    dict<RTLIL::Module*, string> mod_to_pair_id;
+    dict<RTLIL::Module*, string> mod_to_gold_name;
+    dict<RTLIL::Module*, string> mod_to_gate_name;
     
     pool<Module*> mod_to_extract;
     pool<Module*> mod_to_blackbox;
@@ -1626,29 +2392,54 @@ static std::vector<std::pair<RTLIL::IdString, bool>> check_extract_multi(RTLIL::
         if(e.is_multi_mod){
             auto goldm = design->module(e.gold_mod);
             auto gatem = design->module(e.gate_mod);
+            if (touched_mods != nullptr) {
+                touched_mods->insert(e.gold_mod);
+                touched_mods->insert(e.gate_mod);
+            }
             mod_to_check.insert(goldm);
             mod_to_check.insert(gatem);
+            mod_to_pair_id[goldm] = get_pair_id(e.gold_mod, e.gate_mod);
+            mod_to_pair_id[gatem] = get_pair_id(e.gold_mod, e.gate_mod);
+            mod_to_gold_name[goldm] = strip_backslash(e.gold_mod);
+            mod_to_gold_name[gatem] = strip_backslash(e.gold_mod);
+            mod_to_gate_name[goldm] = strip_backslash(e.gate_mod);
+            mod_to_gate_name[gatem] = strip_backslash(e.gate_mod);
             mod_to_blackbox.insert(goldm);
             mod_to_blackbox.insert(gatem);
         }
         else { 
             auto goldm = design->module(e.gold_mod);
             auto gatem = design->module(e.gate_mod);
+            if (touched_mods != nullptr) {
+                touched_mods->insert(e.gold_mod);
+                touched_mods->insert(e.gate_mod);
+            }
             assert(goldm); assert(gatem);
             auto goldc = goldm->cell(e.gold_cell);
             auto gatec = gatem->cell(e.gate_cell);
             assert(goldc); assert(gatec);
             auto gold_mul = design->module(goldc->type);
             auto gate_mul = design->module(gatec->type);
-            if(goldc->type.isPublic() || goldc->type.begins_with("$paramod")) mod_to_check.insert(gold_mul);
-            if(gatec->type.isPublic() || gatec->type.begins_with("$paramod")) mod_to_check.insert(gate_mul);
+            if(goldc->type.isPublic() || goldc->type.begins_with("$paramod")) {
+                mod_to_check.insert(gold_mul);
+                mod_to_pair_id[gold_mul] = get_pair_id(e.gold_mod, e.gate_mod);
+                mod_to_gold_name[gold_mul] = strip_backslash(e.gold_mod);
+                mod_to_gate_name[gold_mul] = strip_backslash(e.gate_mod);
+            }
+            if(gatec->type.isPublic() || gatec->type.begins_with("$paramod")) {
+                mod_to_check.insert(gate_mul);
+                mod_to_pair_id[gate_mul] = get_pair_id(e.gold_mod, e.gate_mod);
+                mod_to_gold_name[gate_mul] = strip_backslash(e.gold_mod);
+                mod_to_gate_name[gate_mul] = strip_backslash(e.gate_mod);
+            }
             mod_to_extract.insert(goldm);
             mod_to_extract.insert(gatem);
         }
     }
 
     for(auto mod: mod_to_check){
-        bool result = check_multi(design, mod, tempdir_name, "");
+        bool result = check_multi(design, mod, tempdir_name, "", dump_cfg, mod_to_pair_id[mod],
+                                  mod_to_gold_name[mod], mod_to_gate_name[mod]);
         results.push_back({mod->name,result});
     }
 
@@ -1843,113 +2634,229 @@ static bool abc_check(const CheckConfig &conf, bool use_blif=false, string check
 
 
 static bool abc_cec_module(const CheckConfig &conf){
-    
-    auto gold_mod = conf.gold_mod;
-    auto gate_mod = conf.gate_mod;
-    auto design = conf.design;
-
-    // for(auto mod: design->modules()){
-    //     if(mod!= gold_mod && mod != gate_mod){
-    //         mod->set_bool_attribute(ID(blackbox), true);
-    //     }
-    // }
-    auto gold_file = dump_blif_module(design, conf.tempdir_name, gold_mod, conf.lib_file);
-    auto gate_file = dump_blif_module(design, conf.tempdir_name, gate_mod, conf.lib_file);
-
-    bool has_dff = false;
-    int gate_dff_cnt = 0;
-    int gold_dff_cnt = 0;
-    bool has_submodule = false;
-    for(auto cells: conf.gold_mod->cells()){
-        if(cells->type == ID($ff) || cells->type == ID($dff) || cells->type == ID($dffe)|| 
-           cells->type == ID($_DFF_P_) || cells->type == ID($_DFF_N_) || cells->type == ID($_DFFE_PN) ||
-           cells->type == ID($_DFFE_PP)){
-            
-            gold_dff_cnt++;
-        } 
-        auto submod = conf.design->module(cells->type);
-        if (submod != nullptr && !(submod->attributes.count(ID::blackbox))) {
-            has_submodule = true;
+    auto count_module_dffs = [](RTLIL::Module *mod, bool gate_side) {
+        int count = 0;
+        for (auto cell : mod->cells()) {
+            if (cell->type == ID($ff) || cell->type == ID($dff) || cell->type == ID($dffe) ||
+                cell->type == ID($_DFF_P_) || cell->type == ID($_DFF_N_) || cell->type == ID($_DFFE_PN) ||
+                cell->type == ID($_DFFE_PP) || (gate_side && cell->type.contains("DFF")))
+                count++;
         }
-        if(has_dff && has_submodule){
+        return count;
+    };
+
+    auto collect_pair_record = [&](int inserted_bbconsts) {
+        PairRecord record;
+        record.pair_id = get_pair_id(conf.gold_mod->name, conf.gate_mod->name);
+        record.gold_mod = strip_backslash(conf.gold_mod->name);
+        record.gate_mod = strip_backslash(conf.gate_mod->name);
+        record.gold_dff_cnt = count_module_dffs(conf.gold_mod, false);
+        record.gate_dff_cnt = count_module_dffs(conf.gate_mod, true);
+        record.const_blackbox_inputs_inserted = inserted_bbconsts;
+
+        for (auto cell : conf.gold_mod->cells()) {
+            RTLIL::Module *submod = conf.design->module(cell->type);
+            if (submod != nullptr && !submod->get_bool_attribute(ID(blackbox))) {
+                record.has_submodule = true;
+                break;
+            }
+        }
+
+        if (conf.telemetry != nullptr) {
+            record.retimed = conf.telemetry->retimed_mods.count(conf.gold_mod->name) ||
+                             conf.telemetry->retimed_mods.count(conf.gate_mod->name);
+            record.touched_by_multiplier = conf.telemetry->multiplier_mods.count(conf.gold_mod->name) ||
+                                           conf.telemetry->multiplier_mods.count(conf.gate_mod->name);
+        }
+
+        return record;
+    };
+
+    auto heuristic_abc_plan = [&](const PairRecord&, const MatchStats&) {
+        return std::vector<ActionKind> {
+            ActionKind::CEC_MAP,
+            ActionKind::CEC_NOMAP,
+            ActionKind::DSEC_MAP,
+            ActionKind::DSEC_NOMAP
+        };
+    };
+
+    auto learned_abc_plan = [&](const PairRecord &pair_record, const MatchStats &match_stats) {
+        if (conf.sched_model == nullptr || !conf.sched_model->loaded)
+            return heuristic_abc_plan(pair_record, match_stats);
+
+        std::vector<std::pair<double, ActionKind>> ranked_actions;
+        for (auto action : heuristic_abc_plan(pair_record, match_stats))
+            ranked_actions.push_back({predict_sched_cost(*conf.sched_model, get_action_name(action), pair_record, match_stats), action});
+
+        std::sort(ranked_actions.begin(), ranked_actions.end(),
+            [](const std::pair<double, ActionKind> &lhs, const std::pair<double, ActionKind> &rhs) {
+                if (lhs.first != rhs.first)
+                    return lhs.first < rhs.first;
+                return get_action_name(lhs.second) < get_action_name(rhs.second);
+            });
+
+        std::vector<ActionKind> plan;
+        for (auto &entry : ranked_actions)
+            plan.push_back(entry.second);
+        return plan;
+    };
+
+    auto run_abc_action = [&](ActionKind action, const string &match_file, const string &gold_file,
+                              const string &gate_file, RunRecord &run_record) {
+        string abc_cmd;
+        switch (action) {
+        case ActionKind::CEC_MAP:
+            abc_cmd = stringf("cec -M %s %s %s", match_file, gate_file, gold_file);
+            break;
+        case ActionKind::CEC_NOMAP:
+            abc_cmd = stringf("cec -n %s %s", gate_file, gold_file);
+            break;
+        case ActionKind::DSEC_MAP:
+            abc_cmd = stringf("dsec -M %s %s %s", match_file, gate_file, gold_file);
+            break;
+        case ActionKind::DSEC_NOMAP:
+            abc_cmd = stringf("dsec -n %s %s", gate_file, gold_file);
             break;
         }
-    }
 
-    for(auto cells: conf.gate_mod->cells()){
-        if(cells->type.contains("DFF") || cells->type == ID($ff) || cells->type == ID($dff) || cells->type == ID($dffe)|| 
-           cells->type == ID($_DFF_P_) || cells->type == ID($_DFF_N_) || cells->type == ID($_DFFE_PN) ||
-           cells->type == ID($_DFFE_PP)){
-            has_dff = true;
-            gate_dff_cnt++;
-        } 
-    }
+        vector<std::pair<std::string, int>> out2result = {
+            {"Networks are equivalent", 1},
+            {"Networks are NOT EQUIVALENT", 2},
+            {"Miter computation has failed", 3}
+        };
+        string cmd = stringf("%s -c '%s'", conf.abc_exe_file, abc_cmd);
+        CommandResult command_result;
+        int result_code = 0;
+        string action_name = get_action_name(action);
+        log("Executing ABC command: '%s'\n", abc_cmd.c_str());
+        int exit_status = exectue_and_check(cmd, result_code, out2result, conf.tempdir_name,
+                                            "abc-" + sanitize_filename(get_pair_id(conf.gold_mod->name, conf.gate_mod->name)) +
+                                            "-" + action_name,
+                                            &command_result);
+        if (exit_status != 0 || result_code == 0) {
+            command_result.result_code = result_code;
+            emit_failure_packet(conf, "ABC", action_name, command_result, {});
+            log_error("Error executing ABC command: %s\n", cmd.c_str());
+        }
 
-    log("Gold DFF count: %d, Gate DFF count: %d\n", gold_dff_cnt, gate_dff_cnt);
+        run_record.pair_id = get_pair_id(conf.gold_mod->name, conf.gate_mod->name);
+        run_record.action = action_name;
+        run_record.exit_status = command_result.exit_status;
+        run_record.result_code = result_code;
+        run_record.runtime_ms = command_result.runtime_ms;
+        run_record.log_file = command_result.log_file;
+        command_result.result_code = result_code;
+        return command_result;
+    };
 
-    has_dff = (gate_dff_cnt !=0 || gold_dff_cnt !=0);
+    auto run_abc_plan = [&](const PairRecord &pair_record, const std::vector<ActionKind> &plan,
+                            const string &match_file, const string &gold_file, const string &gate_file,
+                            std::vector<RunRecord> *trace, CommandResult *last_result, string *last_action) {
+        bool has_dff = pair_record.gold_dff_cnt != 0 || pair_record.gate_dff_cnt != 0;
+        bool exhaustive = conf.dump_cfg.dump_sched;
+        bool strict_order = conf.sched_model != nullptr && conf.sched_model->loaded;
+        bool ran_dsec_map = false;
+        int prev_result = 0;
+        bool solved = false;
+        CommandResult last_command;
+        string last_action_name;
+
+        for (auto action : plan) {
+            if (!has_dff && (action == ActionKind::DSEC_MAP || action == ActionKind::DSEC_NOMAP))
+                continue;
+
+            if (!exhaustive && !strict_order) {
+                if (action == ActionKind::CEC_NOMAP && prev_result != 3)
+                    continue;
+                if (action == ActionKind::DSEC_MAP && !(prev_result == 2 || prev_result == 3))
+                    continue;
+                if (action == ActionKind::DSEC_NOMAP && (!ran_dsec_map || prev_result != 3))
+                    continue;
+            }
+
+            RunRecord run_record;
+            CommandResult command_result = run_abc_action(action, match_file, gold_file, gate_file, run_record);
+            if (trace != nullptr)
+                trace->push_back(run_record);
+
+            prev_result = run_record.result_code;
+            last_command = command_result;
+            last_action_name = run_record.action;
+            if (action == ActionKind::DSEC_MAP)
+                ran_dsec_map = true;
+
+            if (run_record.result_code == 1) {
+                solved = true;
+                if (!exhaustive)
+                    break;
+            }
+        }
+
+        if (last_result != nullptr)
+            *last_result = last_command;
+        if (last_action != nullptr)
+            *last_action = last_action_name;
+        return solved;
+    };
+
+    auto dump_sched_sample = [&](const PairRecord &pair_record, const MatchStats &match_stats,
+                                 const std::vector<RunRecord> &trace) {
+        if (!conf.dump_cfg.dump_sched || conf.dump_cfg.sched_jsonl.empty())
+            return;
+
+        Json::array action_json;
+        string best_action;
+        double best_runtime = 0;
+        bool best_set = false;
+        for (auto &run_record : trace) {
+            action_json.push_back(run_record_to_json(run_record));
+            if (run_record.result_code == 1 && (!best_set || run_record.runtime_ms < best_runtime)) {
+                best_runtime = run_record.runtime_ms;
+                best_action = run_record.action;
+                best_set = true;
+            }
+        }
+
+        append_jsonl(conf.dump_cfg.sched_jsonl, Json::object {
+            {"pair", pair_record_to_json(pair_record)},
+            {"match", match_stats_to_json(match_stats)},
+            {"actions", action_json},
+            {"label_best_action", best_action}
+        });
+    };
 
     using clock = std::chrono::steady_clock;
-
     auto t0 = clock::now();
 
-    string match_file = conf.tempdir_name + "/match_" + RTLIL::unescape_id(gold_mod->name) + "_" + RTLIL::unescape_id(gate_mod->name) + ".txt";
-    // string abc_cmd = (has_dff) ? stringf("dsec -n %s %s", gold_file, gate_file) :
-    //                                             stringf("cec -M %s -n %s %s", match_file, gold_file, gate_file);
+    int gold_inserted = 0;
+    int gate_inserted = 0;
+    string gold_file = dump_blif_module(conf.design, conf.tempdir_name, conf.gold_mod, conf.lib_file, &gold_inserted);
+    string gate_file = dump_blif_module(conf.design, conf.tempdir_name, conf.gate_mod, conf.lib_file, &gate_inserted);
+    string match_file = conf.tempdir_name + "/match_" + RTLIL::unescape_id(conf.gold_mod->name) + "_" +
+        RTLIL::unescape_id(conf.gate_mod->name) + ".txt";
+
+    PairRecord pair_record = collect_pair_record(gold_inserted + gate_inserted);
+    MatchStats match_stats = get_match_stats(conf);
+    log("Gold DFF count: %d, Gate DFF count: %d\n", pair_record.gold_dff_cnt, pair_record.gate_dff_cnt);
+
+    std::vector<ActionKind> plan = learned_abc_plan(pair_record, match_stats);
+    std::vector<RunRecord> trace;
+    CommandResult last_result;
+    string last_action;
 
     log("Running ABC.\n");
     fflush(stdout);
 
-    string abc_cmd = stringf("cec -M %s %s %s", match_file, gate_file, gold_file);
-    string cmd = stringf("%s -c '%s'", conf.abc_exe_file, abc_cmd);
-    int result = 0;
-    vector<std::pair<std::string , int>> out2result = 
-            {{"Networks are equivalent", 1},
-             {"Networks are NOT EQUIVALENT", 2},
-             {"Miter computation has failed", 3}};
+    bool solved = run_abc_plan(pair_record, plan, match_file, gold_file, gate_file, &trace, &last_result, &last_action);
+    dump_sched_sample(pair_record, match_stats, trace);
+    if (!solved && !last_action.empty())
+        emit_failure_packet(conf, "ABC", last_action, last_result, trace);
 
-    log("Executing ABC command: '%s'\n", abc_cmd);
-    bool abc_ret = exectue_and_check(cmd, result, out2result);
-    if (abc_ret != 0 || result == 0) {
-        log_error("Error executing ABC command: %s\n", cmd);
-    }
-
-    // it's not a good idea to use `-n`
-    // use -n flag when 'Miter computation failed'
-    if (result == 3) {
-        abc_cmd = stringf("cec -n %s %s", gate_file, gold_file);
-        cmd = stringf("%s -c '%s'", conf.abc_exe_file, abc_cmd);
-        log("Executing ABC command: '%s'\n", abc_cmd);
-        bool abc_ret = exectue_and_check(cmd, result, out2result);
-        if(abc_ret != 0) {
-            log_error("Error executing ABC command: %s\n", cmd);
-        }
-    }
-    if ((result == 2 || result == 3) && has_dff) {
-        abc_cmd = stringf("dsec -M %s %s %s", match_file, gate_file, gold_file);
-        cmd = stringf("%s -c '%s'", conf.abc_exe_file, abc_cmd);
-        log("Executing ABC command: '%s'\n", abc_cmd);
-        bool abc_ret = exectue_and_check(cmd, result, out2result);
-        if(abc_ret != 0) {
-            log_error("Error executing ABC command: %s\n", cmd);
-        }
-    }
-
-    // it's not a good idea to use `-n`
-    // use -n flag when 'Miter computation failed'
-    if (result == 3 && has_dff) {
-        abc_cmd = stringf("dsec -n %s %s", gate_file, gold_file);
-        cmd = stringf("%s -c '%s'", conf.abc_exe_file, abc_cmd);
-        log("Executing ABC command: '%s'\n", abc_cmd);
-        bool abc_ret = exectue_and_check(cmd, result, out2result);
-        if(abc_ret != 0) {
-            log_error("Error executing ABC command: %s\n", cmd);
-        }
-    }
     auto t1 = clock::now();
     timing_stat.abc_cec_ms += std::chrono::duration_cast<std::chrono::milliseconds>(t1-t0).count();
 
-    return result == 1;
+    return solved;
 }
     
 
@@ -1992,7 +2899,12 @@ static std::vector<std::pair<RTLIL::IdString, bool>> abc_cec(const CheckConfig &
         .gold_prefix = conf.gold_prefix,
         .gate_prefix = conf.gate_prefix,
         .lib_file = conf.lib_file,
-        .seq_check_cfg = conf.seq_check_cfg
+        .sched_model_file = conf.sched_model_file,
+        .seq_check_cfg = conf.seq_check_cfg,
+        .dump_cfg = conf.dump_cfg,
+        .sched_model = conf.sched_model,
+        .telemetry = conf.telemetry,
+        .lib_design = conf.lib_design
     };
 
     std::vector<std::pair<RTLIL::IdString, bool>> results;
@@ -2053,10 +2965,15 @@ static bool bmcinduct_check(const CheckConfig &conf){
     if(conf.seq_check_cfg.weak_mode){
         cmd += "-i -t ";
         cmd += std::to_string(conf.seq_check_cfg.step_skip) + ":" + std::to_string(conf.seq_check_cfg.k_induct) + " ";
-        
-        int ret = exec_cmd(cmd + smt2_file);
+
+        CommandResult weak_capture;
+        int ret = exec_cmd(cmd + smt2_file, conf.tempdir_name,
+                           "smtbmc-weak-" + sanitize_filename(get_pair_id(conf.gold_mod->name, conf.gate_mod->name)),
+                           &weak_capture);
         if(ret != 0){
             log("BMC-Induct failed in weak mode.\n");
+            weak_capture.output += "BMC-Induct failed in weak mode.\n";
+            emit_failure_packet(conf, "BMC", "weak", weak_capture, {});
             return false;
         }
         return true;
@@ -2066,16 +2983,26 @@ static bool bmcinduct_check(const CheckConfig &conf){
     string cmd_bmc = cmd;
 
     cmd_bmc += " -t " + std::to_string(conf.seq_check_cfg.step_skip) + ":" + std::to_string(conf.seq_check_cfg.k_induct) + " ";
-    int ret = exec_cmd(cmd_bmc + smt2_file);
+    CommandResult bmc_capture;
+    int ret = exec_cmd(cmd_bmc + smt2_file, conf.tempdir_name,
+                       "smtbmc-bmc-" + sanitize_filename(get_pair_id(conf.gold_mod->name, conf.gate_mod->name)),
+                       &bmc_capture);
     if(ret != 0){
         log("BMC-Induct failed in BMC phase.\n");
+        bmc_capture.output += "BMC-Induct failed in BMC phase.\n";
+        emit_failure_packet(conf, "BMC", "bmc", bmc_capture, {});
         return false;
     }
     string cmd_induct = cmd;
     cmd_induct += " -i -t "  + std::to_string(conf.seq_check_cfg.k_induct) + " "; 
-    ret = exec_cmd(cmd_induct + smt2_file);
+    CommandResult induct_capture;
+    ret = exec_cmd(cmd_induct + smt2_file, conf.tempdir_name,
+                   "smtbmc-induct-" + sanitize_filename(get_pair_id(conf.gold_mod->name, conf.gate_mod->name)),
+                   &induct_capture);
     if(ret != 0){
         log("BMC-Induct failed in Induct phase.\n");
+        induct_capture.output += "BMC-Induct failed in Induct phase.\n";
+        emit_failure_packet(conf, "BMC", "induct", induct_capture, {});
         return false;
     }
     return true;
@@ -2243,7 +3170,12 @@ Results check_retime(const CheckConfig &conf,
             .gold_prefix = conf.gold_prefix,
             .gate_prefix = conf.gate_prefix,
             .lib_file = conf.lib_file,
-            .seq_check_cfg = conf.seq_check_cfg
+            .sched_model_file = conf.sched_model_file,
+            .seq_check_cfg = conf.seq_check_cfg,
+            .dump_cfg = conf.dump_cfg,
+            .sched_model = conf.sched_model,
+            .telemetry = conf.telemetry,
+            .lib_design = conf.lib_design
         };
 
         //bool dsec_result = abc_dsec(conf_);
@@ -2280,6 +3212,8 @@ Results check_extract_retime(const ModMap& mmap, const CheckConfig &conf)
     {
         for (auto mod_name : {mod_pair.first, mod_pair.second})
         {
+            if (conf.telemetry != nullptr)
+                conf.telemetry->retimed_mods.insert(mod_name);
             auto mod = conf.design->module(mod_name);
             if (!mod) {
                 log_warning("Skipping missing module %s when marking as (* blackbox *).\n", log_id(mod_name));
@@ -2510,22 +3444,26 @@ struct GuideCheckRetimePass : public Pass {
         ModMap map;
         bool result =false;
         auto results = check_extract_retime(map,CheckConfig{
-            nocleanup,
-            abc_exe_file,
-            tempdir_name,
-            design,
-            gold_mod,
-            gate_mod,
-            gold_prefix,
-            gate_prefix,
-            lib_file,
-            SeqCheckConfig{
-                k_induct,
-                step_skip,
-                weak_mode,
-                no_init
+            .nocleanup = nocleanup,
+            .abc_exe_file = abc_exe_file,
+            .tempdir_name = tempdir_name,
+            .design = design,
+            .gold_mod = gold_mod,
+            .gate_mod = gate_mod,
+            .gold_prefix = gold_prefix,
+            .gate_prefix = gate_prefix,
+            .lib_file = lib_file,
+            .sched_model_file = "",
+            .seq_check_cfg = SeqCheckConfig{
+                .k_induct = k_induct,
+                .step_skip = step_skip,
+                .weak_mode = weak_mode,
+                .no_init = no_init
             },
-            nullptr
+            .dump_cfg = MlDumpConfig(),
+            .sched_model = nullptr,
+            .telemetry = nullptr,
+            .lib_design = nullptr
         });
 
         // if(!nocleanup){
@@ -2587,6 +3525,18 @@ struct GuideCheckPass : public Pass {
         log("    -noinit\n");
         log("        do not assume initial conditions at time 0 (treat init as unconstrained).\n");
         log("\n");
+        log("    -guide-dump-sched <file>\n");
+        log("        append pair-level ABC scheduler samples to the JSONL file.\n");
+        log("\n");
+        log("    -guide-dump-match <file>\n");
+        log("        append signal-matching samples to the JSONL file.\n");
+        log("\n");
+        log("    -guide-dump-fail <file>\n");
+        log("        append structured failure packets to the JSONL file.\n");
+        log("\n");
+        log("    -guide-sched-model <file>\n");
+        log("        load a scheduler model JSON file and use it to rank ABC actions.\n");
+        log("\n");
 	}
 	void execute(std::vector<std::string> args, RTLIL::Design *design) override
 	{
@@ -2602,6 +3552,8 @@ struct GuideCheckPass : public Pass {
         int k_induct = 20;
         int step_skip = 0;
         bool no_init = false;
+        string sched_model_file;
+        MlDumpConfig dump_cfg;
         
         size_t argidx;
         for (argidx = 1; argidx < args.size(); argidx++)
@@ -2637,6 +3589,25 @@ struct GuideCheckPass : public Pass {
             if (args[argidx] == "-noinit") {
                 log_error("-noinit option is not supported yet.\n");
                 no_init = true;
+                continue;
+            }
+            if (args[argidx] == "-guide-dump-sched" && argidx + 1 < args.size()) {
+                dump_cfg.dump_sched = true;
+                dump_cfg.sched_jsonl = args[++argidx];
+                continue;
+            }
+            if (args[argidx] == "-guide-dump-match" && argidx + 1 < args.size()) {
+                dump_cfg.dump_match = true;
+                dump_cfg.match_jsonl = args[++argidx];
+                continue;
+            }
+            if (args[argidx] == "-guide-dump-fail" && argidx + 1 < args.size()) {
+                dump_cfg.dump_fail = true;
+                dump_cfg.fail_jsonl = args[++argidx];
+                continue;
+            }
+            if (args[argidx] == "-guide-sched-model" && argidx + 1 < args.size()) {
+                sched_model_file = args[++argidx];
                 continue;
             }
             break;
@@ -2683,6 +3654,9 @@ struct GuideCheckPass : public Pass {
 
         auto design_backup = design; 
         design = clone_design_for_passes(design);
+        gold_mod = design->module(gold_mod_name_id);
+        gate_mod = design->module(gate_mod_name_id);
+        log_assert(gold_mod && gate_mod);
 
 
         auto t_lib_start = std::chrono::steady_clock::now();
@@ -2714,6 +3688,11 @@ struct GuideCheckPass : public Pass {
             .no_init = no_init,
         };
 
+        GuideTelemetry telemetry;
+        GuideSchedModel sched_model;
+        if (!sched_model_file.empty())
+            load_sched_model(sched_model_file, sched_model);
+
         CheckConfig conf = {
             .nocleanup = nocleanup,
             .abc_exe_file = abc_exe_file,
@@ -2724,7 +3703,11 @@ struct GuideCheckPass : public Pass {
             .gold_prefix = gold_prefix,
             .gate_prefix = gate_prefix,
             .lib_file = lib_file,
+            .sched_model_file = sched_model_file,
             .seq_check_cfg = seq_conf,
+            .dump_cfg = dump_cfg,
+            .sched_model = &sched_model,
+            .telemetry = &telemetry,
             .lib_design = lib_design,
         };
 
@@ -2757,7 +3740,7 @@ struct GuideCheckPass : public Pass {
 
         ModMap mod_map = hier_mod_map(design, conf);
         MultiMap multi_map = get_multi_map(design, mod_map);
-        auto multi_results = check_extract_multi(design, multi_map, tempdir_name);
+        auto multi_results = check_extract_multi(design, multi_map, tempdir_name, dump_cfg, &telemetry.multiplier_mods);
         for(auto r: multi_results){
             log("GUIDE_CHECK for multiplier module : %s : %s\n",
                 log_id(r.first),
@@ -2770,6 +3753,8 @@ struct GuideCheckPass : public Pass {
         if(!multi_result) { 
             log("GUIDE_CHECK multiplier check failed.\n");
         }
+        if (dump_cfg.dump_match)
+            (void)match_signals(design, conf, mod_map, false, "pre_async");
         auto t_prep_start2 = std::chrono::steady_clock::now();
         run_pass("techmap", design);
         run_pass("async2sync", design); // ! Warning: May cause side effects. Maybe we can move match_signals before this.
@@ -2793,7 +3778,6 @@ struct GuideCheckPass : public Pass {
 
         // (void)multi_mods;
 
-        
         auto retime_results = check_extract_retime(mod_map, conf);
 
         retime_result = true;
@@ -2807,7 +3791,8 @@ struct GuideCheckPass : public Pass {
 
         
 
-        auto gold2cutpoints = match_signals(design, conf, mod_map);
+        auto gold2cutpoints = match_signals(design, conf, mod_map, true, "post_async");
+        (void)gold2cutpoints;
 
         // remove_subclk(design,conf);
         // RTLIL::Design *design_check = empty_design();
@@ -2830,6 +3815,9 @@ struct GuideCheckPass : public Pass {
 
         report(gold_mod_name_id, gate_mod_name_id,
                 multi_results,retime_results, cec_result_mod);
+
+        if (dump_cfg.dump_match)
+            write_match_suggestions(match_suggestions_path(dump_cfg.match_jsonl), telemetry.match_suggestions);
 
         print_timing_stat(timing_stat);
 
