@@ -302,13 +302,98 @@ struct LocalValidateResult
     string pair_id;
     int selected_cutpoints = 0;
     int local_exact_total = 0;
+    int child_boundary_count = 0;
+    int unresolved_child_boundaries = 0;
+    int boundary_map_expected = 0;
+    int boundary_map_applied = 0;
+    int constant_completed_net_count = 0;
+    int unresolved_internal_boundaries = 0;
     bool ran = false;
     bool proved = false;
+    bool residual_hierarchy = false;
     double runtime_ms = 0;
     string validator_backend = "local_abc";
     bool used_bmc_fallback = false;
     bool authoritative_ok = true;
     string unsafe_reason;
+    string authoritative_reason;
+    string fallback_reason;
+};
+
+struct ChildBoundaryPort
+{
+    RTLIL::IdString parent_mod;
+    RTLIL::IdString child_cell;
+    RTLIL::IdString child_mod;
+    RTLIL::IdString port;
+    RTLIL::IdString local_wire;
+    int bit_index = 0;
+};
+
+struct RegionBoundary
+{
+    RTLIL::IdString parent_gold_mod;
+    RTLIL::IdString parent_gate_mod;
+    RTLIL::IdString gold_child_cell;
+    RTLIL::IdString gate_child_cell;
+    RTLIL::IdString gold_child_mod;
+    RTLIL::IdString gate_child_mod;
+    RTLIL::IdString gold_port;
+    RTLIL::IdString gate_port;
+    RTLIL::IdString gold_local_wire;
+    RTLIL::IdString gate_local_wire;
+    RTLIL::IdString canonical_wire;
+    int bit_index = 0;
+    string boundary_kind = "child_output";
+};
+
+struct PartitionedPair
+{
+    RTLIL::Module *gold_local = nullptr;
+    RTLIL::Module *gate_local = nullptr;
+    std::vector<RegionBoundary> boundaries;
+    pool<string> boundary_bit_names;
+    int unresolved_internal_boundaries = 0;
+    bool residual_hierarchy = false;
+};
+
+struct RegionNode
+{
+    int region_id = -1;
+    RTLIL::Module *gold_mod = nullptr;
+    RTLIL::Module *gate_mod = nullptr;
+    bool is_top = false;
+    bool is_leaf = false;
+    std::vector<CutPoint> state_cutpoints;
+    std::vector<CutPoint> child_boundary_cps;
+    std::vector<RegionBoundary> child_boundaries;
+    std::vector<int> parent_region_ids;
+    std::vector<int> child_region_ids;
+    int unresolved_child_boundary_count = 0;
+};
+
+struct RegionProofResult
+{
+    int region_id = -1;
+    bool shell_proved = false;
+    bool children_discharged = false;
+    bool obligation_discharged = false;
+    bool proved = false;
+    bool authoritative_ok = true;
+    string backend;
+    string unsafe_reason;
+    string authoritative_reason;
+    string fallback_reason;
+    int selected_cutpoints = 0;
+    int local_exact_total = 0;
+    int child_boundary_count = 0;
+    int unresolved_child_boundaries = 0;
+    int boundary_map_expected = 0;
+    int boundary_map_applied = 0;
+    int constant_completed_net_count = 0;
+    int unresolved_internal_boundaries = 0;
+    bool residual_hierarchy = false;
+    double runtime_ms = 0;
 };
 
 struct NamedSig {
@@ -320,7 +405,8 @@ struct NamedSig {
 
 static std::vector<CutPoint> select_local_dff_cutpoints(const std::vector<CutPoint> &all_cps,
                                                         const CutPoint *extra_cand = nullptr);
-static std::vector<CutPoint> select_partition_cutpoints(const std::vector<CutPoint> &all_cps);
+static std::vector<CutPoint> select_region_state_cutpoints(const std::vector<CutPoint> &all_cps);
+static std::vector<CutPoint> select_region_child_boundary_cutpoints(const std::vector<CutPoint> &all_cps);
 static std::vector<CutPoint> dedup_local_dff_cutpoints(const std::vector<CutPoint> &cutpoints);
 static bool can_materialize_cutpoint(RTLIL::Module *mod, const CutPoint &cp, bool use_gold);
 static std::vector<CutPoint> filter_materializable_cutpoints(RTLIL::Module *gold_mod,
@@ -330,6 +416,7 @@ static std::vector<CutPoint> select_support_sliced_dff_cutpoints(RTLIL::Module *
                                                                  RTLIL::Module *gate_mod,
                                                                  const std::vector<CutPoint> &all_cps,
                                                                  const CutPoint &candidate);
+static std::vector<ChildBoundaryPort> submod_to_pi_po(RTLIL::Design *design, RTLIL::Module *mod);
 static LocalValidateResult validate_partition_pair(const CheckConfig &conf,
                                                    RTLIL::Module *gold_mod,
                                                    RTLIL::Module *gate_mod,
@@ -1619,7 +1706,13 @@ static MatchResult match_signals_module(RTLIL::Design *design, RTLIL::Module *go
                     {"skip_reason", "margin_gate"},
                     {"validator_backend", ""},
                     {"runtime_ms", 0.0},
-                    {"accepted", false}
+                    {"accepted", false},
+                    {"boundary_map_expected", 0},
+                    {"boundary_map_applied", 0},
+                    {"constant_completed_net_count", 0},
+                    {"unresolved_internal_boundaries", 0},
+                    {"child_boundary_count", 0},
+                    {"unresolved_child_boundaries", 0}
                 });
                 continue;
             }
@@ -1664,11 +1757,19 @@ static MatchResult match_signals_module(RTLIL::Design *design, RTLIL::Module *go
                     {"validator_backend", local_result.validator_backend},
                     {"used_bmc_fallback", local_result.used_bmc_fallback},
                     {"authoritative_ok", local_result.authoritative_ok},
+                    {"authoritative_reason", local_result.authoritative_reason},
                     {"unsafe_reason", local_result.unsafe_reason},
+                    {"fallback_reason", local_result.fallback_reason},
                     {"runtime_ms", local_result.runtime_ms},
                     {"accepted", local_result.proved},
                     {"selected_cutpoints", local_result.selected_cutpoints},
                     {"local_exact_total", local_result.local_exact_total},
+                    {"boundary_map_expected", local_result.boundary_map_expected},
+                    {"boundary_map_applied", local_result.boundary_map_applied},
+                    {"constant_completed_net_count", local_result.constant_completed_net_count},
+                    {"unresolved_internal_boundaries", local_result.unresolved_internal_boundaries},
+                    {"child_boundary_count", local_result.child_boundary_count},
+                    {"unresolved_child_boundaries", local_result.unresolved_child_boundaries},
                     {"slice_mode", conf.local_validate_support_slice ? "support_slice" : "all_dff"}
                 });
                 if (!local_result.proved) {
@@ -2023,13 +2124,22 @@ static std::vector<CutPoint> select_local_dff_cutpoints(const std::vector<CutPoi
     return dedup_local_dff_cutpoints(out);
 }
 
-static std::vector<CutPoint> select_partition_cutpoints(const std::vector<CutPoint> &all_cps)
+static std::vector<CutPoint> select_region_state_cutpoints(const std::vector<CutPoint> &all_cps)
 {
     std::vector<CutPoint> out;
     for (const auto &cp : all_cps)
-        if (cp.type == MatchType::DFF || cp.type == MatchType::DFF_PO || cp.type == MatchType::SUBCKT_PIPO)
+        if (cp.type == MatchType::DFF)
             out.push_back(cp);
     return dedup_local_dff_cutpoints(out);
+}
+
+static std::vector<CutPoint> select_region_child_boundary_cutpoints(const std::vector<CutPoint> &all_cps)
+{
+    std::vector<CutPoint> out;
+    for (const auto &cp : all_cps)
+        if (cp.type == MatchType::SUBCKT_PIPO)
+            out.push_back(cp);
+    return out;
 }
 
 static std::vector<CutPoint> dedup_local_dff_cutpoints(const std::vector<CutPoint> &cutpoints)
@@ -2119,7 +2229,7 @@ static RTLIL::SigBit get_cutpoint_d_bit(RTLIL::Module *mod, const CutPoint &cp, 
 static bool can_materialize_cutpoint(RTLIL::Module *mod, const CutPoint &cp, bool use_gold)
 {
     if (cp.type == MatchType::SUBCKT_PIPO)
-        return true;
+        return false;
     bool ok = false;
     RTLIL::SigBit dbit = get_cutpoint_d_bit(mod, cp, use_gold, ok);
     return ok && dbit.is_wire();
@@ -2253,8 +2363,167 @@ static std::vector<CutPoint> select_support_sliced_dff_cutpoints(RTLIL::Module *
     return dedup_local_dff_cutpoints(out);
 }
 
+static string region_boundary_key(const string &child_mod_orig,
+                                  const RTLIL::IdString &child_cell,
+                                  const RTLIL::IdString &port,
+                                  int bit_index)
+{
+    return child_mod_orig + "||" + strip_backslash(child_cell) + "||" +
+        strip_backslash(port) + "||" + std::to_string(bit_index);
+}
 
-static void submod_to_pi_po(RTLIL::Design *design, RTLIL::Module *mod)
+static string region_artifact_path(const string &dir_name, const string &prefix,
+                                   const RTLIL::IdString &top_mod)
+{
+    return dir_name + "/" + prefix + "_" + sanitize_filename(strip_backslash(top_mod)) + ".jsonl";
+}
+
+static Json json_array_from_ints(const std::vector<int> &values)
+{
+    Json::array out;
+    for (int value : values)
+        out.push_back(value);
+    return out;
+}
+
+static int parse_name_map_applied(const string &output)
+{
+    size_t pos = output.find("Name map: applied ");
+    if (pos == string::npos)
+        return 0;
+    pos += strlen("Name map: applied ");
+    return atoi(output.c_str() + pos);
+}
+
+static int parse_constant_completed_net_count(const string &output)
+{
+    int total = 0;
+    const string pattern = "Constant-0 drivers added to ";
+    size_t pos = 0;
+    while ((pos = output.find(pattern, pos)) != string::npos) {
+        pos += pattern.size();
+        total += atoi(output.c_str() + pos);
+    }
+    return total;
+}
+
+static string canonical_region_boundary_wire(const CheckConfig &conf,
+                                             const RegionBoundary &boundary)
+{
+    RTLIL::IdString child_orig = get_orignal_mod_name(boundary.gold_child_mod, conf.gold_mod->name, conf.gold_prefix);
+    string base = stringf("__region__%s__%s__%s",
+        sanitize_filename(strip_backslash(child_orig)).c_str(),
+        sanitize_filename(strip_backslash(boundary.gold_child_cell)).c_str(),
+        sanitize_filename(strip_backslash(boundary.gold_port)).c_str());
+    return base;
+}
+
+
+static std::vector<RegionBoundary> merge_region_boundaries(const CheckConfig &conf,
+                                                           RTLIL::Module *gold_mod,
+                                                           RTLIL::Module *gate_mod,
+                                                           const std::vector<ChildBoundaryPort> &gold_boundaries,
+                                                           const std::vector<ChildBoundaryPort> &gate_boundaries)
+{
+    dict<string, ChildBoundaryPort> gate_by_key;
+    for (const auto &boundary : gate_boundaries) {
+        RTLIL::IdString gate_child_orig = get_orignal_mod_name(boundary.child_mod, conf.gate_mod->name, conf.gate_prefix);
+        string key = region_boundary_key(strip_backslash(gate_child_orig), boundary.child_cell, boundary.port, boundary.bit_index);
+        gate_by_key[key] = boundary;
+    }
+
+    std::vector<RegionBoundary> out;
+    for (const auto &gold_boundary : gold_boundaries) {
+        RTLIL::IdString gold_child_orig = get_orignal_mod_name(gold_boundary.child_mod, conf.gold_mod->name, conf.gold_prefix);
+        string key = region_boundary_key(strip_backslash(gold_child_orig), gold_boundary.child_cell, gold_boundary.port, gold_boundary.bit_index);
+        if (!gate_by_key.count(key))
+            continue;
+
+        const auto &gate_boundary = gate_by_key.at(key);
+        RegionBoundary boundary;
+        boundary.parent_gold_mod = gold_mod->name;
+        boundary.parent_gate_mod = gate_mod->name;
+        boundary.gold_child_cell = gold_boundary.child_cell;
+        boundary.gate_child_cell = gate_boundary.child_cell;
+        boundary.gold_child_mod = gold_boundary.child_mod;
+        boundary.gate_child_mod = gate_boundary.child_mod;
+        boundary.gold_port = gold_boundary.port;
+        boundary.gate_port = gate_boundary.port;
+        boundary.gold_local_wire = gold_boundary.local_wire;
+        boundary.gate_local_wire = gate_boundary.local_wire;
+        boundary.bit_index = gold_boundary.bit_index;
+        boundary.boundary_kind = "child_output";
+        boundary.canonical_wire = RTLIL::escape_id(canonical_region_boundary_wire(conf, boundary));
+        out.push_back(boundary);
+    }
+
+    return out;
+}
+
+static void apply_region_boundary_canonical_names(RTLIL::Module *gold_mod,
+                                                  RTLIL::Module *gate_mod,
+                                                  std::vector<RegionBoundary> &boundaries)
+{
+    dict<RTLIL::IdString, RTLIL::IdString> gold_renames;
+    dict<RTLIL::IdString, RTLIL::IdString> gate_renames;
+    for (const auto &boundary : boundaries) {
+        gold_renames[boundary.gold_local_wire] = boundary.canonical_wire;
+        gate_renames[boundary.gate_local_wire] = boundary.canonical_wire;
+    }
+
+    auto apply_renames = [](RTLIL::Module *mod, const dict<RTLIL::IdString, RTLIL::IdString> &renames) {
+        for (const auto &it : renames) {
+            RTLIL::Wire *wire = mod->wire(it.first);
+            if (wire == nullptr || wire->name == it.second)
+                continue;
+            if (mod->wire(it.second) != nullptr && mod->wire(it.second) != wire)
+                continue;
+            mod->rename(wire, it.second);
+        }
+        mod->fixup_ports();
+    };
+
+    apply_renames(gold_mod, gold_renames);
+    apply_renames(gate_mod, gate_renames);
+
+    for (auto &boundary : boundaries) {
+        boundary.gold_local_wire = boundary.canonical_wire;
+        boundary.gate_local_wire = boundary.canonical_wire;
+    }
+}
+
+static pool<string> region_boundary_bit_names(const std::vector<RegionBoundary> &boundaries)
+{
+    pool<string> out;
+    for (const auto &boundary : boundaries) {
+        string wire_name = strip_backslash(boundary.canonical_wire);
+        out.insert(stringf("%s[%d]", wire_name.c_str(), boundary.bit_index));
+    }
+    return out;
+}
+
+static int count_unresolved_internal_boundary_inputs(RTLIL::Module *mod,
+                                                     const pool<string> &boundary_bit_names)
+{
+    int count = 0;
+    for (auto *w : mod->wires()) {
+        if (!w->port_input)
+            continue;
+        string base = strip_backslash(w->name);
+        bool is_state_cut = base.size() >= 3 && base.substr(base.size() - 3) == "_pi";
+        if (is_state_cut)
+            continue;
+        int width = std::max(1, GetSize(w));
+        for (int i = 0; i < width; i++) {
+            string bit_name = width == 1 ? base : stringf("%s[%d]", base.c_str(), i);
+            if (!boundary_bit_names.count(bit_name))
+                count++;
+        }
+    }
+    return count;
+}
+
+static std::vector<ChildBoundaryPort> submod_to_pi_po(RTLIL::Design *design, RTLIL::Module *mod)
 {
     assert(design);
     assert(mod);
@@ -2263,6 +2532,7 @@ static void submod_to_pi_po(RTLIL::Design *design, RTLIL::Module *mod)
     pool<RTLIL::SigBit> cut_bits;
     std::vector<RTLIL::SigSig> pending_conns;
     std::vector<RTLIL::Cell*> remove_cells;
+    std::vector<ChildBoundaryPort> boundaries;
 
     for (auto *cell : mod->cells()) {
 
@@ -2315,6 +2585,14 @@ static void submod_to_pi_po(RTLIL::Design *design, RTLIL::Module *mod)
 
                 int width = GetSize(port_sig);
                 for (int i = 0; i < width; i++) {
+                    boundaries.push_back(ChildBoundaryPort{
+                        mod->name,
+                        cell->name,
+                        child->name,
+                        port->name,
+                        w_pi->name,
+                        i
+                    });
                     RTLIL::SigBit pb = port_sig[i];
                     RTLIL::SigBit mb = mapped_sig[i];
                     if (mb.is_wire())
@@ -2356,6 +2634,7 @@ static void submod_to_pi_po(RTLIL::Design *design, RTLIL::Module *mod)
         mod->remove(cell);
 
     mod->fixup_ports();
+    return boundaries;
 }
 
 static void restrict_local_output_ports(RTLIL::Module *mod)
@@ -2392,8 +2671,7 @@ static std::vector<RTLIL::Module*> topo_sort_modules(RTLIL::Design *design, cons
     }
 }
 
-// RetVal: <gold_submodule, gate_submodule> , pointer in design_check
-static std::pair<RTLIL::Module*, RTLIL::Module*> partition_module(RTLIL::Design *design, RTLIL::Design *design_check, 
+static PartitionedPair partition_module(RTLIL::Design *design, RTLIL::Design *design_check,
     RTLIL::Module *gold_mod, RTLIL::Module *gate_mod,  //pointer in design
     const std::vector<CutPoint>& cutpoints, const CheckConfig& conf)
 {
@@ -2415,8 +2693,11 @@ static std::pair<RTLIL::Module*, RTLIL::Module*> partition_module(RTLIL::Design 
     cutpoints_to_pi_po(gold_clone, cutpoints, true);
     cutpoints_to_pi_po(gate_clone, cutpoints, false);
 
-    submod_to_pi_po(design, gold_clone);
-    submod_to_pi_po(design, gate_clone);
+    std::vector<ChildBoundaryPort> gold_boundaries = submod_to_pi_po(design, gold_clone);
+    std::vector<ChildBoundaryPort> gate_boundaries = submod_to_pi_po(design, gate_clone);
+    std::vector<RegionBoundary> boundaries =
+        merge_region_boundaries(conf, gold_mod, gate_mod, gold_boundaries, gate_boundaries);
+    apply_region_boundary_canonical_names(gold_clone, gate_clone, boundaries);
     restrict_local_output_ports(gold_clone);
     restrict_local_output_ports(gate_clone);
 
@@ -2425,7 +2706,16 @@ static std::pair<RTLIL::Module*, RTLIL::Module*> partition_module(RTLIL::Design 
     run_pass("opt_clean", design_check);
     run_pass("check", design_check);
 
-    return {design_check->module(gold_clone->name), design_check->module(gate_clone->name)};
+    PartitionedPair result;
+    result.gold_local = design_check->module(gold_clone->name);
+    result.gate_local = design_check->module(gate_clone->name);
+    result.boundaries = boundaries;
+    result.boundary_bit_names = region_boundary_bit_names(boundaries);
+    result.unresolved_internal_boundaries =
+        count_unresolved_internal_boundary_inputs(result.gold_local, result.boundary_bit_names) +
+        count_unresolved_internal_boundary_inputs(result.gate_local, result.boundary_bit_names);
+    result.residual_hierarchy = !result.boundaries.empty();
+    return result;
 }
 
 // Maybe implement further.
@@ -2438,7 +2728,7 @@ static std::pair<RTLIL::Module*, RTLIL::Module*> partition_module(RTLIL::Design 
         RTLIL::IdString gate_mod_name = mod_map.mod_map_gold.at(gold_mod_name);
         RTLIL::Module *gate_mod = design->module(gate_mod_name);
 
-        auto module_partition = 
+        auto module_partition =
             partition_module(design, design_check, gold_mod, gate_mod, cutpoints, conf);
         (void)module_partition;
     }
@@ -2454,17 +2744,19 @@ static LocalValidateResult validate_partition_pair(const CheckConfig &conf,
     LocalValidateResult result;
     result.pair_id = get_pair_id(gold_mod->name, gate_mod->name);
     result.selected_cutpoints = GetSize(cutpoints);
-    if (cutpoints.empty())
-        return result;
 
     RTLIL::Design *design_check = empty_design();
     auto local_pair = partition_module(conf.design, design_check, gold_mod, gate_mod, cutpoints, conf);
+    result.child_boundary_count = GetSize(local_pair.boundaries);
+    result.boundary_map_expected = result.child_boundary_count;
+    result.unresolved_internal_boundaries = local_pair.unresolved_internal_boundaries;
+    result.residual_hierarchy = local_pair.residual_hierarchy;
 
     GuideTelemetry local_telemetry;
     CheckConfig local_conf = conf;
     local_conf.design = design_check;
-    local_conf.gold_mod = local_pair.first;
-    local_conf.gate_mod = local_pair.second;
+    local_conf.gold_mod = local_pair.gold_local;
+    local_conf.gate_mod = local_pair.gate_local;
     local_conf.sched_model_file = "";
     local_conf.match_model_file = "";
     local_conf.accept_match_suggestions_file = "";
@@ -2480,13 +2772,39 @@ static LocalValidateResult validate_partition_pair(const CheckConfig &conf,
         local_match.stats;
 
     result.local_exact_total = local_match.stats.exact_total;
+    for (const auto &cp : local_match.cut_points)
+        if (local_pair.boundary_bit_names.count(strip_backslash(cp.name)))
+            result.boundary_map_applied++;
+
     result.ran = true;
     CommandResult local_abc_result;
     result.proved = abc_cec_module(local_conf, false, &local_abc_result);
     result.validator_backend = "local_abc";
+    int abc_name_map_applied = parse_name_map_applied(local_abc_result.output);
+    if (result.boundary_map_applied == 0 && abc_name_map_applied > 0)
+        result.boundary_map_applied = std::min(result.boundary_map_expected, abc_name_map_applied);
+    result.constant_completed_net_count = parse_constant_completed_net_count(local_abc_result.output);
     result.unsafe_reason = partition_unsafe_reason(local_abc_result);
     if (!result.unsafe_reason.empty())
         result.authoritative_ok = false;
+    if (result.unresolved_internal_boundaries > 0) {
+        result.authoritative_ok = false;
+        if (result.fallback_reason.empty())
+            result.fallback_reason = "unresolved_internal_boundaries";
+    }
+    if (result.constant_completed_net_count > 0) {
+        result.authoritative_ok = false;
+        if (result.fallback_reason.empty())
+            result.fallback_reason = "constant_completed_nets";
+    }
+    if (result.boundary_map_expected > 0 && result.boundary_map_applied == 0) {
+        result.authoritative_ok = false;
+        if (result.fallback_reason.empty())
+            result.fallback_reason = "boundary_map_not_applied";
+    }
+    if (result.proved && result.authoritative_ok)
+        result.authoritative_reason = "closed_shell";
+
     if (!result.proved && allow_bmc_fallback) {
         bool residual_state = module_has_dff(local_conf.gold_mod, false) || module_has_dff(local_conf.gate_mod, true);
         bool residual_hierarchy = module_has_submodule(design_check, local_conf.gold_mod) || module_has_submodule(design_check, local_conf.gate_mod);
@@ -2548,11 +2866,19 @@ static void run_local_validate_shadow(const CheckConfig &conf, ModMap &mod_map,
             {"validator_backend", result.validator_backend},
             {"used_bmc_fallback", result.used_bmc_fallback},
             {"authoritative_ok", result.authoritative_ok},
+            {"authoritative_reason", result.authoritative_reason},
             {"unsafe_reason", result.unsafe_reason},
+            {"fallback_reason", result.fallback_reason},
             {"runtime_ms", result.runtime_ms},
             {"accepted", false},
             {"selected_cutpoints", result.selected_cutpoints},
-            {"local_exact_total", result.local_exact_total}
+            {"local_exact_total", result.local_exact_total},
+            {"boundary_map_expected", result.boundary_map_expected},
+            {"boundary_map_applied", result.boundary_map_applied},
+            {"constant_completed_net_count", result.constant_completed_net_count},
+            {"unresolved_internal_boundaries", result.unresolved_internal_boundaries},
+            {"child_boundary_count", result.child_boundary_count},
+            {"unresolved_child_boundaries", result.unresolved_child_boundaries}
         });
         ran_pairs++;
         if (result.proved)
@@ -2571,108 +2897,309 @@ static void run_local_validate_shadow(const CheckConfig &conf, ModMap &mod_map,
         ran_pairs, passed_pairs, failed_pairs, skipped_pairs);
 }
 
+static bool valid_region_child_module(RTLIL::Design *design, RTLIL::Cell *cell, RTLIL::Module *&child)
+{
+    child = design->module(cell->type);
+    if (child == nullptr)
+        return false;
+    if (yosys_celltypes.cell_known(cell->type))
+        return false;
+    if (child->get_blackbox_attribute())
+        return false;
+    return true;
+}
+
+static std::vector<RegionBoundary> collect_region_child_boundaries(const CheckConfig &conf,
+                                                                   const ModMap &mod_map,
+                                                                   RTLIL::Module *gold_mod,
+                                                                   RTLIL::Module *gate_mod)
+{
+    std::vector<RegionBoundary> out;
+    for (auto *gold_cell : gold_mod->cells()) {
+        RTLIL::Module *gold_child = nullptr;
+        if (!valid_region_child_module(conf.design, gold_cell, gold_child))
+            continue;
+        RTLIL::Cell *gate_cell = gate_mod->cell(gold_cell->name);
+        if (gate_cell == nullptr)
+            continue;
+        RTLIL::Module *gate_child = nullptr;
+        if (!valid_region_child_module(conf.design, gate_cell, gate_child))
+            continue;
+        if (!mod_map.mod_map_gold.count(gold_child->name))
+            continue;
+        if (mod_map.mod_map_gold.at(gold_child->name) != gate_child->name)
+            continue;
+
+        std::vector<RTLIL::Wire*> gold_ports;
+        for (auto *w : gold_child->wires())
+            if (w->port_id > 0 && w->port_output)
+                gold_ports.push_back(w);
+        std::sort(gold_ports.begin(), gold_ports.end(),
+                  [](RTLIL::Wire *a, RTLIL::Wire *b){ return a->port_id < b->port_id; });
+
+        for (auto *gold_port : gold_ports) {
+            RTLIL::Wire *gate_port = gate_child->wire(gold_port->name);
+            if (gate_port == nullptr || !gate_port->port_output)
+                continue;
+            int width = std::min(GetSize(gold_port), GetSize(gate_port));
+            for (int i = 0; i < width; i++) {
+                RegionBoundary boundary;
+                boundary.parent_gold_mod = gold_mod->name;
+                boundary.parent_gate_mod = gate_mod->name;
+                boundary.gold_child_cell = gold_cell->name;
+                boundary.gate_child_cell = gate_cell->name;
+                boundary.gold_child_mod = gold_child->name;
+                boundary.gate_child_mod = gate_child->name;
+                boundary.gold_port = gold_port->name;
+                boundary.gate_port = gate_port->name;
+                boundary.bit_index = i;
+                boundary.boundary_kind = "child_output";
+                out.push_back(boundary);
+            }
+        }
+    }
+    return out;
+}
+
+static std::vector<RegionNode> build_region_plan(const CheckConfig &conf,
+                                                 const ModMap &mod_map,
+                                                 const dict<RTLIL::Module*, std::vector<CutPoint>> &gold2cutpoints)
+{
+    std::vector<RegionNode> nodes;
+    dict<RTLIL::IdString, int> region_by_gold;
+    auto sorted_mods = topo_sort_modules(conf.design, conf.gold_mod->name);
+
+    for (auto *gold_mod : sorted_mods) {
+        if (!mod_map.mod_map_gold.count(gold_mod->name))
+            continue;
+        RTLIL::Module *gate_mod = conf.design->module(mod_map.mod_map_gold.at(gold_mod->name));
+        if (gate_mod == nullptr)
+            continue;
+        if (gold_mod->get_blackbox_attribute() || gate_mod->get_blackbox_attribute())
+            continue;
+
+        RegionNode node;
+        node.region_id = GetSize(nodes);
+        node.gold_mod = gold_mod;
+        node.gate_mod = gate_mod;
+        node.is_top = gold_mod->name == conf.gold_mod->name;
+        if (gold2cutpoints.count(gold_mod)) {
+            node.state_cutpoints = select_region_state_cutpoints(gold2cutpoints.at(gold_mod));
+            node.child_boundary_cps = select_region_child_boundary_cutpoints(gold2cutpoints.at(gold_mod));
+        }
+        node.child_boundaries = collect_region_child_boundaries(conf, mod_map, gold_mod, gate_mod);
+        nodes.push_back(node);
+        region_by_gold[gold_mod->name] = node.region_id;
+    }
+
+    for (auto &node : nodes) {
+        pool<int> child_ids;
+        for (const auto &boundary : node.child_boundaries) {
+            if (!region_by_gold.count(boundary.gold_child_mod)) {
+                node.unresolved_child_boundary_count++;
+                continue;
+            }
+            int child_id = region_by_gold.at(boundary.gold_child_mod);
+            child_ids.insert(child_id);
+            nodes[child_id].parent_region_ids.push_back(node.region_id);
+        }
+        for (int child_id : child_ids)
+            node.child_region_ids.push_back(child_id);
+        node.is_leaf = node.child_region_ids.empty();
+    }
+
+    return nodes;
+}
+
 static Results partition_prove(const CheckConfig &conf, ModMap &mod_map,
                                const dict<RTLIL::Module*, std::vector<CutPoint>> &gold2cutpoints)
 {
     Results results;
     string artifact_dir = match_artifact_dir(conf);
-    pool<RTLIL::IdString> processed_gold;
-    auto is_hierarchical_pair = [&](RTLIL::Module *gold_mod, RTLIL::Module *gate_mod) {
-        return module_has_submodule(conf.design, gold_mod) || module_has_submodule(conf.design, gate_mod);
-    };
+    string region_plan_jsonl = region_artifact_path(artifact_dir, "region_plan", conf.gold_mod->name);
+    string region_proof_jsonl = region_artifact_path(artifact_dir, "region_proof", conf.gold_mod->name);
+    remove(region_plan_jsonl.c_str());
+    remove(region_proof_jsonl.c_str());
 
-    auto run_partition_pair = [&](RTLIL::Module *gold_mod, RTLIL::Module *gate_mod, bool allow_fallback) {
-        std::vector<CutPoint> local_cutpoints;
-        if (gold2cutpoints.count(gold_mod))
-            local_cutpoints = filter_materializable_cutpoints(gold_mod, gate_mod,
-                select_partition_cutpoints(gold2cutpoints.at(gold_mod)));
+    log("Running region-driven proving branch.\n");
 
-        bool proved = false;
-        if (!local_cutpoints.empty()) {
-            LocalValidateResult result = validate_partition_pair(conf, gold_mod, gate_mod, local_cutpoints, true);
-            append_jsonl(pair_artifact_path(artifact_dir, "local_validate", gold_mod, gate_mod, ".jsonl"), Json::object {
-                {"design", strip_backslash(conf.gold_mod->name)},
-                {"gold_mod", strip_backslash(gold_mod->name)},
-                {"gate_mod", strip_backslash(gate_mod->name)},
-                {"pair_id", result.pair_id},
-                {"signal_name", ""},
-                {"match_type", "PARTITION_SET"},
-                {"source", "partition_pair"},
-                {"score", 0},
-                {"margin", 0},
-                {"validator_result", result.proved ? "pass" : "fail"},
-                {"validator_backend", result.validator_backend},
-                {"used_bmc_fallback", result.used_bmc_fallback},
-                {"authoritative_ok", result.authoritative_ok},
-                {"unsafe_reason", result.unsafe_reason},
-                {"runtime_ms", result.runtime_ms},
-                {"accepted", false},
-                {"selected_cutpoints", result.selected_cutpoints},
-                {"local_exact_total", result.local_exact_total}
-            });
-            proved = result.proved;
-            if (result.proved && !result.authoritative_ok && allow_fallback) {
-                CheckConfig conf_ = conf;
-                conf_.gold_mod = gold_mod;
-                conf_.gate_mod = gate_mod;
-                log("PARTITION proof for %s is non-authoritative (%s); falling back to module-pair proof.\n",
-                    result.pair_id.c_str(), result.unsafe_reason.c_str());
-                proved = abc_cec_module(conf_);
-            }
-            log("PARTITION proof for %s: %s (%d DFF cutpoints, local exact=%d).\n",
-                result.pair_id.c_str(),
-                proved ? "\033[1;32mPASSED\033[0m" : "\033[1;31mFAILED\033[0m",
-                result.selected_cutpoints,
-                result.local_exact_total);
-        } else if (allow_fallback) {
-            CheckConfig conf_ = conf;
-            conf_.gold_mod = gold_mod;
-            conf_.gate_mod = gate_mod;
-            proved = abc_cec_module(conf_);
-            log("PARTITION fallback to module-pair proof for %s: %s.\n",
-                get_pair_id(gold_mod->name, gate_mod->name).c_str(),
-                proved ? "\033[1;32mPASSED\033[0m" : "\033[1;31mFAILED\033[0m");
-        }
-        return std::pair<bool, bool>{!local_cutpoints.empty(), proved};
-    };
+    std::vector<RegionNode> nodes = build_region_plan(conf, mod_map, gold2cutpoints);
+    std::vector<RegionProofResult> proof_results(GetSize(nodes));
 
-    log("Running partition-driven proving branch.\n");
-
-    if (mod_map.mod_map_gold.count(conf.gold_mod->name)) {
-        RTLIL::Module *top_gold = conf.design->module(conf.gold_mod->name);
-        RTLIL::Module *top_gate = conf.design->module(conf.gate_mod->name);
-        if (top_gold != nullptr && top_gate != nullptr) {
-            auto [used_partition, proved] = run_partition_pair(top_gold, top_gate, true);
-            processed_gold.insert(top_gold->name);
-            bool authoritative_top = !is_hierarchical_pair(top_gold, top_gate);
-            if (used_partition && !authoritative_top) {
-                log("PARTITION top-level proof for %s is non-authoritative in hierarchical mode; continuing descendant proofs.\n",
-                    get_pair_id(top_gold->name, top_gate->name).c_str());
-            }
-            if (authoritative_top || !used_partition) {
-                results.push_back({
-                    get_orignal_mod_name(top_gold->name, conf.gold_mod->name, conf.gold_prefix),
-                    proved
-                });
-            }
-        }
+    for (const auto &node : nodes) {
+        Json::array child_ids;
+        for (int child_id : node.child_region_ids)
+            child_ids.push_back(child_id);
+        Json::array parent_ids;
+        for (int parent_id : node.parent_region_ids)
+            parent_ids.push_back(parent_id);
+        append_jsonl(region_plan_jsonl, Json::object {
+            {"region_id", node.region_id},
+            {"gold_mod", strip_backslash(node.gold_mod->name)},
+            {"gate_mod", strip_backslash(node.gate_mod->name)},
+            {"is_top", node.is_top},
+            {"is_leaf", node.is_leaf},
+            {"parent_region_ids", parent_ids},
+            {"child_region_ids", child_ids},
+            {"state_cutpoint_count", int(node.state_cutpoints.size())},
+            {"child_boundary_count", int(node.child_boundaries.size())},
+            {"subckt_cutpoint_count", int(node.child_boundary_cps.size())},
+            {"unresolved_child_boundary_count", node.unresolved_child_boundary_count},
+            {"residual_hierarchy", !node.child_boundaries.empty()}
+        });
     }
 
-    for (const auto &[gold_name, gate_name] : mod_map.mod_map_gold) {
-        if (processed_gold.count(gold_name))
-            continue;
-        RTLIL::Module *gold_mod = conf.design->module(gold_name);
-        RTLIL::Module *gate_mod = conf.design->module(gate_name);
-        if (gold_mod == nullptr || gate_mod == nullptr)
-            continue;
-        if (gold_mod->get_blackbox_attribute() || gate_mod->get_blackbox_attribute())
-            continue;
-        auto [used_partition, proved] = run_partition_pair(gold_mod, gate_mod, true);
-        (void)used_partition;
+    for (const auto &node : nodes) {
+        RegionProofResult region_result;
+        region_result.region_id = node.region_id;
+        region_result.child_boundary_count = GetSize(node.child_boundaries);
+        region_result.unresolved_child_boundaries = node.unresolved_child_boundary_count;
 
+        bool children_discharged = true;
+        for (int child_id : node.child_region_ids) {
+            const auto &child_result = proof_results.at(child_id);
+            if (!child_result.obligation_discharged) {
+                children_discharged = false;
+                break;
+            }
+        }
+        region_result.children_discharged = children_discharged;
+
+        std::vector<CutPoint> local_cutpoints =
+            filter_materializable_cutpoints(node.gold_mod, node.gate_mod, node.state_cutpoints);
+        bool shell_attempted = !local_cutpoints.empty() || !node.child_boundaries.empty();
+        if (shell_attempted) {
+            LocalValidateResult shell_result =
+                validate_partition_pair(conf, node.gold_mod, node.gate_mod, local_cutpoints, true);
+            region_result.shell_proved = shell_result.proved;
+            region_result.selected_cutpoints = shell_result.selected_cutpoints;
+            region_result.local_exact_total = shell_result.local_exact_total;
+            region_result.child_boundary_count = shell_result.child_boundary_count;
+            region_result.unresolved_child_boundaries = shell_result.unresolved_child_boundaries;
+            region_result.boundary_map_expected = shell_result.boundary_map_expected;
+            region_result.boundary_map_applied = shell_result.boundary_map_applied;
+            region_result.constant_completed_net_count = shell_result.constant_completed_net_count;
+            region_result.unresolved_internal_boundaries = shell_result.unresolved_internal_boundaries;
+            region_result.residual_hierarchy = shell_result.residual_hierarchy;
+            region_result.runtime_ms = shell_result.runtime_ms;
+            region_result.backend = shell_result.validator_backend;
+            region_result.unsafe_reason = shell_result.unsafe_reason;
+            region_result.authoritative_ok =
+                shell_result.authoritative_ok &&
+                region_result.unresolved_child_boundaries == 0 &&
+                region_result.unresolved_internal_boundaries == 0 &&
+                region_result.constant_completed_net_count == 0 &&
+                (region_result.boundary_map_expected == 0 || region_result.boundary_map_applied > 0) &&
+                children_discharged;
+            if (!children_discharged && region_result.fallback_reason.empty())
+                region_result.fallback_reason = "child_obligations_not_discharged";
+            if (region_result.unresolved_child_boundaries > 0 && region_result.fallback_reason.empty())
+                region_result.fallback_reason = "unresolved_child_boundaries";
+            if (region_result.unresolved_internal_boundaries > 0 && region_result.fallback_reason.empty())
+                region_result.fallback_reason = "unresolved_internal_boundaries";
+            if (region_result.constant_completed_net_count > 0 && region_result.fallback_reason.empty())
+                region_result.fallback_reason = "constant_completed_nets";
+            if (region_result.boundary_map_expected > 0 && region_result.boundary_map_applied == 0 && region_result.fallback_reason.empty())
+                region_result.fallback_reason = "boundary_map_not_applied";
+            if (!shell_result.authoritative_ok && region_result.fallback_reason.empty())
+                region_result.fallback_reason = !shell_result.fallback_reason.empty() ? shell_result.fallback_reason : shell_result.unsafe_reason;
+            region_result.proved = region_result.shell_proved && children_discharged;
+            region_result.obligation_discharged = region_result.proved && region_result.authoritative_ok;
+            if (region_result.authoritative_ok)
+                region_result.authoritative_reason = "closed_region_shell";
+
+            append_jsonl(pair_artifact_path(artifact_dir, "local_validate", node.gold_mod, node.gate_mod, ".jsonl"), Json::object {
+                {"design", strip_backslash(conf.gold_mod->name)},
+                {"gold_mod", strip_backslash(node.gold_mod->name)},
+                {"gate_mod", strip_backslash(node.gate_mod->name)},
+                {"pair_id", get_pair_id(node.gold_mod->name, node.gate_mod->name)},
+                {"signal_name", ""},
+                {"match_type", "REGION_SHELL"},
+                {"source", "region_shell"},
+                {"score", 0},
+                {"margin", 0},
+                {"validator_result", shell_result.proved ? "pass" : "fail"},
+                {"validator_backend", shell_result.validator_backend},
+                {"used_bmc_fallback", shell_result.used_bmc_fallback},
+                {"authoritative_ok", region_result.authoritative_ok},
+                {"authoritative_reason", region_result.authoritative_reason},
+                {"unsafe_reason", shell_result.unsafe_reason},
+                {"fallback_reason", region_result.fallback_reason},
+                {"runtime_ms", shell_result.runtime_ms},
+                {"accepted", false},
+                {"selected_cutpoints", shell_result.selected_cutpoints},
+                {"local_exact_total", shell_result.local_exact_total},
+                {"boundary_map_expected", shell_result.boundary_map_expected},
+                {"boundary_map_applied", shell_result.boundary_map_applied},
+                {"constant_completed_net_count", shell_result.constant_completed_net_count},
+                {"unresolved_internal_boundaries", shell_result.unresolved_internal_boundaries},
+                {"child_boundary_count", shell_result.child_boundary_count},
+                {"unresolved_child_boundaries", shell_result.unresolved_child_boundaries}
+            });
+        } else {
+            region_result.fallback_reason = "no_shell_obligation";
+            region_result.authoritative_ok = false;
+            region_result.obligation_discharged = false;
+        }
+
+        if (!region_result.proved || !region_result.authoritative_ok) {
+            CheckConfig conf_ = conf;
+            conf_.gold_mod = node.gold_mod;
+            conf_.gate_mod = node.gate_mod;
+            bool fallback_ok = abc_cec_module(conf_);
+            if (region_result.fallback_reason.empty())
+                region_result.fallback_reason = region_result.proved ? "non_authoritative_region" : "shell_failed";
+            log("REGION proof for %s falling back to module-pair proof (%s).\n",
+                get_pair_id(node.gold_mod->name, node.gate_mod->name).c_str(),
+                region_result.fallback_reason.c_str());
+            region_result.proved = fallback_ok;
+            region_result.authoritative_ok = false;
+            region_result.obligation_discharged = fallback_ok;
+            if (region_result.backend.empty())
+                region_result.backend = "module_pair_fallback";
+            else
+                region_result.backend += "+module_pair_fallback";
+        }
+
+        append_jsonl(region_proof_jsonl, Json::object {
+            {"region_id", node.region_id},
+            {"gold_mod", strip_backslash(node.gold_mod->name)},
+            {"gate_mod", strip_backslash(node.gate_mod->name)},
+            {"parent_region_ids", json_array_from_ints(node.parent_region_ids)},
+            {"child_region_ids", json_array_from_ints(node.child_region_ids)},
+            {"state_cutpoint_count", int(node.state_cutpoints.size())},
+            {"child_boundary_count", region_result.child_boundary_count},
+            {"shell_proved", region_result.shell_proved},
+            {"children_discharged", region_result.children_discharged},
+            {"obligation_discharged", region_result.obligation_discharged},
+            {"authoritative_ok", region_result.authoritative_ok},
+            {"authoritative_reason", region_result.authoritative_reason},
+            {"proved", region_result.proved},
+            {"unsafe_reason", region_result.unsafe_reason},
+            {"fallback_reason", region_result.fallback_reason},
+            {"backend", region_result.backend},
+            {"runtime_ms", region_result.runtime_ms},
+            {"selected_cutpoints", region_result.selected_cutpoints},
+            {"local_exact_total", region_result.local_exact_total},
+            {"boundary_map_expected", region_result.boundary_map_expected},
+            {"boundary_map_applied", region_result.boundary_map_applied},
+            {"constant_completed_net_count", region_result.constant_completed_net_count},
+            {"unresolved_internal_boundaries", region_result.unresolved_internal_boundaries},
+            {"unresolved_child_boundaries", region_result.unresolved_child_boundaries},
+            {"residual_hierarchy", region_result.residual_hierarchy}
+        });
+
+        log("REGION proof for %s: %s (state cuts=%d, child boundaries=%d, children=%s).\n",
+            get_pair_id(node.gold_mod->name, node.gate_mod->name).c_str(),
+            region_result.proved ? "\033[1;32mPASSED\033[0m" : "\033[1;31mFAILED\033[0m",
+            region_result.selected_cutpoints,
+            region_result.child_boundary_count,
+            region_result.children_discharged ? "discharged" : "pending");
+
+        proof_results.at(node.region_id) = region_result;
         results.push_back({
-            get_orignal_mod_name(gold_name, conf.gold_mod->name, conf.gold_prefix),
-            proved
+            get_orignal_mod_name(node.gold_mod->name, conf.gold_mod->name, conf.gold_prefix),
+            region_result.proved
         });
     }
 
