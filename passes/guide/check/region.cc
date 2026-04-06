@@ -61,6 +61,14 @@ struct BitTraceInfo
     bool promotable = false;
 };
 
+struct TraceBoundaryPair
+{
+    string source_id;
+    string gold_bit_name;
+    string gate_bit_name;
+    bool count_as_promoted = false;
+};
+
 struct ShellAuditInfo
 {
     int iface_in_cnt = 0;
@@ -80,9 +88,12 @@ struct ShellAuditInfo
 
 struct ConstantCompletionAudit
 {
-    int traceable_count = 0;
+    int promotable_count = 0;
+    int traceable_remaining_count = 0;
     int untraceable_count = 0;
-    std::vector<string> samples;
+    std::vector<string> promotable_samples;
+    std::vector<string> remaining_samples;
+    std::vector<TraceBoundaryPair> promotions;
 };
 
 } // namespace
@@ -662,7 +673,7 @@ static BitTraceInfo trace_residual_source(const BitTraceDB &db, const string &bi
                         (saw_alias ? "passthrough_alias_input" : "module_interface_input");
             info.source_id = "if:" + current;
             info.traceable = true;
-            info.promotable = false;
+            info.promotable = saw_alias || saw_slice_or_concat;
             return info;
         }
 
@@ -704,7 +715,7 @@ static BitTraceInfo trace_residual_source(const BitTraceDB &db, const string &bi
             info.kind = saw_slice_or_concat ? "slice_or_concat_residual" : "passthrough_alias_input";
             info.source_id = "wire:" + current;
             info.traceable = true;
-            info.promotable = saw_slice_or_concat;
+            info.promotable = true;
             return info;
         }
 
@@ -749,29 +760,110 @@ static RTLIL::Wire *find_single_bit_input_wire(RTLIL::Module *mod, const string 
     return nullptr;
 }
 
+static bool find_module_bit(RTLIL::Module *mod, const string &bit_name, RTLIL::Wire *&wire, int &bit_idx)
+{
+    for (auto *w : mod->wires()) {
+        int width = std::max(1, GetSize(w));
+        for (int i = 0; i < width; i++) {
+            if (wire_bit_name(w->name, width, i) != bit_name)
+                continue;
+            wire = w;
+            bit_idx = i;
+            return true;
+        }
+    }
+    wire = nullptr;
+    bit_idx = -1;
+    return false;
+}
+
+static pool<string> collect_undriven_used_internal_bit_names(RTLIL::Module *mod)
+{
+    pool<string> driven_bits, used_bits, out;
+    collect_wire_usage(mod, driven_bits, used_bits);
+    for (const auto &bit_name : used_bits) {
+        if (driven_bits.count(bit_name))
+            continue;
+        RTLIL::Wire *wire = nullptr;
+        int bit_idx = -1;
+        if (!find_module_bit(mod, bit_name, wire, bit_idx) || wire == nullptr)
+            continue;
+        if (!wire->port_input)
+            out.insert(bit_name);
+    }
+    return out;
+}
+
 static string canonical_trace_boundary_wire(const string &source_id)
 {
     return "__region__trace__" + sanitize_filename(source_id);
 }
 
-static void apply_trace_boundary_canonical_names(RTLIL::Module *gold_mod, RTLIL::Module *gate_mod,
-                                                 const dict<string, string> &bit_to_source)
+static RTLIL::Wire *ensure_single_bit_input_wire(RTLIL::Module *mod, const RTLIL::IdString &wire_name)
+{
+    RTLIL::Wire *wire = mod->wire(wire_name);
+    if (wire != nullptr) {
+        if (!wire->port_input || wire->port_output || GetSize(wire) != 1)
+            return nullptr;
+        return wire;
+    }
+    wire = mod->addWire(wire_name, 1);
+    wire->port_input = true;
+    wire->port_output = false;
+    return wire;
+}
+
+static bool can_promote_internal_boundary_bit(RTLIL::Module *mod, const string &bit_name,
+                                              const RTLIL::IdString &canonical_wire)
+{
+    RTLIL::Wire *wire = nullptr;
+    int bit_idx = -1;
+    if (!find_module_bit(mod, bit_name, wire, bit_idx) || wire == nullptr)
+        return false;
+    if (wire->port_input)
+        return false;
+    RTLIL::Wire *canonical = mod->wire(canonical_wire);
+    if (canonical == nullptr)
+        return true;
+    return canonical->port_input && !canonical->port_output && GetSize(canonical) == 1;
+}
+
+static bool promote_internal_boundary_bit(RTLIL::Module *mod, const string &bit_name,
+                                          const RTLIL::IdString &canonical_wire)
+{
+    if (!can_promote_internal_boundary_bit(mod, bit_name, canonical_wire))
+        return false;
+    RTLIL::Wire *wire = nullptr;
+    int bit_idx = -1;
+    if (!find_module_bit(mod, bit_name, wire, bit_idx) || wire == nullptr)
+        return false;
+    RTLIL::Wire *port_wire = ensure_single_bit_input_wire(mod, canonical_wire);
+    if (port_wire == nullptr)
+        return false;
+    mod->connect(RTLIL::SigSpec(RTLIL::SigBit(wire, bit_idx)), RTLIL::SigSpec(port_wire));
+    mod->fixup_ports();
+    return true;
+}
+
+static pool<string> apply_trace_boundary_canonical_names(RTLIL::Module *gold_mod, RTLIL::Module *gate_mod,
+                                                         const std::vector<TraceBoundaryPair> &pairs)
 {
     dict<RTLIL::IdString, RTLIL::IdString> gold_renames;
     dict<RTLIL::IdString, RTLIL::IdString> gate_renames;
+    pool<string> applied_bits;
 
-    for (const auto &it : bit_to_source) {
-        const string &bit_name = it.first;
-        RTLIL::Wire *gold_wire = find_single_bit_input_wire(gold_mod, bit_name);
-        RTLIL::Wire *gate_wire = find_single_bit_input_wire(gate_mod, bit_name);
+    for (const auto &pair : pairs) {
+        RTLIL::Wire *gold_wire = find_single_bit_input_wire(gold_mod, pair.gold_bit_name);
+        RTLIL::Wire *gate_wire = find_single_bit_input_wire(gate_mod, pair.gate_bit_name);
         if (gold_wire == nullptr || gate_wire == nullptr)
             continue;
-        RTLIL::IdString canonical = RTLIL::escape_id(canonical_trace_boundary_wire(it.second));
+        RTLIL::IdString canonical = RTLIL::escape_id(canonical_trace_boundary_wire(pair.source_id));
         if ((gold_mod->wire(canonical) != nullptr && gold_mod->wire(canonical) != gold_wire) ||
             (gate_mod->wire(canonical) != nullptr && gate_mod->wire(canonical) != gate_wire))
             continue;
         gold_renames[gold_wire->name] = canonical;
         gate_renames[gate_wire->name] = canonical;
+        applied_bits.insert(wire_bit_name(canonical, 1, 0));
     }
 
     auto apply_renames = [](RTLIL::Module *mod, const dict<RTLIL::IdString, RTLIL::IdString> &renames) {
@@ -786,6 +878,7 @@ static void apply_trace_boundary_canonical_names(RTLIL::Module *gold_mod, RTLIL:
 
     apply_renames(gold_mod, gold_renames);
     apply_renames(gate_mod, gate_renames);
+    return applied_bits;
 }
 
 static ShellAuditInfo audit_shell_inputs(RTLIL::Module *gold_local,
@@ -856,47 +949,71 @@ static ConstantCompletionAudit audit_constant_completed_nets(RTLIL::Module *gold
                                                             const BitTraceDB &gate_db)
 {
     ConstantCompletionAudit audit;
-    auto collect_undriven_used_internal = [](RTLIL::Module *mod) {
-        pool<string> driven_bits, used_bits;
-        collect_wire_usage(mod, driven_bits, used_bits);
-        pool<string> out;
-        for (const auto &bit_name : used_bits) {
-            if (driven_bits.count(bit_name))
-                continue;
-            for (auto *w : mod->wires()) {
-                int width = std::max(1, GetSize(w));
-                for (int i = 0; i < width; i++) {
-                    if (wire_bit_name(w->name, width, i) != bit_name)
-                        continue;
-                    if (!w->port_input)
-                        out.insert(bit_name);
-                }
-            }
-        }
-        return out;
+    pool<string> gold_bits = collect_undriven_used_internal_bit_names(gold_local);
+    pool<string> gate_bits = collect_undriven_used_internal_bit_names(gate_local);
+    dict<string, BitTraceInfo> gold_info, gate_info;
+    dict<string, std::vector<string>> gold_prom_by_source, gate_prom_by_source;
+
+    auto sample_name = [](const char *side, const string &bit_name, const BitTraceInfo &trace) {
+        string kind = trace.kind.empty() ? "other_unresolved" : trace.kind;
+        if (!trace.source_id.empty())
+            return stringf("%s:%s:%s", side, bit_name.c_str(), trace.source_id.c_str());
+        return stringf("%s:%s:%s", side, bit_name.c_str(), kind.c_str());
     };
 
-    pool<string> local_bits = collect_undriven_used_internal(gold_local);
-    pool<string> gate_bits = collect_undriven_used_internal(gate_local);
-    for (const auto &bit_name : gate_bits)
-        local_bits.insert(bit_name);
-
-    for (const auto &bit_name : local_bits) {
-        BitTraceInfo gold_trace = trace_residual_source(gold_db, bit_name);
-        BitTraceInfo gate_trace = trace_residual_source(gate_db, bit_name);
-        bool traceable =
-            gold_trace.traceable || gate_trace.traceable ||
-            gold_trace.kind == "passthrough_alias_input" || gate_trace.kind == "passthrough_alias_input" ||
-            gold_trace.kind == "slice_or_concat_residual" || gate_trace.kind == "slice_or_concat_residual";
-        if (traceable)
-            audit.traceable_count++;
-        else
-            audit.untraceable_count++;
-        add_sample_name(audit.samples,
-                        bit_name + ":" + (traceable ? "traceable" : "untraceable") +
-                        ":" + (gold_trace.kind != "other_unresolved" ? gold_trace.kind : gate_trace.kind),
-                        8);
+    for (const auto &bit_name : gold_bits) {
+        BitTraceInfo trace = trace_residual_source(gold_db, bit_name);
+        gold_info[bit_name] = trace;
+        if (trace.traceable && trace.promotable && !trace.source_id.empty())
+            gold_prom_by_source[trace.source_id].push_back(bit_name);
     }
+    for (const auto &bit_name : gate_bits) {
+        BitTraceInfo trace = trace_residual_source(gate_db, bit_name);
+        gate_info[bit_name] = trace;
+        if (trace.traceable && trace.promotable && !trace.source_id.empty())
+            gate_prom_by_source[trace.source_id].push_back(bit_name);
+    }
+
+    pool<string> promotable_sources;
+    for (const auto &it : gold_prom_by_source) {
+        const string &source_id = it.first;
+        if (!gate_prom_by_source.count(source_id))
+            continue;
+        const auto &gold_names = it.second;
+        const auto &gate_names = gate_prom_by_source.at(source_id);
+        if (GetSize(gold_names) != 1 || GetSize(gate_names) != 1)
+            continue;
+        promotable_sources.insert(source_id);
+        audit.promotions.push_back({source_id, gold_names.front(), gate_names.front(), true});
+    }
+
+    auto classify_side = [&](const char *side, const pool<string> &bits, const dict<string, BitTraceInfo> &info_map,
+                             const dict<string, std::vector<string>> &prom_by_source) {
+        for (const auto &bit_name : bits) {
+            BitTraceInfo trace;
+            if (info_map.count(bit_name))
+                trace = info_map.at(bit_name);
+            bool paired_promotable =
+                trace.traceable && trace.promotable && !trace.source_id.empty() &&
+                promotable_sources.count(trace.source_id) &&
+                prom_by_source.count(trace.source_id) &&
+                GetSize(prom_by_source.at(trace.source_id)) == 1 &&
+                prom_by_source.at(trace.source_id).front() == bit_name;
+            if (paired_promotable) {
+                audit.promotable_count++;
+                add_sample_name(audit.promotable_samples, sample_name(side, bit_name, trace), 8);
+            } else if (trace.traceable) {
+                audit.traceable_remaining_count++;
+                add_sample_name(audit.remaining_samples, sample_name(side, bit_name, trace), 8);
+            } else {
+                audit.untraceable_count++;
+                add_sample_name(audit.remaining_samples, sample_name(side, bit_name, trace), 8);
+            }
+        }
+    };
+
+    classify_side("gold", gold_bits, gold_info, gold_prom_by_source);
+    classify_side("gate", gate_bits, gate_info, gate_prom_by_source);
     return audit;
 }
 
@@ -907,6 +1024,8 @@ void refine_shell_closure(PartitionedPair &pair, RTLIL::Module *gold_orig, RTLIL
     pool<string> state_in = collect_state_cut_input_bit_names(cutpoints);
     BitTraceDB gold_db = build_bit_trace_db(gold_orig);
     BitTraceDB gate_db = build_bit_trace_db(gate_orig);
+
+    pool<string> canon_alias_in;
 
     auto base_allowed = [&]() {
         pool<string> allowed = iface_in;
@@ -936,63 +1055,106 @@ void refine_shell_closure(PartitionedPair &pair, RTLIL::Module *gold_orig, RTLIL
     classify_residual_inputs(pair.gold_local, gold_db, allowed, gold_trace_info);
     classify_residual_inputs(pair.gate_local, gate_db, allowed, gate_trace_info);
 
-    dict<string, std::vector<string>> gold_promotable_by_source, gate_promotable_by_source;
+    dict<string, std::vector<string>> gold_trace_by_source, gate_trace_by_source;
+    dict<string, std::vector<string>> gold_prom_by_source, gate_prom_by_source;
     for (const auto &it : gold_trace_info) {
-        const string &bit_name = it.first;
         const auto &trace = it.second;
-        trace_by_bit[bit_name] = trace;
         if (trace.kind == "passthrough_alias_input" || trace.kind == "module_interface_input")
-            alias_in.insert(bit_name);
+            alias_in.insert(it.first);
+        if (trace.traceable && !trace.source_id.empty())
+            gold_trace_by_source[trace.source_id].push_back(it.first);
         if (trace.traceable && trace.promotable && !trace.source_id.empty())
-            gold_promotable_by_source[trace.source_id].push_back(bit_name);
+            gold_prom_by_source[trace.source_id].push_back(it.first);
     }
     for (const auto &it : gate_trace_info) {
         const auto &trace = it.second;
+        if (trace.traceable && !trace.source_id.empty())
+            gate_trace_by_source[trace.source_id].push_back(it.first);
         if (trace.traceable && trace.promotable && !trace.source_id.empty())
-            gate_promotable_by_source[trace.source_id].push_back(it.first);
+            gate_prom_by_source[trace.source_id].push_back(it.first);
     }
 
-    dict<string, string> canonical_promotions;
-    for (const auto &it : gold_promotable_by_source) {
+    std::vector<TraceBoundaryPair> trace_pairs;
+    for (const auto &it : gold_trace_by_source) {
         const string &source_id = it.first;
-        if (!gate_promotable_by_source.count(source_id))
+        if (!gate_trace_by_source.count(source_id))
             continue;
         const auto &gold_bits = it.second;
-        const auto &gate_bits = gate_promotable_by_source.at(source_id);
+        const auto &gate_bits = gate_trace_by_source.at(source_id);
         if (GetSize(gold_bits) != 1 || GetSize(gate_bits) != 1)
             continue;
-        pair.promoted_internal_boundary_bit_names.insert(gold_bits.front());
-        canonical_promotions[gold_bits.front()] = source_id;
+        bool count_as_promoted =
+            gold_prom_by_source.count(source_id) &&
+            gate_prom_by_source.count(source_id) &&
+            GetSize(gold_prom_by_source.at(source_id)) == 1 &&
+            GetSize(gate_prom_by_source.at(source_id)) == 1 &&
+            gold_prom_by_source.at(source_id).front() == gold_bits.front() &&
+            gate_prom_by_source.at(source_id).front() == gate_bits.front();
+        trace_pairs.push_back({source_id, gold_bits.front(), gate_bits.front(), count_as_promoted});
     }
 
-    if (!canonical_promotions.empty()) {
-        apply_trace_boundary_canonical_names(pair.gold_local, pair.gate_local, canonical_promotions);
-        pool<string> renamed_promoted_bits;
-        for (const auto &bit_name : pair.promoted_internal_boundary_bit_names) {
-            if (canonical_promotions.count(bit_name))
-                renamed_promoted_bits.insert(canonical_trace_boundary_wire(canonical_promotions.at(bit_name)));
-            else
-                renamed_promoted_bits.insert(bit_name);
+    int trace_prom_cnt = 0;
+    if (!trace_pairs.empty()) {
+        pool<string> applied = apply_trace_boundary_canonical_names(pair.gold_local, pair.gate_local, trace_pairs);
+        for (const auto &trace_pair : trace_pairs) {
+            string canonical_bit = wire_bit_name(RTLIL::escape_id(canonical_trace_boundary_wire(trace_pair.source_id)), 1, 0);
+            if (!applied.count(canonical_bit))
+                continue;
+            if (trace_pair.count_as_promoted) {
+                pair.promoted_internal_boundary_bit_names.insert(canonical_bit);
+                trace_prom_cnt++;
+            } else {
+                canon_alias_in.insert(canonical_bit);
+            }
         }
-        pair.promoted_internal_boundary_bit_names = renamed_promoted_bits;
+    }
+
+    ConstantCompletionAudit cc_before =
+        audit_constant_completed_nets(pair.gold_local, pair.gate_local, gold_db, gate_db);
+    pair.const_comp_prom_cnt = cc_before.promotable_count;
+    pair.const_comp_promoted_cnt = 0;
+    pair.const_comp_prom_samps.clear();
+    for (const auto &promotion : cc_before.promotions) {
+        RTLIL::IdString canonical = RTLIL::escape_id(canonical_trace_boundary_wire(promotion.source_id));
+        if (!can_promote_internal_boundary_bit(pair.gold_local, promotion.gold_bit_name, canonical))
+            continue;
+        if (!can_promote_internal_boundary_bit(pair.gate_local, promotion.gate_bit_name, canonical))
+            continue;
+        if (!promote_internal_boundary_bit(pair.gold_local, promotion.gold_bit_name, canonical))
+            continue;
+        if (!promote_internal_boundary_bit(pair.gate_local, promotion.gate_bit_name, canonical))
+            continue;
+        string canonical_bit = wire_bit_name(canonical, 1, 0);
+        pair.promoted_internal_boundary_bit_names.insert(canonical_bit);
+        pair.const_comp_promoted_cnt += 2;
+        add_sample_name(pair.const_comp_prom_samps, canonical_bit, 8);
     }
 
     allowed = base_allowed();
-    for (const auto &bit_name : alias_in)
-        allowed.insert(bit_name);
-
+    alias_in.clear();
     gold_trace_info.clear();
-    trace_by_bit.clear();
+    gate_trace_info.clear();
     classify_residual_inputs(pair.gold_local, gold_db, allowed, gold_trace_info);
-    for (const auto &it : gold_trace_info)
+    classify_residual_inputs(pair.gate_local, gate_db, allowed, gate_trace_info);
+
+    trace_by_bit.clear();
+    for (const auto &it : gold_trace_info) {
         trace_by_bit[it.first] = it.second;
+        if (it.second.kind == "passthrough_alias_input" || it.second.kind == "module_interface_input")
+            alias_in.insert(it.first);
+    }
 
     pair.allowed_shell_input_bit_names = allowed;
     for (const auto &bit_name : alias_in)
         pair.allowed_shell_input_bit_names.insert(bit_name);
+    for (const auto &bit_name : canon_alias_in)
+        pair.allowed_shell_input_bit_names.insert(bit_name);
+    pool<string> alias_allowed = alias_in;
+    for (const auto &bit_name : canon_alias_in)
+        alias_allowed.insert(bit_name);
 
     ShellAuditInfo audit = audit_shell_inputs(pair.gold_local, iface_in, state_in,
-                                              pair.boundary_bit_names, alias_in,
+                                              pair.boundary_bit_names, alias_allowed,
                                               pair.promoted_internal_boundary_bit_names, trace_by_bit);
     pair.iface_in_cnt = audit.iface_in_cnt;
     pair.state_in_cnt = audit.state_in_cnt;
@@ -1000,7 +1162,7 @@ void refine_shell_closure(PartitionedPair &pair, RTLIL::Module *gold_orig, RTLIL
     pair.alias_in_cnt = audit.alias_in_cnt;
     pair.slice_res_cnt = audit.slice_res_cnt;
     pair.trace_res_in_cnt = audit.trace_res_in_cnt;
-    pair.trace_prom_cnt = audit.trace_prom_cnt;
+    pair.trace_prom_cnt = trace_prom_cnt;
     pair.prom_int_bnd_cnt = audit.prom_int_bnd_cnt;
     pair.unr_int_in_cnt = audit.unr_int_in_cnt;
     pair.unr_untrace_in_cnt = audit.unr_untrace_in_cnt;
@@ -1008,11 +1170,16 @@ void refine_shell_closure(PartitionedPair &pair, RTLIL::Module *gold_orig, RTLIL
     pair.unr_int_in_samps = audit.unr_int_in_samps;
     pair.unr_int_bnd_cnt = audit.unr_int_bnd_cnt;
 
-    ConstantCompletionAudit cc_audit =
+    ConstantCompletionAudit cc_after =
         audit_constant_completed_nets(pair.gold_local, pair.gate_local, gold_db, gate_db);
-    pair.const_comp_trace_cnt = cc_audit.traceable_count;
-    pair.const_comp_untrace_cnt = cc_audit.untraceable_count;
-    pair.const_comp_samps = cc_audit.samples;
+    pair.const_comp_trace_rem_cnt = cc_after.traceable_remaining_count + cc_after.promotable_count;
+    pair.const_comp_trace_cnt = pair.const_comp_trace_rem_cnt;
+    pair.const_comp_untrace_cnt = cc_after.untraceable_count;
+    pair.const_comp_rem_samps = cc_after.remaining_samples;
+    for (const auto &name : cc_after.promotable_samples)
+        add_sample_name(pair.const_comp_rem_samps, name, 8);
+    pair.const_comp_samps = pair.const_comp_rem_samps;
+    pair.shell_refine_iter_cnt = 2;
 }
 
 std::vector<ChildBoundaryPort> submod_to_pi_po(RTLIL::Design *design, RTLIL::Module *mod)
@@ -1254,9 +1421,15 @@ LocalValidateResult validate_partition_pair(const CheckConfig &conf,
     result.unr_untrace_in_cnt = local_pair.unr_untrace_in_cnt;
     result.prom_int_bnd_samps = local_pair.prom_int_bnd_samps;
     result.unr_int_in_samps = local_pair.unr_int_in_samps;
+    result.const_comp_prom_cnt = local_pair.const_comp_prom_cnt;
+    result.const_comp_promoted_cnt = local_pair.const_comp_promoted_cnt;
+    result.const_comp_trace_rem_cnt = local_pair.const_comp_trace_rem_cnt;
     result.const_comp_trace_cnt = local_pair.const_comp_trace_cnt;
     result.const_comp_untrace_cnt = local_pair.const_comp_untrace_cnt;
+    result.const_comp_prom_samps = local_pair.const_comp_prom_samps;
+    result.const_comp_rem_samps = local_pair.const_comp_rem_samps;
     result.const_comp_samps = local_pair.const_comp_samps;
+    result.shell_refine_iter_cnt = local_pair.shell_refine_iter_cnt;
     result.resid_hier = local_pair.resid_hier;
 
     GuideTelemetry local_telemetry;
@@ -1293,12 +1466,13 @@ LocalValidateResult validate_partition_pair(const CheckConfig &conf,
         result.bnd_map_app = std::min(result.bnd_map_exp, abc_name_map_applied);
     result.const_comp_net_cnt = parse_const_comp_net_cnt(local_abc_result.output);
     int classified_constant_completed =
-        result.const_comp_trace_cnt + result.const_comp_untrace_cnt;
+        result.const_comp_trace_rem_cnt + result.const_comp_untrace_cnt;
     if (result.const_comp_net_cnt > classified_constant_completed) {
         result.const_comp_untrace_cnt +=
             result.const_comp_net_cnt - classified_constant_completed;
-        add_sample_name(result.const_comp_samps, "abc_constant_completed_unclassified", 8);
+        add_sample_name(result.const_comp_rem_samps, "abc_constant_completed_unclassified", 8);
     }
+    result.const_comp_samps = result.const_comp_rem_samps;
     result.unsafe_why = partition_unsafe_why(local_abc_result);
     if (!result.unsafe_why.empty())
         result.auth_ok = false;
@@ -1398,13 +1572,19 @@ void run_local_vali_shadow(const CheckConfig &conf, ModMap &mod_map,
             {"slice_or_concat_residual_count", result.slice_res_cnt},
             {"traceable_residual_input_count", result.trace_res_in_cnt},
             {"promoted_from_trace_count", result.trace_prom_cnt},
+            {"constant_completed_promotable_count", result.const_comp_prom_cnt},
+            {"promoted_from_constant_completion_count", result.const_comp_promoted_cnt},
             {"promoted_internal_boundary_count", result.prom_int_bnd_cnt},
             {"unresolved_internal_input_count", result.unr_int_in_cnt},
             {"unresolved_untraceable_input_count", result.unr_untrace_in_cnt},
+            {"constant_completed_traceable_remaining_count", result.const_comp_trace_rem_cnt},
             {"constant_completed_traceable_count", result.const_comp_trace_cnt},
             {"constant_completed_untraceable_count", result.const_comp_untrace_cnt},
+            {"shell_refinement_iterations", result.shell_refine_iter_cnt},
             {"promoted_internal_boundary_samples", json_array_from_strings(result.prom_int_bnd_samps)},
+            {"promoted_from_constant_completion_samples", json_array_from_strings(result.const_comp_prom_samps)},
             {"unresolved_internal_input_samples", json_array_from_strings(result.unr_int_in_samps)},
+            {"constant_completed_remaining_samples", json_array_from_strings(result.const_comp_rem_samps)},
             {"constant_completed_samples", json_array_from_strings(result.const_comp_samps)},
             {"unresolved_internal_boundaries", result.unr_int_bnd_cnt},
             {"child_boundary_count", result.child_bnd_cnt},
@@ -1621,11 +1801,17 @@ Results partition_prove(const CheckConfig &conf, ModMap &mod_map,
             region_result.prom_int_bnd_cnt = shell_result.prom_int_bnd_cnt;
             region_result.unr_int_in_cnt = shell_result.unr_int_in_cnt;
             region_result.unr_untrace_in_cnt = shell_result.unr_untrace_in_cnt;
+            region_result.const_comp_prom_cnt = shell_result.const_comp_prom_cnt;
+            region_result.const_comp_promoted_cnt = shell_result.const_comp_promoted_cnt;
+            region_result.const_comp_trace_rem_cnt = shell_result.const_comp_trace_rem_cnt;
             region_result.prom_int_bnd_samps = shell_result.prom_int_bnd_samps;
             region_result.unr_int_in_samps = shell_result.unr_int_in_samps;
             region_result.const_comp_trace_cnt = shell_result.const_comp_trace_cnt;
             region_result.const_comp_untrace_cnt = shell_result.const_comp_untrace_cnt;
+            region_result.const_comp_prom_samps = shell_result.const_comp_prom_samps;
+            region_result.const_comp_rem_samps = shell_result.const_comp_rem_samps;
             region_result.const_comp_samps = shell_result.const_comp_samps;
+            region_result.shell_refine_iter_cnt = shell_result.shell_refine_iter_cnt;
             region_result.resid_hier = shell_result.resid_hier;
             region_result.runtime_ms = shell_result.runtime_ms;
             region_result.backend = shell_result.vali_backend;
@@ -1685,13 +1871,19 @@ Results partition_prove(const CheckConfig &conf, ModMap &mod_map,
                 {"slice_or_concat_residual_count", shell_result.slice_res_cnt},
                 {"traceable_residual_input_count", shell_result.trace_res_in_cnt},
                 {"promoted_from_trace_count", shell_result.trace_prom_cnt},
+                {"constant_completed_promotable_count", shell_result.const_comp_prom_cnt},
+                {"promoted_from_constant_completion_count", shell_result.const_comp_promoted_cnt},
                 {"promoted_internal_boundary_count", shell_result.prom_int_bnd_cnt},
                 {"unresolved_internal_input_count", shell_result.unr_int_in_cnt},
                 {"unresolved_untraceable_input_count", shell_result.unr_untrace_in_cnt},
+                {"constant_completed_traceable_remaining_count", shell_result.const_comp_trace_rem_cnt},
                 {"constant_completed_traceable_count", shell_result.const_comp_trace_cnt},
                 {"constant_completed_untraceable_count", shell_result.const_comp_untrace_cnt},
+                {"shell_refinement_iterations", shell_result.shell_refine_iter_cnt},
                 {"promoted_internal_boundary_samples", json_array_from_strings(shell_result.prom_int_bnd_samps)},
+                {"promoted_from_constant_completion_samples", json_array_from_strings(shell_result.const_comp_prom_samps)},
                 {"unresolved_internal_input_samples", json_array_from_strings(shell_result.unr_int_in_samps)},
+                {"constant_completed_remaining_samples", json_array_from_strings(shell_result.const_comp_rem_samps)},
                 {"constant_completed_samples", json_array_from_strings(shell_result.const_comp_samps)},
                 {"unresolved_internal_boundaries", shell_result.unr_int_bnd_cnt},
                 {"child_boundary_count", shell_result.child_bnd_cnt},
@@ -1752,13 +1944,19 @@ Results partition_prove(const CheckConfig &conf, ModMap &mod_map,
             {"slice_or_concat_residual_count", region_result.slice_res_cnt},
             {"traceable_residual_input_count", region_result.trace_res_in_cnt},
             {"promoted_from_trace_count", region_result.trace_prom_cnt},
+            {"constant_completed_promotable_count", region_result.const_comp_prom_cnt},
+            {"promoted_from_constant_completion_count", region_result.const_comp_promoted_cnt},
             {"promoted_internal_boundary_count", region_result.prom_int_bnd_cnt},
             {"unresolved_internal_input_count", region_result.unr_int_in_cnt},
             {"unresolved_untraceable_input_count", region_result.unr_untrace_in_cnt},
+            {"constant_completed_traceable_remaining_count", region_result.const_comp_trace_rem_cnt},
             {"constant_completed_traceable_count", region_result.const_comp_trace_cnt},
             {"constant_completed_untraceable_count", region_result.const_comp_untrace_cnt},
+            {"shell_refinement_iterations", region_result.shell_refine_iter_cnt},
             {"promoted_internal_boundary_samples", json_array_from_strings(region_result.prom_int_bnd_samps)},
+            {"promoted_from_constant_completion_samples", json_array_from_strings(region_result.const_comp_prom_samps)},
             {"unresolved_internal_input_samples", json_array_from_strings(region_result.unr_int_in_samps)},
+            {"constant_completed_remaining_samples", json_array_from_strings(region_result.const_comp_rem_samps)},
             {"constant_completed_samples", json_array_from_strings(region_result.const_comp_samps)},
             {"unresolved_internal_boundaries", region_result.unr_int_bnd_cnt},
             {"unresolved_child_boundaries", region_result.unr_child_bnd_cnt},
