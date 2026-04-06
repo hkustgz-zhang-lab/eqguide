@@ -318,6 +318,7 @@ struct NamedSig {
 
 static std::vector<CutPoint> select_local_dff_cutpoints(const std::vector<CutPoint> &all_cps,
                                                         const CutPoint *extra_cand = nullptr);
+static std::vector<CutPoint> select_partition_cutpoints(const std::vector<CutPoint> &all_cps);
 static std::vector<CutPoint> dedup_local_dff_cutpoints(const std::vector<CutPoint> &cutpoints);
 static std::vector<CutPoint> select_support_sliced_dff_cutpoints(RTLIL::Module *gold_mod,
                                                                  RTLIL::Module *gate_mod,
@@ -1982,7 +1983,7 @@ static std::vector<CutPoint> select_local_dff_cutpoints(const std::vector<CutPoi
 {
     std::vector<CutPoint> out;
     auto is_dff_cp = [](const CutPoint &cp) {
-        return cp.type == MatchType::DFF;
+        return cp.type == MatchType::DFF || cp.type == MatchType::DFF_PO;
     };
 
     for (auto &cp : all_cps)
@@ -2000,6 +2001,15 @@ static std::vector<CutPoint> select_local_dff_cutpoints(const std::vector<CutPoi
             out.push_back(*extra_cand);
     }
 
+    return dedup_local_dff_cutpoints(out);
+}
+
+static std::vector<CutPoint> select_partition_cutpoints(const std::vector<CutPoint> &all_cps)
+{
+    std::vector<CutPoint> out;
+    for (const auto &cp : all_cps)
+        if (cp.type == MatchType::DFF || cp.type == MatchType::DFF_PO || cp.type == MatchType::SUBCKT_PIPO)
+            out.push_back(cp);
     return dedup_local_dff_cutpoints(out);
 }
 
@@ -2093,7 +2103,7 @@ static std::vector<CutPoint> select_support_sliced_dff_cutpoints(RTLIL::Module *
                                                                  const CutPoint &candidate)
 {
     auto is_dff_cp = [](const CutPoint &cp) {
-        return cp.type == MatchType::DFF;
+        return cp.type == MatchType::DFF || cp.type == MatchType::DFF_PO;
     };
 
     auto collect_slice = [&](RTLIL::Module *mod, bool use_gold, pool<RTLIL::IdString> &selected) {
@@ -2507,6 +2517,101 @@ static void run_local_validate_shadow(const CheckConfig &conf, ModMap &mod_map,
 
     log("LOCAL_VALIDATE shadow summary: ran %d pair(s), passed %d, failed %d, skipped %d.\n",
         ran_pairs, passed_pairs, failed_pairs, skipped_pairs);
+}
+
+static Results partition_prove(const CheckConfig &conf, ModMap &mod_map,
+                               const dict<RTLIL::Module*, std::vector<CutPoint>> &gold2cutpoints)
+{
+    Results results;
+    string artifact_dir = match_artifact_dir(conf);
+    pool<RTLIL::IdString> processed_gold;
+
+    auto run_partition_pair = [&](RTLIL::Module *gold_mod, RTLIL::Module *gate_mod, bool allow_fallback) {
+        std::vector<CutPoint> local_cutpoints;
+        if (gold2cutpoints.count(gold_mod))
+            local_cutpoints = select_partition_cutpoints(gold2cutpoints.at(gold_mod));
+
+        bool proved = false;
+        if (!local_cutpoints.empty()) {
+            LocalValidateResult result = validate_partition_pair(conf, gold_mod, gate_mod, local_cutpoints);
+            append_jsonl(pair_artifact_path(artifact_dir, "local_validate", gold_mod, gate_mod, ".jsonl"), Json::object {
+                {"design", strip_backslash(conf.gold_mod->name)},
+                {"gold_mod", strip_backslash(gold_mod->name)},
+                {"gate_mod", strip_backslash(gate_mod->name)},
+                {"pair_id", result.pair_id},
+                {"signal_name", ""},
+                {"match_type", "PARTITION_SET"},
+                {"source", "partition_pair"},
+                {"score", 0},
+                {"margin", 0},
+                {"validator_result", result.proved ? "pass" : "fail"},
+                {"validator_backend", result.validator_backend},
+                {"used_bmc_fallback", result.used_bmc_fallback},
+                {"runtime_ms", result.runtime_ms},
+                {"accepted", false},
+                {"selected_cutpoints", result.selected_cutpoints},
+                {"local_exact_total", result.local_exact_total}
+            });
+            proved = result.proved;
+            log("PARTITION proof for %s: %s (%d DFF cutpoints, local exact=%d).\n",
+                result.pair_id.c_str(),
+                proved ? "\033[1;32mPASSED\033[0m" : "\033[1;31mFAILED\033[0m",
+                result.selected_cutpoints,
+                result.local_exact_total);
+        } else if (allow_fallback) {
+            CheckConfig conf_ = conf;
+            conf_.gold_mod = gold_mod;
+            conf_.gate_mod = gate_mod;
+            proved = abc_cec_module(conf_);
+            log("PARTITION fallback to module-pair proof for %s: %s.\n",
+                get_pair_id(gold_mod->name, gate_mod->name).c_str(),
+                proved ? "\033[1;32mPASSED\033[0m" : "\033[1;31mFAILED\033[0m");
+        }
+        return std::pair<bool, bool>{!local_cutpoints.empty(), proved};
+    };
+
+    log("Running partition-driven proving branch.\n");
+
+    if (mod_map.mod_map_gold.count(conf.gold_mod->name)) {
+        RTLIL::Module *top_gold = conf.design->module(conf.gold_mod->name);
+        RTLIL::Module *top_gate = conf.design->module(conf.gate_mod->name);
+        if (top_gold != nullptr && top_gate != nullptr) {
+            auto [used_partition, proved] = run_partition_pair(top_gold, top_gate, true);
+            processed_gold.insert(top_gold->name);
+            if (used_partition && proved) {
+                results.push_back({
+                    get_orignal_mod_name(top_gold->name, conf.gold_mod->name, conf.gold_prefix),
+                    true
+                });
+                log("PARTITION top-level proof succeeded, skipping descendant module pairs.\n");
+                return results;
+            }
+            results.push_back({
+                get_orignal_mod_name(top_gold->name, conf.gold_mod->name, conf.gold_prefix),
+                proved
+            });
+        }
+    }
+
+    for (const auto &[gold_name, gate_name] : mod_map.mod_map_gold) {
+        if (processed_gold.count(gold_name))
+            continue;
+        RTLIL::Module *gold_mod = conf.design->module(gold_name);
+        RTLIL::Module *gate_mod = conf.design->module(gate_name);
+        if (gold_mod == nullptr || gate_mod == nullptr)
+            continue;
+        if (gold_mod->get_blackbox_attribute() || gate_mod->get_blackbox_attribute())
+            continue;
+        auto [used_partition, proved] = run_partition_pair(gold_mod, gate_mod, true);
+        (void)used_partition;
+
+        results.push_back({
+            get_orignal_mod_name(gold_name, conf.gold_mod->name, conf.gold_prefix),
+            proved
+        });
+    }
+
+    return results;
 }
 
 static int exectue_and_check(const std::string & cmd, bool & correct,
@@ -4237,6 +4342,9 @@ struct GuideCheckPass : public Pass {
         log("    -local-validate-support-slice\n");
         log("        use candidate-centered support slicing for DFF suggestion validation.\n");
         log("\n");
+        log("    -partition-prove\n");
+        log("        use partition-driven proving for module pairs with authoritative DFF cutpoints.\n");
+        log("\n");
 	}
 	void execute(std::vector<std::string> args, RTLIL::Design *design) override
 	{
@@ -4257,6 +4365,7 @@ struct GuideCheckPass : public Pass {
         string accept_match_suggestions_file;
         bool local_validate_shadow = false;
         bool local_validate_support_slice = false;
+        bool partition_prove_mode = false;
         MlDumpConfig dump_cfg;
         
         size_t argidx;
@@ -4328,6 +4437,10 @@ struct GuideCheckPass : public Pass {
             }
             if (args[argidx] == "-local-validate-support-slice") {
                 local_validate_support_slice = true;
+                continue;
+            }
+            if (args[argidx] == "-partition-prove") {
+                partition_prove_mode = true;
                 continue;
             }
             break;
@@ -4537,7 +4650,10 @@ struct GuideCheckPass : public Pass {
         // propagate_child_ports(design_check);
 
         // conf.design = design_check;
-        cec_result_mod = abc_cec(conf);
+        if (partition_prove_mode)
+            cec_result_mod = partition_prove(conf, mod_map, gold2cutpoints);
+        else
+            cec_result_mod = abc_cec(conf);
 
         cec_result = true; 
         for(auto r: cec_result_mod){
