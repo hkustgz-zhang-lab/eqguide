@@ -307,6 +307,8 @@ struct LocalValidateResult
     double runtime_ms = 0;
     string validator_backend = "local_abc";
     bool used_bmc_fallback = false;
+    bool authoritative_ok = true;
+    string unsafe_reason;
 };
 
 struct NamedSig {
@@ -320,6 +322,10 @@ static std::vector<CutPoint> select_local_dff_cutpoints(const std::vector<CutPoi
                                                         const CutPoint *extra_cand = nullptr);
 static std::vector<CutPoint> select_partition_cutpoints(const std::vector<CutPoint> &all_cps);
 static std::vector<CutPoint> dedup_local_dff_cutpoints(const std::vector<CutPoint> &cutpoints);
+static bool can_materialize_cutpoint(RTLIL::Module *mod, const CutPoint &cp, bool use_gold);
+static std::vector<CutPoint> filter_materializable_cutpoints(RTLIL::Module *gold_mod,
+                                                             RTLIL::Module *gate_mod,
+                                                             const std::vector<CutPoint> &cutpoints);
 static std::vector<CutPoint> select_support_sliced_dff_cutpoints(RTLIL::Module *gold_mod,
                                                                  RTLIL::Module *gate_mod,
                                                                  const std::vector<CutPoint> &all_cps,
@@ -327,7 +333,8 @@ static std::vector<CutPoint> select_support_sliced_dff_cutpoints(RTLIL::Module *
 static LocalValidateResult validate_partition_pair(const CheckConfig &conf,
                                                    RTLIL::Module *gold_mod,
                                                    RTLIL::Module *gate_mod,
-                                                   const std::vector<CutPoint> &cutpoints);
+                                                   const std::vector<CutPoint> &cutpoints,
+                                                   bool allow_bmc_fallback = true);
 static bool bmcinduct_check(const CheckConfig &conf);
 
 static inline void print_timing_stat(const TimingStat& s) {
@@ -524,6 +531,18 @@ static std::vector<string> extract_failure_clues(const string &output)
             clues.push_back(clue);
 
     return clues;
+}
+
+static string partition_unsafe_reason(const CommandResult &command_result)
+{
+    const string &output = command_result.output;
+    if (output.find("Constant-0 drivers added to") != string::npos)
+        return "constant_completed_nets";
+    if (output.find("Name map: applied 0") != string::npos)
+        return "name_map_not_applied";
+    if (output.find("Networks are equivalent after structural hashing.") != string::npos)
+        return "structural_hash_only";
+    return "";
 }
 
 static CommandResult exec_capture(const string &cmd, const string &tempdir_name, const string &tag)
@@ -1203,6 +1222,11 @@ static dict<RTLIL::IdString, NamedSig> build_named_sigs(RTLIL::Design* design, R
     pool<RTLIL::Cell*> subckts;
     dict<RTLIL::SigBit, RTLIL::Cell*> ff_q_bits_map;
 
+    auto cell_has_ff_ports = [&](RTLIL::Cell *cell) {
+        return cell->hasPort(ID::Q) && cell->hasPort(ID::D) &&
+               (cell->is_builtin_ff() || cell->type == ID($anyinit) || cell->type.contains("DFF"));
+    };
+
     for (auto cell : m->cells()) {
         // subckt
         if (!yosys_celltypes.cell_known(cell->type)){
@@ -1210,17 +1234,10 @@ static dict<RTLIL::IdString, NamedSig> build_named_sigs(RTLIL::Design* design, R
             continue;
         }
 
-        if (!cell->is_builtin_ff() && cell->type != ID($anyinit))
+        if (!cell_has_ff_ports(cell))
             continue;
 
-        FfData ff(nullptr, cell);
-        if (!ff.has_clk && !ff.has_gclk){
-            assert(0);
-            continue;
-        }
-            
-
-        RTLIL::SigSpec q = ff.sig_q;
+        RTLIL::SigSpec q = cell->getPort(ID::Q);
         q = sigmap(q);
 
         for (int i = 0; i < GetSize(q); i++) {
@@ -1632,7 +1649,7 @@ static MatchResult match_signals_module(RTLIL::Design *design, RTLIL::Module *go
                     select_support_sliced_dff_cutpoints(gold_mod, gate_mod, result.cut_points, candidate_cutpoint) :
                     select_local_dff_cutpoints(result.cut_points, &candidate_cutpoint);
                 LocalValidateResult local_result =
-                    validate_partition_pair(conf, gold_mod, gate_mod, local_cutpoints);
+                    validate_partition_pair(conf, gold_mod, gate_mod, local_cutpoints, true);
                 append_jsonl(local_validate_jsonl, Json::object {
                     {"design", strip_backslash(conf.gold_mod->name)},
                     {"gold_mod", strip_backslash(gold_mod->name)},
@@ -1646,6 +1663,8 @@ static MatchResult match_signals_module(RTLIL::Design *design, RTLIL::Module *go
                     {"validator_result", local_result.proved ? "pass" : "fail"},
                     {"validator_backend", local_result.validator_backend},
                     {"used_bmc_fallback", local_result.used_bmc_fallback},
+                    {"authoritative_ok", local_result.authoritative_ok},
+                    {"unsafe_reason", local_result.unsafe_reason},
                     {"runtime_ms", local_result.runtime_ms},
                     {"accepted", local_result.proved},
                     {"selected_cutpoints", local_result.selected_cutpoints},
@@ -1841,11 +1860,16 @@ static void cutpoints_to_pi_po(RTLIL::Module *mod,
         return w;
     };
 
+    auto cell_has_ff_ports = [&](RTLIL::Cell *cell) {
+        return cell->hasPort(ID::Q) && cell->hasPort(ID::D) &&
+               (cell->is_builtin_ff() || cell->type == ID($anyinit) || cell->type.contains("DFF"));
+    };
+
     auto find_ff_by_qbit = [&](RTLIL::SigBit qbit) -> RTLIL::Cell* {
         if (!qbit.is_wire())
             return nullptr;
         for (auto cell : mod->cells()) {
-            if (!cell->is_builtin_ff() && cell->type != ID($anyinit))
+            if (!cell_has_ff_ports(cell))
                 continue;
             RTLIL::SigSpec qsig = sigmap(cell->getPort(ID::Q));
             for (int i = 0; i < GetSize(qsig); i++) {
@@ -1904,14 +1928,9 @@ static void cutpoints_to_pi_po(RTLIL::Module *mod,
         cut_q_bits.insert(qbit_mapped);
         cut_cells.insert(ff);
 
-        RTLIL::SigBit pi_bit = qbit_port;
-        if (qbit_port.wire->port_output) {
-            RTLIL::Wire *pi_wire = make_port_wire(cp.name, "_pi", 1, true, false);
-            pi_bit = RTLIL::SigBit(pi_wire);
-            pending_q_conns.emplace_back(RTLIL::SigSpec(qbit_port), RTLIL::SigSpec(pi_wire));
-        } else {
-            qbit_port.wire->port_input = true;
-        }
+        RTLIL::Wire *pi_wire = make_port_wire(cp.name, "_pi", 1, true, false);
+        RTLIL::SigBit pi_bit(pi_wire);
+        pending_q_conns.emplace_back(RTLIL::SigSpec(qbit_port), RTLIL::SigSpec(pi_wire));
         if (qbit_mapped != pi_bit)
             pending_q_conns.emplace_back(RTLIL::SigSpec(qbit_mapped), RTLIL::SigSpec(pi_bit));
 
@@ -2095,6 +2114,30 @@ static RTLIL::SigBit get_cutpoint_d_bit(RTLIL::Module *mod, const CutPoint &cp, 
 
     ok = true;
     return dsig[qidx];
+}
+
+static bool can_materialize_cutpoint(RTLIL::Module *mod, const CutPoint &cp, bool use_gold)
+{
+    if (cp.type == MatchType::SUBCKT_PIPO)
+        return true;
+    bool ok = false;
+    RTLIL::SigBit dbit = get_cutpoint_d_bit(mod, cp, use_gold, ok);
+    return ok && dbit.is_wire();
+}
+
+static std::vector<CutPoint> filter_materializable_cutpoints(RTLIL::Module *gold_mod,
+                                                             RTLIL::Module *gate_mod,
+                                                             const std::vector<CutPoint> &cutpoints)
+{
+    std::vector<CutPoint> out;
+    for (const auto &cp : cutpoints) {
+        if (!can_materialize_cutpoint(gold_mod, cp, true))
+            continue;
+        if (!can_materialize_cutpoint(gate_mod, cp, false))
+            continue;
+        out.push_back(cp);
+    }
+    return out;
 }
 
 static std::vector<CutPoint> select_support_sliced_dff_cutpoints(RTLIL::Module *gold_mod,
@@ -2328,7 +2371,7 @@ static void restrict_local_output_ports(RTLIL::Module *mod)
     mod->fixup_ports();
 }
 
-static bool abc_cec_module(const CheckConfig &conf, bool fatal = true);
+static bool abc_cec_module(const CheckConfig &conf, bool fatal = true, CommandResult *deciding_result = nullptr);
 
 static std::vector<RTLIL::Module*> topo_sort_modules(RTLIL::Design *design, const RTLIL::IdString& root);
 
@@ -2404,7 +2447,8 @@ static std::pair<RTLIL::Module*, RTLIL::Module*> partition_module(RTLIL::Design 
 static LocalValidateResult validate_partition_pair(const CheckConfig &conf,
                                                    RTLIL::Module *gold_mod,
                                                    RTLIL::Module *gate_mod,
-                                                   const std::vector<CutPoint> &cutpoints)
+                                                   const std::vector<CutPoint> &cutpoints,
+                                                   bool allow_bmc_fallback)
 {
     auto t_start = std::chrono::steady_clock::now();
     LocalValidateResult result;
@@ -2437,9 +2481,13 @@ static LocalValidateResult validate_partition_pair(const CheckConfig &conf,
 
     result.local_exact_total = local_match.stats.exact_total;
     result.ran = true;
-    result.proved = abc_cec_module(local_conf, false);
+    CommandResult local_abc_result;
+    result.proved = abc_cec_module(local_conf, false, &local_abc_result);
     result.validator_backend = "local_abc";
-    if (!result.proved) {
+    result.unsafe_reason = partition_unsafe_reason(local_abc_result);
+    if (!result.unsafe_reason.empty())
+        result.authoritative_ok = false;
+    if (!result.proved && allow_bmc_fallback) {
         bool residual_state = module_has_dff(local_conf.gold_mod, false) || module_has_dff(local_conf.gate_mod, true);
         bool residual_hierarchy = module_has_submodule(design_check, local_conf.gold_mod) || module_has_submodule(design_check, local_conf.gate_mod);
         if (residual_state || residual_hierarchy) {
@@ -2475,7 +2523,9 @@ static void run_local_validate_shadow(const CheckConfig &conf, ModMap &mod_map,
         if (!gold2cutpoints.count(gold_mod))
             continue;
 
-        std::vector<CutPoint> local_cutpoints = select_local_dff_cutpoints(gold2cutpoints.at(gold_mod));
+        std::vector<CutPoint> local_cutpoints =
+            filter_materializable_cutpoints(gold_mod, gate_mod,
+                select_local_dff_cutpoints(gold2cutpoints.at(gold_mod)));
         if (local_cutpoints.empty()) {
             skipped_pairs++;
             log("LOCAL_VALIDATE shadow skipped for %s: no DFF cutpoints.\n",
@@ -2483,7 +2533,7 @@ static void run_local_validate_shadow(const CheckConfig &conf, ModMap &mod_map,
             continue;
         }
 
-        LocalValidateResult result = validate_partition_pair(conf, gold_mod, gate_mod, local_cutpoints);
+        LocalValidateResult result = validate_partition_pair(conf, gold_mod, gate_mod, local_cutpoints, false);
         append_jsonl(pair_artifact_path(artifact_dir, "local_validate", gold_mod, gate_mod, ".jsonl"), Json::object {
             {"design", strip_backslash(conf.gold_mod->name)},
             {"gold_mod", strip_backslash(gold_mod->name)},
@@ -2497,6 +2547,8 @@ static void run_local_validate_shadow(const CheckConfig &conf, ModMap &mod_map,
             {"validator_result", result.proved ? "pass" : "fail"},
             {"validator_backend", result.validator_backend},
             {"used_bmc_fallback", result.used_bmc_fallback},
+            {"authoritative_ok", result.authoritative_ok},
+            {"unsafe_reason", result.unsafe_reason},
             {"runtime_ms", result.runtime_ms},
             {"accepted", false},
             {"selected_cutpoints", result.selected_cutpoints},
@@ -2525,15 +2577,19 @@ static Results partition_prove(const CheckConfig &conf, ModMap &mod_map,
     Results results;
     string artifact_dir = match_artifact_dir(conf);
     pool<RTLIL::IdString> processed_gold;
+    auto is_hierarchical_pair = [&](RTLIL::Module *gold_mod, RTLIL::Module *gate_mod) {
+        return module_has_submodule(conf.design, gold_mod) || module_has_submodule(conf.design, gate_mod);
+    };
 
     auto run_partition_pair = [&](RTLIL::Module *gold_mod, RTLIL::Module *gate_mod, bool allow_fallback) {
         std::vector<CutPoint> local_cutpoints;
         if (gold2cutpoints.count(gold_mod))
-            local_cutpoints = select_partition_cutpoints(gold2cutpoints.at(gold_mod));
+            local_cutpoints = filter_materializable_cutpoints(gold_mod, gate_mod,
+                select_partition_cutpoints(gold2cutpoints.at(gold_mod)));
 
         bool proved = false;
         if (!local_cutpoints.empty()) {
-            LocalValidateResult result = validate_partition_pair(conf, gold_mod, gate_mod, local_cutpoints);
+            LocalValidateResult result = validate_partition_pair(conf, gold_mod, gate_mod, local_cutpoints, true);
             append_jsonl(pair_artifact_path(artifact_dir, "local_validate", gold_mod, gate_mod, ".jsonl"), Json::object {
                 {"design", strip_backslash(conf.gold_mod->name)},
                 {"gold_mod", strip_backslash(gold_mod->name)},
@@ -2547,12 +2603,22 @@ static Results partition_prove(const CheckConfig &conf, ModMap &mod_map,
                 {"validator_result", result.proved ? "pass" : "fail"},
                 {"validator_backend", result.validator_backend},
                 {"used_bmc_fallback", result.used_bmc_fallback},
+                {"authoritative_ok", result.authoritative_ok},
+                {"unsafe_reason", result.unsafe_reason},
                 {"runtime_ms", result.runtime_ms},
                 {"accepted", false},
                 {"selected_cutpoints", result.selected_cutpoints},
                 {"local_exact_total", result.local_exact_total}
             });
             proved = result.proved;
+            if (result.proved && !result.authoritative_ok && allow_fallback) {
+                CheckConfig conf_ = conf;
+                conf_.gold_mod = gold_mod;
+                conf_.gate_mod = gate_mod;
+                log("PARTITION proof for %s is non-authoritative (%s); falling back to module-pair proof.\n",
+                    result.pair_id.c_str(), result.unsafe_reason.c_str());
+                proved = abc_cec_module(conf_);
+            }
             log("PARTITION proof for %s: %s (%d DFF cutpoints, local exact=%d).\n",
                 result.pair_id.c_str(),
                 proved ? "\033[1;32mPASSED\033[0m" : "\033[1;31mFAILED\033[0m",
@@ -2578,18 +2644,17 @@ static Results partition_prove(const CheckConfig &conf, ModMap &mod_map,
         if (top_gold != nullptr && top_gate != nullptr) {
             auto [used_partition, proved] = run_partition_pair(top_gold, top_gate, true);
             processed_gold.insert(top_gold->name);
-            if (used_partition && proved) {
+            bool authoritative_top = !is_hierarchical_pair(top_gold, top_gate);
+            if (used_partition && !authoritative_top) {
+                log("PARTITION top-level proof for %s is non-authoritative in hierarchical mode; continuing descendant proofs.\n",
+                    get_pair_id(top_gold->name, top_gate->name).c_str());
+            }
+            if (authoritative_top || !used_partition) {
                 results.push_back({
                     get_orignal_mod_name(top_gold->name, conf.gold_mod->name, conf.gold_prefix),
-                    true
+                    proved
                 });
-                log("PARTITION top-level proof succeeded, skipping descendant module pairs.\n");
-                return results;
             }
-            results.push_back({
-                get_orignal_mod_name(top_gold->name, conf.gold_mod->name, conf.gold_prefix),
-                proved
-            });
         }
     }
 
@@ -3412,7 +3477,7 @@ static bool abc_check(const CheckConfig &conf, bool use_blif=false, string check
 
 
 
-static bool abc_cec_module(const CheckConfig &conf, bool fatal){
+static bool abc_cec_module(const CheckConfig &conf, bool fatal, CommandResult *deciding_result){
     auto count_module_dffs = [](RTLIL::Module *mod, bool gate_side) {
         int count = 0;
         for (auto cell : mod->cells()) {
@@ -3633,6 +3698,8 @@ static bool abc_cec_module(const CheckConfig &conf, bool fatal){
     dump_sched_sample(pair_record, match_stats, trace);
     if (!solved && !last_action.empty())
         emit_failure_packet(conf, "ABC", last_action, last_result, trace);
+    if (deciding_result != nullptr)
+        *deciding_result = last_result;
 
     auto t1 = clock::now();
     timing_stat.abc_cec_ms += std::chrono::duration_cast<std::chrono::milliseconds>(t1-t0).count();
