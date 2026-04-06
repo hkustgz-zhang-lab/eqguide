@@ -1,5 +1,5 @@
-#ifndef YOSYS_PASSES_GUIDE_CHECK_CORE_H
-#define YOSYS_PASSES_GUIDE_CHECK_CORE_H
+#ifndef YOSYS_PASSES_GUIDE_CHECK_CHECK_H
+#define YOSYS_PASSES_GUIDE_CHECK_CHECK_H
 
 #include "passes/guide/check/shared.h"
 

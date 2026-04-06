@@ -2,7 +2,7 @@
 #define YOSYS_PASSES_GUIDE_CHECK_RETIME_MULTIPLIER_H
 
 #include "passes/guide/check/shared.h"
-#include "passes/guide/check/core.h"
+#include "passes/guide/check/check.h"
 
 YOSYS_NAMESPACE_BEGIN
 namespace guide_check {

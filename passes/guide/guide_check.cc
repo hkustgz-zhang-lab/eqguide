@@ -51,7 +51,7 @@
 USING_YOSYS_NAMESPACE
 
 #include "passes/guide/check/shared.h"
-#include "passes/guide/check/core.h"
+#include "passes/guide/check/check.h"
 #include "passes/guide/check/failure_exec.h"
 #include "passes/guide/check/scheduler.h"
 #include "passes/guide/check/matching.h"
