@@ -127,8 +127,6 @@ def remove_old_artifacts(case_dir: pathlib.Path) -> None:
         "match_validated_*.txt",
         "match_suggestions_*.jsonl",
         "local_validate_*.jsonl",
-        "match_suggestions.json",
-        "match.jsonl",
     ):
         for path in case_dir.glob(pattern):
             if path.is_file():
@@ -159,13 +157,15 @@ def main() -> int:
     rejected_dff_suggestions = 0
     local_validator_runs = 0
     local_validator_runtime_ms = 0.0
+    local_bmc_fallback_runs = 0
     shadow_validator_runs = 0
     shadow_validator_runtime_ms = 0.0
+    shadow_bmc_fallback_runs = 0
     selected_cutpoints = []
     local_exact_totals = []
 
     if args.model or args.suggestions_file:
-        suggestions_path = case_dir / "match_suggestions.json"
+        suggestions_path = case_dir / "match_suggestions_replay.json"
         if args.suggestions_file:
             shutil.copyfile(pathlib.Path(args.suggestions_file).resolve(), suggestions_path)
         else:
@@ -180,7 +180,7 @@ def main() -> int:
                 "--snapshot",
                 args.snapshot,
                 "--output",
-                "match_suggestions.json",
+                suggestions_path.name,
             ]
             if args.min_score is not None:
                 cmd.extend(["--min-score", str(args.min_score)])
@@ -197,7 +197,7 @@ def main() -> int:
             rewrite_guide_check(
                 verific,
                 (["-local-validate-support-slice"] if args.support_slice else []) +
-                ["-guide-accept-match-suggestions", "match_suggestions.json"],
+                ["-guide-accept-match-suggestions", suggestions_path.name],
                 ["-guide-dump-match", "-guide-dump-sched", "-guide-dump-fail"],
             ),
             args.yosys,
@@ -211,6 +211,8 @@ def main() -> int:
                     if row.get("validator_result") in {"pass", "fail"}:
                         shadow_validator_runs += 1
                         shadow_validator_runtime_ms += float(row.get("runtime_ms", 0.0))
+                        if row.get("used_bmc_fallback"):
+                            shadow_bmc_fallback_runs += 1
                     continue
                 if source != "ml_raw":
                     continue
@@ -223,6 +225,8 @@ def main() -> int:
                 if row.get("validator_result") in {"pass", "fail"}:
                     local_validator_runs += 1
                     local_validator_runtime_ms += float(row.get("runtime_ms", 0.0))
+                    if row.get("used_bmc_fallback"):
+                        local_bmc_fallback_runs += 1
                     if "selected_cutpoints" in row:
                         selected_cutpoints.append(float(row["selected_cutpoints"]))
                     if "local_exact_total" in row:
@@ -253,12 +257,14 @@ def main() -> int:
         "skipped_dff_suggestions": skipped_dff_suggestions,
         "local_validator_runs": local_validator_runs,
         "local_validator_runtime_ms": local_validator_runtime_ms,
+        "local_bmc_fallback_runs": local_bmc_fallback_runs,
         "avg_selected_cutpoints": avg(selected_cutpoints),
         "median_selected_cutpoints": median(selected_cutpoints),
         "avg_local_exact_total": avg(local_exact_totals),
         "slice_mode": "support_slice" if args.support_slice else "all_dff",
         "shadow_validator_runs": shadow_validator_runs,
         "shadow_validator_runtime_ms": shadow_validator_runtime_ms,
+        "shadow_bmc_fallback_runs": shadow_bmc_fallback_runs,
         "final_pass_fail": accepted["final_result"] if accepted is not None else shadow["final_result"],
         "baseline_wall_time_ms": baseline["wall_time_ms"],
         "shadow_wall_time_ms": shadow["wall_time_ms"],
