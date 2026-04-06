@@ -279,8 +279,8 @@ string match_artifact_dir(const CheckConfig &conf)
 {
     if (conf.dump_cfg.dump_match && !conf.dump_cfg.match_jsonl.empty())
         return path_dirname(conf.dump_cfg.match_jsonl);
-    if (!conf.accept_match_suggestions_file.empty())
-        return path_dirname(conf.accept_match_suggestions_file);
+    if (!conf.accept_sugs_file.empty())
+        return path_dirname(conf.accept_sugs_file);
     return conf.tempdir_name;
 }
 
@@ -328,11 +328,11 @@ MatchResult match_signals_module(RTLIL::Design *design, RTLIL::Module *gold_mod,
     string pair_id = get_pair_id(gold_mod->name, gate_mod->name);
     string match_file = conf.tempdir_name + "/match_" + RTLIL::unescape_id(gold_mod->name) + "_" + RTLIL::unescape_id(gate_mod->name) + ".txt";
     result.stats.match_file = match_file;
-    string artifact_dir = match_artifact_dir(conf);
-    string match_exact_file = pair_artifact_path(artifact_dir, "match_exact", gold_mod, gate_mod, ".txt");
-    string match_validated_file = pair_artifact_path(artifact_dir, "match_validated", gold_mod, gate_mod, ".txt");
-    string match_suggestions_jsonl = pair_artifact_path(artifact_dir, "match_suggestions", gold_mod, gate_mod, ".jsonl");
-    string local_validate_jsonl = pair_artifact_path(artifact_dir, "local_validate", gold_mod, gate_mod, ".jsonl");
+    string art_dir = match_artifact_dir(conf);
+    string exact_file = pair_artifact_path(art_dir, "match_exact", gold_mod, gate_mod, ".txt");
+    string vali_file = pair_artifact_path(art_dir, "match_validated", gold_mod, gate_mod, ".txt");
+    string sugs_jsonl = pair_artifact_path(art_dir, "match_suggestions", gold_mod, gate_mod, ".jsonl");
+    string vali_jsonl = pair_artifact_path(art_dir, "local_validate", gold_mod, gate_mod, ".jsonl");
 
     FILE *f = nullptr;
     FILE *f_exact = nullptr;
@@ -340,9 +340,9 @@ MatchResult match_signals_module(RTLIL::Design *design, RTLIL::Module *gold_mod,
     if (emit_match_file)
         f = fopen(match_file.c_str(), "w");
     if (emit_match_file)
-        f_exact = fopen(match_exact_file.c_str(), "w");
+        f_exact = fopen(exact_file.c_str(), "w");
     if (emit_match_file)
-        f_validated = fopen(match_validated_file.c_str(), "w");
+        f_validated = fopen(vali_file.c_str(), "w");
 
     pool<RTLIL::IdString> matched_gold;
     pool<RTLIL::IdString> matched_gate;
@@ -387,8 +387,8 @@ MatchResult match_signals_module(RTLIL::Design *design, RTLIL::Module *gold_mod,
     int applied_suggestions = 0;
     int validated_dff_suggestions = 0;
     int rejected_dff_suggestions = 0;
-    if (emit_match_file && !conf.accept_match_suggestions_file.empty()) {
-        Json::array accepted = load_match_suggestions_file(conf.accept_match_suggestions_file);
+    if (emit_match_file && !conf.accept_sugs_file.empty()) {
+        Json::array accepted = load_match_suggestions_file(conf.accept_sugs_file);
         for (auto &item : accepted) {
             if (!item.is_object())
                 continue;
@@ -400,7 +400,7 @@ MatchResult match_signals_module(RTLIL::Design *design, RTLIL::Module *gold_mod,
             RTLIL::IdString gold_name = RTLIL::escape_id(item["gold_name"].string_value());
             RTLIL::IdString gate_name = RTLIL::escape_id(item["suggested_gate_name"].string_value());
             if (item["score_margin"].number_value() <= 0) {
-                append_jsonl(local_validate_jsonl, Json::object {
+                append_jsonl(vali_jsonl, Json::object {
                     {"design", strip_backslash(conf.gold_mod->name)},
                     {"gold_mod", strip_backslash(gold_mod->name)},
                     {"gate_mod", strip_backslash(gate_mod->name)},
@@ -460,13 +460,13 @@ MatchResult match_signals_module(RTLIL::Design *design, RTLIL::Module *gold_mod,
                     kentry.wire_name, kentry.bit_index};
 
             if (gentry.type == MatchType::DFF || gentry.type == MatchType::DFF_PO) {
-                std::vector<CutPoint> local_cutpoints =
-                    conf.local_validate_support_slice ?
+                std::vector<CutPoint> local_cps =
+                    conf.local_vali_slice ?
                     select_support_sliced_dff_cutpoints(gold_mod, gate_mod, result.cut_points, candidate_cutpoint) :
                     select_local_dff_cutpoints(result.cut_points, &candidate_cutpoint);
-                LocalValidateResult local_result =
-                    validate_partition_pair(conf, gold_mod, gate_mod, local_cutpoints, true);
-                append_jsonl(local_validate_jsonl, Json::object {
+                LocalValidateResult vali =
+                    validate_partition_pair(conf, gold_mod, gate_mod, local_cps, true);
+                append_jsonl(vali_jsonl, Json::object {
                     {"design", strip_backslash(conf.gold_mod->name)},
                     {"gold_mod", strip_backslash(gold_mod->name)},
                     {"gate_mod", strip_backslash(gate_mod->name)},
@@ -476,41 +476,41 @@ MatchResult match_signals_module(RTLIL::Design *design, RTLIL::Module *gold_mod,
                     {"source", "ml_raw"},
                     {"score", item["score"].number_value()},
                     {"margin", item["score_margin"].number_value()},
-                    {"validator_result", local_result.proved ? "pass" : "fail"},
-                    {"validator_backend", local_result.validator_backend},
-                    {"used_bmc_fallback", local_result.used_bmc_fallback},
-                    {"authoritative_ok", local_result.authoritative_ok},
-                    {"authoritative_reason", local_result.authoritative_reason},
-                    {"unsafe_reason", local_result.unsafe_reason},
-                    {"fallback_reason", local_result.fallback_reason},
-                    {"runtime_ms", local_result.runtime_ms},
-                    {"accepted", local_result.proved},
-                    {"selected_cutpoints", local_result.selected_cutpoints},
-                    {"local_exact_total", local_result.local_exact_total},
-                    {"boundary_map_expected", local_result.boundary_map_expected},
-                    {"boundary_map_applied", local_result.boundary_map_applied},
-                    {"constant_completed_net_count", local_result.constant_completed_net_count},
-                    {"module_interface_input_count", local_result.module_interface_input_count},
-                    {"state_cut_input_count", local_result.state_cut_input_count},
-                    {"child_boundary_input_count", local_result.child_boundary_input_count},
-                    {"passthrough_alias_input_count", local_result.passthrough_alias_input_count},
-                    {"slice_or_concat_residual_count", local_result.slice_or_concat_residual_count},
-                    {"traceable_residual_input_count", local_result.traceable_residual_input_count},
-                    {"promoted_from_trace_count", local_result.promoted_from_trace_count},
-                    {"promoted_internal_boundary_count", local_result.promoted_internal_boundary_count},
-                    {"unresolved_internal_input_count", local_result.unresolved_internal_input_count},
-                    {"unresolved_untraceable_input_count", local_result.unresolved_untraceable_input_count},
-                    {"constant_completed_traceable_count", local_result.constant_completed_traceable_count},
-                    {"constant_completed_untraceable_count", local_result.constant_completed_untraceable_count},
-                    {"promoted_internal_boundary_samples", string_array_to_json(local_result.promoted_internal_boundary_samples)},
-                    {"unresolved_internal_input_samples", string_array_to_json(local_result.unresolved_internal_input_samples)},
-                    {"constant_completed_samples", string_array_to_json(local_result.constant_completed_samples)},
-                    {"unresolved_internal_boundaries", local_result.unresolved_internal_boundaries},
-                    {"child_boundary_count", local_result.child_boundary_count},
-                    {"unresolved_child_boundaries", local_result.unresolved_child_boundaries},
-                    {"slice_mode", conf.local_validate_support_slice ? "support_slice" : "all_dff"}
+                    {"validator_result", vali.proved ? "pass" : "fail"},
+                    {"validator_backend", vali.vali_backend},
+                    {"used_bmc_fallback", vali.used_bmc_fb},
+                    {"authoritative_ok", vali.auth_ok},
+                    {"authoritative_reason", vali.auth_why},
+                    {"unsafe_reason", vali.unsafe_why},
+                    {"fallback_reason", vali.fb_why},
+                    {"runtime_ms", vali.runtime_ms},
+                    {"accepted", vali.proved},
+                    {"selected_cutpoints", vali.cut_cnt},
+                    {"local_exact_total", vali.exact_cnt},
+                    {"boundary_map_expected", vali.bnd_map_exp},
+                    {"boundary_map_applied", vali.bnd_map_app},
+                    {"constant_completed_net_count", vali.const_comp_net_cnt},
+                    {"module_interface_input_count", vali.iface_in_cnt},
+                    {"state_cut_input_count", vali.state_in_cnt},
+                    {"child_boundary_input_count", vali.child_in_cnt},
+                    {"passthrough_alias_input_count", vali.alias_in_cnt},
+                    {"slice_or_concat_residual_count", vali.slice_res_cnt},
+                    {"traceable_residual_input_count", vali.trace_res_in_cnt},
+                    {"promoted_from_trace_count", vali.trace_prom_cnt},
+                    {"promoted_internal_boundary_count", vali.prom_int_bnd_cnt},
+                    {"unresolved_internal_input_count", vali.unr_int_in_cnt},
+                    {"unresolved_untraceable_input_count", vali.unr_untrace_in_cnt},
+                    {"constant_completed_traceable_count", vali.const_comp_trace_cnt},
+                    {"constant_completed_untraceable_count", vali.const_comp_untrace_cnt},
+                    {"promoted_internal_boundary_samples", string_array_to_json(vali.prom_int_bnd_samps)},
+                    {"unresolved_internal_input_samples", string_array_to_json(vali.unr_int_in_samps)},
+                    {"constant_completed_samples", string_array_to_json(vali.const_comp_samps)},
+                    {"unresolved_internal_boundaries", vali.unr_int_bnd_cnt},
+                    {"child_boundary_count", vali.child_bnd_cnt},
+                    {"unresolved_child_boundaries", vali.unr_child_bnd_cnt},
+                    {"slice_mode", conf.local_vali_slice ? "support_slice" : "all_dff"}
                 });
-                if (!local_result.proved) {
+                if (!vali.proved) {
                     rejected_dff_suggestions++;
                     log("Rejected DFF suggestion %s -> %s for pair %s: local validation failed.\n",
                         gold_name.c_str(), gate_name.c_str(), pair_id.c_str());
@@ -539,7 +539,7 @@ MatchResult match_signals_module(RTLIL::Design *design, RTLIL::Module *gold_mod,
         result.stats.unmatched_gold = GetSize(gold) - GetSize(matched_gold);
         result.stats.unmatched_gate = GetSize(gate) - GetSize(matched_gate);
         if (conf.telemetry != nullptr && applied_suggestions > 0)
-            conf.telemetry->pair_applied_match_suggestions[pair_id] = applied_suggestions;
+            conf.telemetry->pair_applied_sugs[pair_id] = applied_suggestions;
         if (applied_suggestions > 0 || validated_dff_suggestions > 0 || rejected_dff_suggestions > 0)
             log("Applied %d match suggestions for pair %s (%d DFF validated, %d DFF rejected).\n",
                 applied_suggestions, pair_id.c_str(),
@@ -643,7 +643,7 @@ MatchResult match_signals_module(RTLIL::Design *design, RTLIL::Module *gold_mod,
                     {"score_margin", score_margin}
                 };
                 suggestions.push_back(suggestion);
-                append_jsonl(match_suggestions_jsonl, suggestion);
+                append_jsonl(sugs_jsonl, suggestion);
                 if (conf.telemetry != nullptr && snapshot_name == "pre_async")
                     conf.telemetry->match_suggestions.push_back(suggestion);
             }

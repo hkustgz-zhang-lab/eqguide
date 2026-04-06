@@ -63,19 +63,19 @@ struct BitTraceInfo
 
 struct ShellAuditInfo
 {
-    int module_interface_input_count = 0;
-    int state_cut_input_count = 0;
-    int child_boundary_input_count = 0;
-    int passthrough_alias_input_count = 0;
-    int slice_or_concat_residual_count = 0;
-    int traceable_residual_input_count = 0;
-    int promoted_from_trace_count = 0;
-    int promoted_internal_boundary_count = 0;
-    int unresolved_internal_input_count = 0;
-    int unresolved_untraceable_input_count = 0;
-    int unresolved_internal_boundaries = 0;
-    std::vector<string> promoted_internal_boundary_samples;
-    std::vector<string> unresolved_internal_input_samples;
+    int iface_in_cnt = 0;
+    int state_in_cnt = 0;
+    int child_in_cnt = 0;
+    int alias_in_cnt = 0;
+    int slice_res_cnt = 0;
+    int trace_res_in_cnt = 0;
+    int trace_prom_cnt = 0;
+    int prom_int_bnd_cnt = 0;
+    int unr_int_in_cnt = 0;
+    int unr_untrace_in_cnt = 0;
+    int unr_int_bnd_cnt = 0;
+    std::vector<string> prom_int_bnd_samps;
+    std::vector<string> unr_int_in_samps;
 };
 
 struct ConstantCompletionAudit
@@ -410,7 +410,7 @@ int parse_name_map_applied(const string &output)
     return atoi(output.c_str() + pos);
 }
 
-int parse_constant_completed_net_count(const string &output)
+int parse_const_comp_net_cnt(const string &output)
 {
     int total = 0;
     const string pattern = "Constant-0 drivers added to ";
@@ -789,12 +789,12 @@ static void apply_trace_boundary_canonical_names(RTLIL::Module *gold_mod, RTLIL:
 }
 
 static ShellAuditInfo audit_shell_inputs(RTLIL::Module *gold_local,
-                                         const pool<string> &module_interface_inputs,
-                                         const pool<string> &state_cut_inputs,
-                                         const pool<string> &child_boundary_inputs,
-                                         const pool<string> &passthrough_alias_inputs,
-                                         const pool<string> &promoted_internal_inputs,
-                                         const dict<string, BitTraceInfo> &trace_info_by_bit)
+                                         const pool<string> &iface_in,
+                                         const pool<string> &state_in,
+                                         const pool<string> &child_in,
+                                         const pool<string> &alias_in,
+                                         const pool<string> &prom_in,
+                                         const dict<string, BitTraceInfo> &trace_by_bit)
 {
     ShellAuditInfo info;
     pool<string> seen_input_bits;
@@ -808,45 +808,45 @@ static ShellAuditInfo audit_shell_inputs(RTLIL::Module *gold_local,
                 continue;
             seen_input_bits.insert(bit_name);
 
-            if (module_interface_inputs.count(bit_name)) {
-                info.module_interface_input_count++;
+            if (iface_in.count(bit_name)) {
+                info.iface_in_cnt++;
                 continue;
             }
-            if (state_cut_inputs.count(bit_name)) {
-                info.state_cut_input_count++;
+            if (state_in.count(bit_name)) {
+                info.state_in_cnt++;
                 continue;
             }
-            if (child_boundary_inputs.count(bit_name)) {
-                info.child_boundary_input_count++;
+            if (child_in.count(bit_name)) {
+                info.child_in_cnt++;
                 continue;
             }
-            if (passthrough_alias_inputs.count(bit_name)) {
-                info.passthrough_alias_input_count++;
+            if (alias_in.count(bit_name)) {
+                info.alias_in_cnt++;
                 continue;
             }
-            if (promoted_internal_inputs.count(bit_name)) {
-                info.promoted_internal_boundary_count++;
-                info.promoted_from_trace_count++;
-                add_sample_name(info.promoted_internal_boundary_samples, bit_name, 8);
+            if (prom_in.count(bit_name)) {
+                info.prom_int_bnd_cnt++;
+                info.trace_prom_cnt++;
+                add_sample_name(info.prom_int_bnd_samps, bit_name, 8);
                 continue;
             }
 
-            if (trace_info_by_bit.count(bit_name)) {
-                const auto &trace = trace_info_by_bit.at(bit_name);
+            if (trace_by_bit.count(bit_name)) {
+                const auto &trace = trace_by_bit.at(bit_name);
                 if (trace.traceable)
-                    info.traceable_residual_input_count++;
+                    info.trace_res_in_cnt++;
                 if (trace.kind == "slice_or_concat_residual")
-                    info.slice_or_concat_residual_count++;
+                    info.slice_res_cnt++;
             }
 
-            info.unresolved_internal_input_count++;
-            if (!trace_info_by_bit.count(bit_name) || !trace_info_by_bit.at(bit_name).traceable)
-                info.unresolved_untraceable_input_count++;
-            add_sample_name(info.unresolved_internal_input_samples, bit_name, 8);
+            info.unr_int_in_cnt++;
+            if (!trace_by_bit.count(bit_name) || !trace_by_bit.at(bit_name).traceable)
+                info.unr_untrace_in_cnt++;
+            add_sample_name(info.unr_int_in_samps, bit_name, 8);
         }
     }
 
-    info.unresolved_internal_boundaries = info.unresolved_internal_input_count;
+    info.unr_int_bnd_cnt = info.unr_int_in_cnt;
     return info;
 }
 
@@ -903,14 +903,14 @@ static ConstantCompletionAudit audit_constant_completed_nets(RTLIL::Module *gold
 void refine_shell_closure(PartitionedPair &pair, RTLIL::Module *gold_orig, RTLIL::Module *gate_orig,
                           const std::vector<CutPoint> &cutpoints)
 {
-    pool<string> module_interface_inputs = collect_module_interface_input_bit_names(gold_orig);
-    pool<string> state_cut_inputs = collect_state_cut_input_bit_names(cutpoints);
+    pool<string> iface_in = collect_module_interface_input_bit_names(gold_orig);
+    pool<string> state_in = collect_state_cut_input_bit_names(cutpoints);
     BitTraceDB gold_db = build_bit_trace_db(gold_orig);
     BitTraceDB gate_db = build_bit_trace_db(gate_orig);
 
     auto base_allowed = [&]() {
-        pool<string> allowed = module_interface_inputs;
-        for (const auto &bit_name : state_cut_inputs)
+        pool<string> allowed = iface_in;
+        for (const auto &bit_name : state_in)
             allowed.insert(bit_name);
         for (const auto &bit_name : pair.boundary_bit_names)
             allowed.insert(bit_name);
@@ -919,8 +919,8 @@ void refine_shell_closure(PartitionedPair &pair, RTLIL::Module *gold_orig, RTLIL
         return allowed;
     };
 
-    pool<string> passthrough_alias_inputs;
-    dict<string, BitTraceInfo> trace_info_by_bit;
+    pool<string> alias_in;
+    dict<string, BitTraceInfo> trace_by_bit;
 
     auto classify_residual_inputs = [&](RTLIL::Module *mod, const BitTraceDB &db,
                                         const pool<string> &allowed, dict<string, BitTraceInfo> &out) {
@@ -940,9 +940,9 @@ void refine_shell_closure(PartitionedPair &pair, RTLIL::Module *gold_orig, RTLIL
     for (const auto &it : gold_trace_info) {
         const string &bit_name = it.first;
         const auto &trace = it.second;
-        trace_info_by_bit[bit_name] = trace;
+        trace_by_bit[bit_name] = trace;
         if (trace.kind == "passthrough_alias_input" || trace.kind == "module_interface_input")
-            passthrough_alias_inputs.insert(bit_name);
+            alias_in.insert(bit_name);
         if (trace.traceable && trace.promotable && !trace.source_id.empty())
             gold_promotable_by_source[trace.source_id].push_back(bit_name);
     }
@@ -978,41 +978,41 @@ void refine_shell_closure(PartitionedPair &pair, RTLIL::Module *gold_orig, RTLIL
     }
 
     allowed = base_allowed();
-    for (const auto &bit_name : passthrough_alias_inputs)
+    for (const auto &bit_name : alias_in)
         allowed.insert(bit_name);
 
     gold_trace_info.clear();
-    trace_info_by_bit.clear();
+    trace_by_bit.clear();
     classify_residual_inputs(pair.gold_local, gold_db, allowed, gold_trace_info);
     for (const auto &it : gold_trace_info)
-        trace_info_by_bit[it.first] = it.second;
+        trace_by_bit[it.first] = it.second;
 
     pair.allowed_shell_input_bit_names = allowed;
-    for (const auto &bit_name : passthrough_alias_inputs)
+    for (const auto &bit_name : alias_in)
         pair.allowed_shell_input_bit_names.insert(bit_name);
 
-    ShellAuditInfo audit = audit_shell_inputs(pair.gold_local, module_interface_inputs, state_cut_inputs,
-                                              pair.boundary_bit_names, passthrough_alias_inputs,
-                                              pair.promoted_internal_boundary_bit_names, trace_info_by_bit);
-    pair.module_interface_input_count = audit.module_interface_input_count;
-    pair.state_cut_input_count = audit.state_cut_input_count;
-    pair.child_boundary_input_count = audit.child_boundary_input_count;
-    pair.passthrough_alias_input_count = audit.passthrough_alias_input_count;
-    pair.slice_or_concat_residual_count = audit.slice_or_concat_residual_count;
-    pair.traceable_residual_input_count = audit.traceable_residual_input_count;
-    pair.promoted_from_trace_count = audit.promoted_from_trace_count;
-    pair.promoted_internal_boundary_count = audit.promoted_internal_boundary_count;
-    pair.unresolved_internal_input_count = audit.unresolved_internal_input_count;
-    pair.unresolved_untraceable_input_count = audit.unresolved_untraceable_input_count;
-    pair.promoted_internal_boundary_samples = audit.promoted_internal_boundary_samples;
-    pair.unresolved_internal_input_samples = audit.unresolved_internal_input_samples;
-    pair.unresolved_internal_boundaries = audit.unresolved_internal_boundaries;
+    ShellAuditInfo audit = audit_shell_inputs(pair.gold_local, iface_in, state_in,
+                                              pair.boundary_bit_names, alias_in,
+                                              pair.promoted_internal_boundary_bit_names, trace_by_bit);
+    pair.iface_in_cnt = audit.iface_in_cnt;
+    pair.state_in_cnt = audit.state_in_cnt;
+    pair.child_in_cnt = audit.child_in_cnt;
+    pair.alias_in_cnt = audit.alias_in_cnt;
+    pair.slice_res_cnt = audit.slice_res_cnt;
+    pair.trace_res_in_cnt = audit.trace_res_in_cnt;
+    pair.trace_prom_cnt = audit.trace_prom_cnt;
+    pair.prom_int_bnd_cnt = audit.prom_int_bnd_cnt;
+    pair.unr_int_in_cnt = audit.unr_int_in_cnt;
+    pair.unr_untrace_in_cnt = audit.unr_untrace_in_cnt;
+    pair.prom_int_bnd_samps = audit.prom_int_bnd_samps;
+    pair.unr_int_in_samps = audit.unr_int_in_samps;
+    pair.unr_int_bnd_cnt = audit.unr_int_bnd_cnt;
 
     ConstantCompletionAudit cc_audit =
         audit_constant_completed_nets(pair.gold_local, pair.gate_local, gold_db, gate_db);
-    pair.constant_completed_traceable_count = cc_audit.traceable_count;
-    pair.constant_completed_untraceable_count = cc_audit.untraceable_count;
-    pair.constant_completed_samples = cc_audit.samples;
+    pair.const_comp_trace_cnt = cc_audit.traceable_count;
+    pair.const_comp_untrace_cnt = cc_audit.untraceable_count;
+    pair.const_comp_samps = cc_audit.samples;
 }
 
 std::vector<ChildBoundaryPort> submod_to_pi_po(RTLIL::Design *design, RTLIL::Module *mod)
@@ -1204,7 +1204,7 @@ PartitionedPair partition_module(RTLIL::Design *design, RTLIL::Design *design_ch
     result.gate_local = design_check->module(gate_clone->name);
     result.boundaries = boundaries;
     result.boundary_bit_names = region_boundary_bit_names(boundaries);
-    result.residual_hierarchy = !result.boundaries.empty();
+    result.resid_hier = !result.boundaries.empty();
     refine_shell_closure(result, gold_mod, gate_mod, cutpoints);
     return result;
 }
@@ -1234,30 +1234,30 @@ LocalValidateResult validate_partition_pair(const CheckConfig &conf,
     auto t_start = std::chrono::steady_clock::now();
     LocalValidateResult result;
     result.pair_id = get_pair_id(gold_mod->name, gate_mod->name);
-    result.selected_cutpoints = GetSize(cutpoints);
+    result.cut_cnt = GetSize(cutpoints);
 
     RTLIL::Design *design_check = empty_design();
     auto local_pair = partition_module(conf.design, design_check, gold_mod, gate_mod, cutpoints, conf);
-    result.child_boundary_count = GetSize(local_pair.boundaries);
-    result.boundary_map_expected =
+    result.child_bnd_cnt = GetSize(local_pair.boundaries);
+    result.bnd_map_exp =
         GetSize(local_pair.boundary_bit_names) + GetSize(local_pair.promoted_internal_boundary_bit_names);
-    result.unresolved_internal_boundaries = local_pair.unresolved_internal_boundaries;
-    result.module_interface_input_count = local_pair.module_interface_input_count;
-    result.state_cut_input_count = local_pair.state_cut_input_count;
-    result.child_boundary_input_count = local_pair.child_boundary_input_count;
-    result.passthrough_alias_input_count = local_pair.passthrough_alias_input_count;
-    result.slice_or_concat_residual_count = local_pair.slice_or_concat_residual_count;
-    result.traceable_residual_input_count = local_pair.traceable_residual_input_count;
-    result.promoted_from_trace_count = local_pair.promoted_from_trace_count;
-    result.promoted_internal_boundary_count = local_pair.promoted_internal_boundary_count;
-    result.unresolved_internal_input_count = local_pair.unresolved_internal_input_count;
-    result.unresolved_untraceable_input_count = local_pair.unresolved_untraceable_input_count;
-    result.promoted_internal_boundary_samples = local_pair.promoted_internal_boundary_samples;
-    result.unresolved_internal_input_samples = local_pair.unresolved_internal_input_samples;
-    result.constant_completed_traceable_count = local_pair.constant_completed_traceable_count;
-    result.constant_completed_untraceable_count = local_pair.constant_completed_untraceable_count;
-    result.constant_completed_samples = local_pair.constant_completed_samples;
-    result.residual_hierarchy = local_pair.residual_hierarchy;
+    result.unr_int_bnd_cnt = local_pair.unr_int_bnd_cnt;
+    result.iface_in_cnt = local_pair.iface_in_cnt;
+    result.state_in_cnt = local_pair.state_in_cnt;
+    result.child_in_cnt = local_pair.child_in_cnt;
+    result.alias_in_cnt = local_pair.alias_in_cnt;
+    result.slice_res_cnt = local_pair.slice_res_cnt;
+    result.trace_res_in_cnt = local_pair.trace_res_in_cnt;
+    result.trace_prom_cnt = local_pair.trace_prom_cnt;
+    result.prom_int_bnd_cnt = local_pair.prom_int_bnd_cnt;
+    result.unr_int_in_cnt = local_pair.unr_int_in_cnt;
+    result.unr_untrace_in_cnt = local_pair.unr_untrace_in_cnt;
+    result.prom_int_bnd_samps = local_pair.prom_int_bnd_samps;
+    result.unr_int_in_samps = local_pair.unr_int_in_samps;
+    result.const_comp_trace_cnt = local_pair.const_comp_trace_cnt;
+    result.const_comp_untrace_cnt = local_pair.const_comp_untrace_cnt;
+    result.const_comp_samps = local_pair.const_comp_samps;
+    result.resid_hier = local_pair.resid_hier;
 
     GuideTelemetry local_telemetry;
     CheckConfig local_conf = conf;
@@ -1266,7 +1266,7 @@ LocalValidateResult validate_partition_pair(const CheckConfig &conf,
     local_conf.gate_mod = local_pair.gate_local;
     local_conf.sched_model_file = "";
     local_conf.match_model_file = "";
-    local_conf.accept_match_suggestions_file = "";
+    local_conf.accept_sugs_file = "";
     local_conf.dump_cfg = MlDumpConfig();
     local_conf.sched_model = nullptr;
     local_conf.match_model = nullptr;
@@ -1278,55 +1278,55 @@ LocalValidateResult validate_partition_pair(const CheckConfig &conf,
     local_telemetry.pair_match_stats[get_pair_id(local_conf.gold_mod->name, local_conf.gate_mod->name)] =
         local_match.stats;
 
-    result.local_exact_total = local_match.stats.exact_total;
+    result.exact_cnt = local_match.stats.exact_total;
     for (const auto &cp : local_match.cut_points)
         if (local_pair.boundary_bit_names.count(strip_backslash(cp.name)) ||
             local_pair.promoted_internal_boundary_bit_names.count(strip_backslash(cp.name)))
-            result.boundary_map_applied++;
+            result.bnd_map_app++;
 
     result.ran = true;
     CommandResult local_abc_result;
     result.proved = abc_cec_module(local_conf, false, &local_abc_result);
-    result.validator_backend = "local_abc";
+    result.vali_backend = "local_abc";
     int abc_name_map_applied = parse_name_map_applied(local_abc_result.output);
-    if (result.boundary_map_applied == 0 && abc_name_map_applied > 0)
-        result.boundary_map_applied = std::min(result.boundary_map_expected, abc_name_map_applied);
-    result.constant_completed_net_count = parse_constant_completed_net_count(local_abc_result.output);
+    if (result.bnd_map_app == 0 && abc_name_map_applied > 0)
+        result.bnd_map_app = std::min(result.bnd_map_exp, abc_name_map_applied);
+    result.const_comp_net_cnt = parse_const_comp_net_cnt(local_abc_result.output);
     int classified_constant_completed =
-        result.constant_completed_traceable_count + result.constant_completed_untraceable_count;
-    if (result.constant_completed_net_count > classified_constant_completed) {
-        result.constant_completed_untraceable_count +=
-            result.constant_completed_net_count - classified_constant_completed;
-        add_sample_name(result.constant_completed_samples, "abc_constant_completed_unclassified", 8);
+        result.const_comp_trace_cnt + result.const_comp_untrace_cnt;
+    if (result.const_comp_net_cnt > classified_constant_completed) {
+        result.const_comp_untrace_cnt +=
+            result.const_comp_net_cnt - classified_constant_completed;
+        add_sample_name(result.const_comp_samps, "abc_constant_completed_unclassified", 8);
     }
-    result.unsafe_reason = partition_unsafe_reason(local_abc_result);
-    if (!result.unsafe_reason.empty())
-        result.authoritative_ok = false;
-    if (result.unresolved_internal_boundaries > 0) {
-        result.authoritative_ok = false;
-        if (result.fallback_reason.empty())
-            result.fallback_reason = "unresolved_internal_boundaries";
+    result.unsafe_why = partition_unsafe_why(local_abc_result);
+    if (!result.unsafe_why.empty())
+        result.auth_ok = false;
+    if (result.unr_int_bnd_cnt > 0) {
+        result.auth_ok = false;
+        if (result.fb_why.empty())
+            result.fb_why = "unresolved_internal_boundaries";
     }
-    if (result.constant_completed_net_count > 0) {
-        result.authoritative_ok = false;
-        if (result.fallback_reason.empty())
-            result.fallback_reason = "constant_completed_nets";
+    if (result.const_comp_net_cnt > 0) {
+        result.auth_ok = false;
+        if (result.fb_why.empty())
+            result.fb_why = "constant_completed_nets";
     }
-    if (result.boundary_map_expected > 0 && result.boundary_map_applied == 0) {
-        result.authoritative_ok = false;
-        if (result.fallback_reason.empty())
-            result.fallback_reason = "boundary_map_not_applied";
+    if (result.bnd_map_exp > 0 && result.bnd_map_app == 0) {
+        result.auth_ok = false;
+        if (result.fb_why.empty())
+            result.fb_why = "boundary_map_not_applied";
     }
-    if (result.proved && result.authoritative_ok)
-        result.authoritative_reason = "closed_shell";
+    if (result.proved && result.auth_ok)
+        result.auth_why = "closed_shell";
 
     if (!result.proved && allow_bmc_fallback) {
         bool residual_state = module_has_dff(local_conf.gold_mod, false) || module_has_dff(local_conf.gate_mod, true);
-        bool residual_hierarchy = module_has_submodule(design_check, local_conf.gold_mod) || module_has_submodule(design_check, local_conf.gate_mod);
-        if (residual_state || residual_hierarchy) {
-            result.used_bmc_fallback = true;
+        bool resid_hier = module_has_submodule(design_check, local_conf.gold_mod) || module_has_submodule(design_check, local_conf.gate_mod);
+        if (residual_state || resid_hier) {
+            result.used_bmc_fb = true;
             bool bmc_ok = bmcinduct_check(local_conf);
-            result.validator_backend = "local_abc_bmc";
+            result.vali_backend = "local_abc_bmc";
             if (bmc_ok)
                 result.proved = true;
         }
@@ -1338,7 +1338,7 @@ LocalValidateResult validate_partition_pair(const CheckConfig &conf,
     return result;
 }
 
-void run_local_validate_shadow(const CheckConfig &conf, ModMap &mod_map,
+void run_local_vali_shadow(const CheckConfig &conf, ModMap &mod_map,
                                       const dict<RTLIL::Module*, std::vector<CutPoint>> &gold2cutpoints)
 {
     int ran_pairs = 0;
@@ -1378,37 +1378,37 @@ void run_local_validate_shadow(const CheckConfig &conf, ModMap &mod_map,
             {"score", 0},
             {"margin", 0},
             {"validator_result", result.proved ? "pass" : "fail"},
-            {"validator_backend", result.validator_backend},
-            {"used_bmc_fallback", result.used_bmc_fallback},
-            {"authoritative_ok", result.authoritative_ok},
-            {"authoritative_reason", result.authoritative_reason},
-            {"unsafe_reason", result.unsafe_reason},
-            {"fallback_reason", result.fallback_reason},
+            {"validator_backend", result.vali_backend},
+            {"used_bmc_fallback", result.used_bmc_fb},
+            {"authoritative_ok", result.auth_ok},
+            {"authoritative_reason", result.auth_why},
+            {"unsafe_reason", result.unsafe_why},
+            {"fallback_reason", result.fb_why},
             {"runtime_ms", result.runtime_ms},
             {"accepted", false},
-            {"selected_cutpoints", result.selected_cutpoints},
-            {"local_exact_total", result.local_exact_total},
-            {"boundary_map_expected", result.boundary_map_expected},
-            {"boundary_map_applied", result.boundary_map_applied},
-            {"constant_completed_net_count", result.constant_completed_net_count},
-            {"module_interface_input_count", result.module_interface_input_count},
-            {"state_cut_input_count", result.state_cut_input_count},
-            {"child_boundary_input_count", result.child_boundary_input_count},
-            {"passthrough_alias_input_count", result.passthrough_alias_input_count},
-            {"slice_or_concat_residual_count", result.slice_or_concat_residual_count},
-            {"traceable_residual_input_count", result.traceable_residual_input_count},
-            {"promoted_from_trace_count", result.promoted_from_trace_count},
-            {"promoted_internal_boundary_count", result.promoted_internal_boundary_count},
-            {"unresolved_internal_input_count", result.unresolved_internal_input_count},
-            {"unresolved_untraceable_input_count", result.unresolved_untraceable_input_count},
-            {"constant_completed_traceable_count", result.constant_completed_traceable_count},
-            {"constant_completed_untraceable_count", result.constant_completed_untraceable_count},
-            {"promoted_internal_boundary_samples", json_array_from_strings(result.promoted_internal_boundary_samples)},
-            {"unresolved_internal_input_samples", json_array_from_strings(result.unresolved_internal_input_samples)},
-            {"constant_completed_samples", json_array_from_strings(result.constant_completed_samples)},
-            {"unresolved_internal_boundaries", result.unresolved_internal_boundaries},
-            {"child_boundary_count", result.child_boundary_count},
-            {"unresolved_child_boundaries", result.unresolved_child_boundaries}
+            {"selected_cutpoints", result.cut_cnt},
+            {"local_exact_total", result.exact_cnt},
+            {"boundary_map_expected", result.bnd_map_exp},
+            {"boundary_map_applied", result.bnd_map_app},
+            {"constant_completed_net_count", result.const_comp_net_cnt},
+            {"module_interface_input_count", result.iface_in_cnt},
+            {"state_cut_input_count", result.state_in_cnt},
+            {"child_boundary_input_count", result.child_in_cnt},
+            {"passthrough_alias_input_count", result.alias_in_cnt},
+            {"slice_or_concat_residual_count", result.slice_res_cnt},
+            {"traceable_residual_input_count", result.trace_res_in_cnt},
+            {"promoted_from_trace_count", result.trace_prom_cnt},
+            {"promoted_internal_boundary_count", result.prom_int_bnd_cnt},
+            {"unresolved_internal_input_count", result.unr_int_in_cnt},
+            {"unresolved_untraceable_input_count", result.unr_untrace_in_cnt},
+            {"constant_completed_traceable_count", result.const_comp_trace_cnt},
+            {"constant_completed_untraceable_count", result.const_comp_untrace_cnt},
+            {"promoted_internal_boundary_samples", json_array_from_strings(result.prom_int_bnd_samps)},
+            {"unresolved_internal_input_samples", json_array_from_strings(result.unr_int_in_samps)},
+            {"constant_completed_samples", json_array_from_strings(result.const_comp_samps)},
+            {"unresolved_internal_boundaries", result.unr_int_bnd_cnt},
+            {"child_boundary_count", result.child_bnd_cnt},
+            {"unresolved_child_boundaries", result.unr_child_bnd_cnt}
         });
         ran_pairs++;
         if (result.proved)
@@ -1419,8 +1419,8 @@ void run_local_validate_shadow(const CheckConfig &conf, ModMap &mod_map,
         log("LOCAL_VALIDATE shadow for %s: %s (%d DFF cutpoints, local exact=%d).\n",
             result.pair_id.c_str(),
             result.proved ? "\033[1;32mPASSED\033[0m" : "\033[1;31mFAILED\033[0m",
-            result.selected_cutpoints,
-            result.local_exact_total);
+            result.cut_cnt,
+            result.exact_cnt);
     }
 
     log("LOCAL_VALIDATE shadow summary: ran %d pair(s), passed %d, failed %d, skipped %d.\n",
@@ -1527,7 +1527,7 @@ std::vector<RegionNode> build_region_plan(const CheckConfig &conf,
         pool<int> child_ids;
         for (const auto &boundary : node.child_boundaries) {
             if (!region_by_gold.count(boundary.gold_child_mod)) {
-                node.unresolved_child_boundary_count++;
+                node.unresolved_child_bnd_cnt++;
                 continue;
             }
             int child_id = region_by_gold.at(boundary.gold_child_mod);
@@ -1575,7 +1575,7 @@ Results partition_prove(const CheckConfig &conf, ModMap &mod_map,
             {"state_cutpoint_count", int(node.state_cutpoints.size())},
             {"child_boundary_count", int(node.child_boundaries.size())},
             {"subckt_cutpoint_count", int(node.child_boundary_cps.size())},
-            {"unresolved_child_boundary_count", node.unresolved_child_boundary_count},
+            {"unresolved_child_bnd_cnt", node.unresolved_child_bnd_cnt},
             {"residual_hierarchy", !node.child_boundaries.empty()}
         });
     }
@@ -1583,18 +1583,18 @@ Results partition_prove(const CheckConfig &conf, ModMap &mod_map,
     for (const auto &node : nodes) {
         RegionProofResult region_result;
         region_result.region_id = node.region_id;
-        region_result.child_boundary_count = GetSize(node.child_boundaries);
-        region_result.unresolved_child_boundaries = node.unresolved_child_boundary_count;
+        region_result.child_bnd_cnt = GetSize(node.child_boundaries);
+        region_result.unr_child_bnd_cnt = node.unresolved_child_bnd_cnt;
 
-        bool children_discharged = true;
+        bool child_done = true;
         for (int child_id : node.child_region_ids) {
             const auto &child_result = proof_results.at(child_id);
-            if (!child_result.obligation_discharged) {
-                children_discharged = false;
+            if (!child_result.oblig_done) {
+                child_done = false;
                 break;
             }
         }
-        region_result.children_discharged = children_discharged;
+        region_result.child_done = child_done;
 
         std::vector<CutPoint> local_cutpoints =
             filter_materializable_cutpoints(node.gold_mod, node.gate_mod, node.state_cutpoints);
@@ -1603,56 +1603,56 @@ Results partition_prove(const CheckConfig &conf, ModMap &mod_map,
             LocalValidateResult shell_result =
                 validate_partition_pair(conf, node.gold_mod, node.gate_mod, local_cutpoints, true);
             region_result.shell_proved = shell_result.proved;
-            region_result.selected_cutpoints = shell_result.selected_cutpoints;
-            region_result.local_exact_total = shell_result.local_exact_total;
-            region_result.child_boundary_count = shell_result.child_boundary_count;
-            region_result.unresolved_child_boundaries = shell_result.unresolved_child_boundaries;
-            region_result.boundary_map_expected = shell_result.boundary_map_expected;
-            region_result.boundary_map_applied = shell_result.boundary_map_applied;
-            region_result.constant_completed_net_count = shell_result.constant_completed_net_count;
-            region_result.unresolved_internal_boundaries = shell_result.unresolved_internal_boundaries;
-            region_result.module_interface_input_count = shell_result.module_interface_input_count;
-            region_result.state_cut_input_count = shell_result.state_cut_input_count;
-            region_result.child_boundary_input_count = shell_result.child_boundary_input_count;
-            region_result.passthrough_alias_input_count = shell_result.passthrough_alias_input_count;
-            region_result.slice_or_concat_residual_count = shell_result.slice_or_concat_residual_count;
-            region_result.traceable_residual_input_count = shell_result.traceable_residual_input_count;
-            region_result.promoted_from_trace_count = shell_result.promoted_from_trace_count;
-            region_result.promoted_internal_boundary_count = shell_result.promoted_internal_boundary_count;
-            region_result.unresolved_internal_input_count = shell_result.unresolved_internal_input_count;
-            region_result.unresolved_untraceable_input_count = shell_result.unresolved_untraceable_input_count;
-            region_result.promoted_internal_boundary_samples = shell_result.promoted_internal_boundary_samples;
-            region_result.unresolved_internal_input_samples = shell_result.unresolved_internal_input_samples;
-            region_result.constant_completed_traceable_count = shell_result.constant_completed_traceable_count;
-            region_result.constant_completed_untraceable_count = shell_result.constant_completed_untraceable_count;
-            region_result.constant_completed_samples = shell_result.constant_completed_samples;
-            region_result.residual_hierarchy = shell_result.residual_hierarchy;
+            region_result.cut_cnt = shell_result.cut_cnt;
+            region_result.exact_cnt = shell_result.exact_cnt;
+            region_result.child_bnd_cnt = shell_result.child_bnd_cnt;
+            region_result.unr_child_bnd_cnt = shell_result.unr_child_bnd_cnt;
+            region_result.bnd_map_exp = shell_result.bnd_map_exp;
+            region_result.bnd_map_app = shell_result.bnd_map_app;
+            region_result.const_comp_net_cnt = shell_result.const_comp_net_cnt;
+            region_result.unr_int_bnd_cnt = shell_result.unr_int_bnd_cnt;
+            region_result.iface_in_cnt = shell_result.iface_in_cnt;
+            region_result.state_in_cnt = shell_result.state_in_cnt;
+            region_result.child_in_cnt = shell_result.child_in_cnt;
+            region_result.alias_in_cnt = shell_result.alias_in_cnt;
+            region_result.slice_res_cnt = shell_result.slice_res_cnt;
+            region_result.trace_res_in_cnt = shell_result.trace_res_in_cnt;
+            region_result.trace_prom_cnt = shell_result.trace_prom_cnt;
+            region_result.prom_int_bnd_cnt = shell_result.prom_int_bnd_cnt;
+            region_result.unr_int_in_cnt = shell_result.unr_int_in_cnt;
+            region_result.unr_untrace_in_cnt = shell_result.unr_untrace_in_cnt;
+            region_result.prom_int_bnd_samps = shell_result.prom_int_bnd_samps;
+            region_result.unr_int_in_samps = shell_result.unr_int_in_samps;
+            region_result.const_comp_trace_cnt = shell_result.const_comp_trace_cnt;
+            region_result.const_comp_untrace_cnt = shell_result.const_comp_untrace_cnt;
+            region_result.const_comp_samps = shell_result.const_comp_samps;
+            region_result.resid_hier = shell_result.resid_hier;
             region_result.runtime_ms = shell_result.runtime_ms;
-            region_result.backend = shell_result.validator_backend;
-            region_result.unsafe_reason = shell_result.unsafe_reason;
-            region_result.authoritative_ok =
-                shell_result.authoritative_ok &&
-                region_result.unresolved_child_boundaries == 0 &&
-                region_result.unresolved_internal_boundaries == 0 &&
-                region_result.constant_completed_net_count == 0 &&
-                (region_result.boundary_map_expected == 0 || region_result.boundary_map_applied > 0) &&
-                children_discharged;
-            if (!children_discharged && region_result.fallback_reason.empty())
-                region_result.fallback_reason = "child_obligations_not_discharged";
-            if (region_result.unresolved_child_boundaries > 0 && region_result.fallback_reason.empty())
-                region_result.fallback_reason = "unresolved_child_boundaries";
-            if (region_result.unresolved_internal_boundaries > 0 && region_result.fallback_reason.empty())
-                region_result.fallback_reason = "unresolved_internal_boundaries";
-            if (region_result.constant_completed_net_count > 0 && region_result.fallback_reason.empty())
-                region_result.fallback_reason = "constant_completed_nets";
-            if (region_result.boundary_map_expected > 0 && region_result.boundary_map_applied == 0 && region_result.fallback_reason.empty())
-                region_result.fallback_reason = "boundary_map_not_applied";
-            if (!shell_result.authoritative_ok && region_result.fallback_reason.empty())
-                region_result.fallback_reason = !shell_result.fallback_reason.empty() ? shell_result.fallback_reason : shell_result.unsafe_reason;
-            region_result.proved = region_result.shell_proved && children_discharged;
-            region_result.obligation_discharged = region_result.proved && region_result.authoritative_ok;
-            if (region_result.authoritative_ok)
-                region_result.authoritative_reason = "closed_region_shell";
+            region_result.backend = shell_result.vali_backend;
+            region_result.unsafe_why = shell_result.unsafe_why;
+            region_result.auth_ok =
+                shell_result.auth_ok &&
+                region_result.unr_child_bnd_cnt == 0 &&
+                region_result.unr_int_bnd_cnt == 0 &&
+                region_result.const_comp_net_cnt == 0 &&
+                (region_result.bnd_map_exp == 0 || region_result.bnd_map_app > 0) &&
+                child_done;
+            if (!child_done && region_result.fb_why.empty())
+                region_result.fb_why = "child_obligations_not_discharged";
+            if (region_result.unr_child_bnd_cnt > 0 && region_result.fb_why.empty())
+                region_result.fb_why = "unresolved_child_boundaries";
+            if (region_result.unr_int_bnd_cnt > 0 && region_result.fb_why.empty())
+                region_result.fb_why = "unresolved_internal_boundaries";
+            if (region_result.const_comp_net_cnt > 0 && region_result.fb_why.empty())
+                region_result.fb_why = "constant_completed_nets";
+            if (region_result.bnd_map_exp > 0 && region_result.bnd_map_app == 0 && region_result.fb_why.empty())
+                region_result.fb_why = "boundary_map_not_applied";
+            if (!shell_result.auth_ok && region_result.fb_why.empty())
+                region_result.fb_why = !shell_result.fb_why.empty() ? shell_result.fb_why : shell_result.unsafe_why;
+            region_result.proved = region_result.shell_proved && child_done;
+            region_result.oblig_done = region_result.proved && region_result.auth_ok;
+            if (region_result.auth_ok)
+                region_result.auth_why = "closed_region_shell";
 
             append_jsonl(pair_artifact_path(artifact_dir, "local_validate", node.gold_mod, node.gate_mod, ".jsonl"), Json::object {
                 {"design", strip_backslash(conf.gold_mod->name)},
@@ -1665,57 +1665,57 @@ Results partition_prove(const CheckConfig &conf, ModMap &mod_map,
                 {"score", 0},
                 {"margin", 0},
                 {"validator_result", shell_result.proved ? "pass" : "fail"},
-                {"validator_backend", shell_result.validator_backend},
-                {"used_bmc_fallback", shell_result.used_bmc_fallback},
-                {"authoritative_ok", region_result.authoritative_ok},
-                {"authoritative_reason", region_result.authoritative_reason},
-                {"unsafe_reason", shell_result.unsafe_reason},
-                {"fallback_reason", region_result.fallback_reason},
+                {"validator_backend", shell_result.vali_backend},
+                {"used_bmc_fallback", shell_result.used_bmc_fb},
+                {"authoritative_ok", region_result.auth_ok},
+                {"authoritative_reason", region_result.auth_why},
+                {"unsafe_reason", shell_result.unsafe_why},
+                {"fallback_reason", region_result.fb_why},
                 {"runtime_ms", shell_result.runtime_ms},
                 {"accepted", false},
-                {"selected_cutpoints", shell_result.selected_cutpoints},
-                {"local_exact_total", shell_result.local_exact_total},
-                {"boundary_map_expected", shell_result.boundary_map_expected},
-                {"boundary_map_applied", shell_result.boundary_map_applied},
-                {"constant_completed_net_count", shell_result.constant_completed_net_count},
-                {"module_interface_input_count", shell_result.module_interface_input_count},
-                {"state_cut_input_count", shell_result.state_cut_input_count},
-                {"child_boundary_input_count", shell_result.child_boundary_input_count},
-                {"passthrough_alias_input_count", shell_result.passthrough_alias_input_count},
-                {"slice_or_concat_residual_count", shell_result.slice_or_concat_residual_count},
-                {"traceable_residual_input_count", shell_result.traceable_residual_input_count},
-                {"promoted_from_trace_count", shell_result.promoted_from_trace_count},
-                {"promoted_internal_boundary_count", shell_result.promoted_internal_boundary_count},
-                {"unresolved_internal_input_count", shell_result.unresolved_internal_input_count},
-                {"unresolved_untraceable_input_count", shell_result.unresolved_untraceable_input_count},
-                {"constant_completed_traceable_count", shell_result.constant_completed_traceable_count},
-                {"constant_completed_untraceable_count", shell_result.constant_completed_untraceable_count},
-                {"promoted_internal_boundary_samples", json_array_from_strings(shell_result.promoted_internal_boundary_samples)},
-                {"unresolved_internal_input_samples", json_array_from_strings(shell_result.unresolved_internal_input_samples)},
-                {"constant_completed_samples", json_array_from_strings(shell_result.constant_completed_samples)},
-                {"unresolved_internal_boundaries", shell_result.unresolved_internal_boundaries},
-                {"child_boundary_count", shell_result.child_boundary_count},
-                {"unresolved_child_boundaries", shell_result.unresolved_child_boundaries}
+                {"selected_cutpoints", shell_result.cut_cnt},
+                {"local_exact_total", shell_result.exact_cnt},
+                {"boundary_map_expected", shell_result.bnd_map_exp},
+                {"boundary_map_applied", shell_result.bnd_map_app},
+                {"constant_completed_net_count", shell_result.const_comp_net_cnt},
+                {"module_interface_input_count", shell_result.iface_in_cnt},
+                {"state_cut_input_count", shell_result.state_in_cnt},
+                {"child_boundary_input_count", shell_result.child_in_cnt},
+                {"passthrough_alias_input_count", shell_result.alias_in_cnt},
+                {"slice_or_concat_residual_count", shell_result.slice_res_cnt},
+                {"traceable_residual_input_count", shell_result.trace_res_in_cnt},
+                {"promoted_from_trace_count", shell_result.trace_prom_cnt},
+                {"promoted_internal_boundary_count", shell_result.prom_int_bnd_cnt},
+                {"unresolved_internal_input_count", shell_result.unr_int_in_cnt},
+                {"unresolved_untraceable_input_count", shell_result.unr_untrace_in_cnt},
+                {"constant_completed_traceable_count", shell_result.const_comp_trace_cnt},
+                {"constant_completed_untraceable_count", shell_result.const_comp_untrace_cnt},
+                {"promoted_internal_boundary_samples", json_array_from_strings(shell_result.prom_int_bnd_samps)},
+                {"unresolved_internal_input_samples", json_array_from_strings(shell_result.unr_int_in_samps)},
+                {"constant_completed_samples", json_array_from_strings(shell_result.const_comp_samps)},
+                {"unresolved_internal_boundaries", shell_result.unr_int_bnd_cnt},
+                {"child_boundary_count", shell_result.child_bnd_cnt},
+                {"unresolved_child_boundaries", shell_result.unr_child_bnd_cnt}
             });
         } else {
-            region_result.fallback_reason = "no_shell_obligation";
-            region_result.authoritative_ok = false;
-            region_result.obligation_discharged = false;
+            region_result.fb_why = "no_shell_obligation";
+            region_result.auth_ok = false;
+            region_result.oblig_done = false;
         }
 
-        if (!region_result.proved || !region_result.authoritative_ok) {
+        if (!region_result.proved || !region_result.auth_ok) {
             CheckConfig conf_ = conf;
             conf_.gold_mod = node.gold_mod;
             conf_.gate_mod = node.gate_mod;
             bool fallback_ok = abc_cec_module(conf_);
-            if (region_result.fallback_reason.empty())
-                region_result.fallback_reason = region_result.proved ? "non_authoritative_region" : "shell_failed";
+            if (region_result.fb_why.empty())
+                region_result.fb_why = region_result.proved ? "non_authoritative_region" : "shell_failed";
             log("REGION proof for %s falling back to module-pair proof (%s).\n",
                 get_pair_id(node.gold_mod->name, node.gate_mod->name).c_str(),
-                region_result.fallback_reason.c_str());
+                region_result.fb_why.c_str());
             region_result.proved = fallback_ok;
-            region_result.authoritative_ok = false;
-            region_result.obligation_discharged = fallback_ok;
+            region_result.auth_ok = false;
+            region_result.oblig_done = fallback_ok;
             if (region_result.backend.empty())
                 region_result.backend = "module_pair_fallback";
             else
@@ -1729,48 +1729,48 @@ Results partition_prove(const CheckConfig &conf, ModMap &mod_map,
             {"parent_region_ids", json_array_from_ints(node.parent_region_ids)},
             {"child_region_ids", json_array_from_ints(node.child_region_ids)},
             {"state_cutpoint_count", int(node.state_cutpoints.size())},
-            {"child_boundary_count", region_result.child_boundary_count},
+            {"child_boundary_count", region_result.child_bnd_cnt},
             {"shell_proved", region_result.shell_proved},
-            {"children_discharged", region_result.children_discharged},
-            {"obligation_discharged", region_result.obligation_discharged},
-            {"authoritative_ok", region_result.authoritative_ok},
-            {"authoritative_reason", region_result.authoritative_reason},
+            {"children_discharged", region_result.child_done},
+            {"obligation_discharged", region_result.oblig_done},
+            {"authoritative_ok", region_result.auth_ok},
+            {"authoritative_reason", region_result.auth_why},
             {"proved", region_result.proved},
-            {"unsafe_reason", region_result.unsafe_reason},
-            {"fallback_reason", region_result.fallback_reason},
+            {"unsafe_reason", region_result.unsafe_why},
+            {"fallback_reason", region_result.fb_why},
             {"backend", region_result.backend},
             {"runtime_ms", region_result.runtime_ms},
-            {"selected_cutpoints", region_result.selected_cutpoints},
-            {"local_exact_total", region_result.local_exact_total},
-            {"boundary_map_expected", region_result.boundary_map_expected},
-            {"boundary_map_applied", region_result.boundary_map_applied},
-            {"constant_completed_net_count", region_result.constant_completed_net_count},
-            {"module_interface_input_count", region_result.module_interface_input_count},
-            {"state_cut_input_count", region_result.state_cut_input_count},
-            {"child_boundary_input_count", region_result.child_boundary_input_count},
-            {"passthrough_alias_input_count", region_result.passthrough_alias_input_count},
-            {"slice_or_concat_residual_count", region_result.slice_or_concat_residual_count},
-            {"traceable_residual_input_count", region_result.traceable_residual_input_count},
-            {"promoted_from_trace_count", region_result.promoted_from_trace_count},
-            {"promoted_internal_boundary_count", region_result.promoted_internal_boundary_count},
-            {"unresolved_internal_input_count", region_result.unresolved_internal_input_count},
-            {"unresolved_untraceable_input_count", region_result.unresolved_untraceable_input_count},
-            {"constant_completed_traceable_count", region_result.constant_completed_traceable_count},
-            {"constant_completed_untraceable_count", region_result.constant_completed_untraceable_count},
-            {"promoted_internal_boundary_samples", json_array_from_strings(region_result.promoted_internal_boundary_samples)},
-            {"unresolved_internal_input_samples", json_array_from_strings(region_result.unresolved_internal_input_samples)},
-            {"constant_completed_samples", json_array_from_strings(region_result.constant_completed_samples)},
-            {"unresolved_internal_boundaries", region_result.unresolved_internal_boundaries},
-            {"unresolved_child_boundaries", region_result.unresolved_child_boundaries},
-            {"residual_hierarchy", region_result.residual_hierarchy}
+            {"selected_cutpoints", region_result.cut_cnt},
+            {"local_exact_total", region_result.exact_cnt},
+            {"boundary_map_expected", region_result.bnd_map_exp},
+            {"boundary_map_applied", region_result.bnd_map_app},
+            {"constant_completed_net_count", region_result.const_comp_net_cnt},
+            {"module_interface_input_count", region_result.iface_in_cnt},
+            {"state_cut_input_count", region_result.state_in_cnt},
+            {"child_boundary_input_count", region_result.child_in_cnt},
+            {"passthrough_alias_input_count", region_result.alias_in_cnt},
+            {"slice_or_concat_residual_count", region_result.slice_res_cnt},
+            {"traceable_residual_input_count", region_result.trace_res_in_cnt},
+            {"promoted_from_trace_count", region_result.trace_prom_cnt},
+            {"promoted_internal_boundary_count", region_result.prom_int_bnd_cnt},
+            {"unresolved_internal_input_count", region_result.unr_int_in_cnt},
+            {"unresolved_untraceable_input_count", region_result.unr_untrace_in_cnt},
+            {"constant_completed_traceable_count", region_result.const_comp_trace_cnt},
+            {"constant_completed_untraceable_count", region_result.const_comp_untrace_cnt},
+            {"promoted_internal_boundary_samples", json_array_from_strings(region_result.prom_int_bnd_samps)},
+            {"unresolved_internal_input_samples", json_array_from_strings(region_result.unr_int_in_samps)},
+            {"constant_completed_samples", json_array_from_strings(region_result.const_comp_samps)},
+            {"unresolved_internal_boundaries", region_result.unr_int_bnd_cnt},
+            {"unresolved_child_boundaries", region_result.unr_child_bnd_cnt},
+            {"residual_hierarchy", region_result.resid_hier}
         });
 
         log("REGION proof for %s: %s (state cuts=%d, child boundaries=%d, children=%s).\n",
             get_pair_id(node.gold_mod->name, node.gate_mod->name).c_str(),
             region_result.proved ? "\033[1;32mPASSED\033[0m" : "\033[1;31mFAILED\033[0m",
-            region_result.selected_cutpoints,
-            region_result.child_boundary_count,
-            region_result.children_discharged ? "discharged" : "pending");
+            region_result.cut_cnt,
+            region_result.child_bnd_cnt,
+            region_result.child_done ? "discharged" : "pending");
 
         proof_results.at(node.region_id) = region_result;
         results.push_back({

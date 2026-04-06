@@ -16,7 +16,7 @@ std::vector<CutPoint> select_support_sliced_dff_cutpoints(RTLIL::Module *gold_mo
 LocalValidateResult validate_partition_pair(const CheckConfig &conf, RTLIL::Module *gold_mod,
                                             RTLIL::Module *gate_mod, const std::vector<CutPoint> &cutpoints,
                                             bool allow_bmc_fallback = true);
-void run_local_validate_shadow(const CheckConfig &conf, ModMap &mod_map,
+void run_local_vali_shadow(const CheckConfig &conf, ModMap &mod_map,
                                const dict<RTLIL::Module*, std::vector<CutPoint>> &gold2cutpoints);
 Results partition_prove(const CheckConfig &conf, ModMap &mod_map,
                         const dict<RTLIL::Module*, std::vector<CutPoint>> &gold2cutpoints);

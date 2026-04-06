@@ -159,8 +159,8 @@ Json pair_record_to_json(const PairRecord &record)
         {"gate_dff_cnt", record.gate_dff_cnt},
         {"has_submodule", record.has_submodule},
         {"retimed", record.retimed},
-        {"touched_by_multiplier", record.touched_by_multiplier},
-        {"const_blackbox_inputs_inserted", record.const_blackbox_inputs_inserted}
+        {"mul_touched", record.mul_touched},
+        {"bb_const_in_cnt", record.bb_const_in_cnt}
     };
 }
 
@@ -529,31 +529,31 @@ bool abc_cec_module(const CheckConfig &conf, bool fatal, CommandResult *deciding
         return count;
     };
 
-    auto collect_pair_record = [&](int inserted_bbconsts) {
-        PairRecord record;
-        record.pair_id = get_pair_id(conf.gold_mod->name, conf.gate_mod->name);
-        record.gold_mod = strip_backslash(conf.gold_mod->name);
-        record.gate_mod = strip_backslash(conf.gate_mod->name);
-        record.gold_dff_cnt = count_module_dffs(conf.gold_mod, false);
-        record.gate_dff_cnt = count_module_dffs(conf.gate_mod, true);
-        record.const_blackbox_inputs_inserted = inserted_bbconsts;
+    auto collect_pair_record = [&](int bbconsts) {
+        PairRecord rec;
+        rec.pair_id = get_pair_id(conf.gold_mod->name, conf.gate_mod->name);
+        rec.gold_mod = strip_backslash(conf.gold_mod->name);
+        rec.gate_mod = strip_backslash(conf.gate_mod->name);
+        rec.gold_dff_cnt = count_module_dffs(conf.gold_mod, false);
+        rec.gate_dff_cnt = count_module_dffs(conf.gate_mod, true);
+        rec.bb_const_in_cnt = bbconsts;
 
         for (auto cell : conf.gold_mod->cells()) {
             RTLIL::Module *submod = conf.design->module(cell->type);
             if (submod != nullptr && !submod->get_bool_attribute(ID(blackbox))) {
-                record.has_submodule = true;
+                rec.has_submodule = true;
                 break;
             }
         }
 
         if (conf.telemetry != nullptr) {
-            record.retimed = conf.telemetry->retimed_mods.count(conf.gold_mod->name) ||
-                             conf.telemetry->retimed_mods.count(conf.gate_mod->name);
-            record.touched_by_multiplier = conf.telemetry->multiplier_mods.count(conf.gold_mod->name) ||
-                                           conf.telemetry->multiplier_mods.count(conf.gate_mod->name);
+            rec.retimed = conf.telemetry->retimed_mods.count(conf.gold_mod->name) ||
+                          conf.telemetry->retimed_mods.count(conf.gate_mod->name);
+            rec.mul_touched = conf.telemetry->multiplier_mods.count(conf.gold_mod->name) ||
+                              conf.telemetry->multiplier_mods.count(conf.gate_mod->name);
         }
 
-        return record;
+        return rec;
     };
 
     auto heuristic_abc_plan = [&](const PairRecord&, const MatchStats&) {
@@ -565,15 +565,15 @@ bool abc_cec_module(const CheckConfig &conf, bool fatal, CommandResult *deciding
         };
     };
 
-    auto learned_abc_plan = [&](const PairRecord &pair_record, const MatchStats &match_stats) {
+    auto learned_abc_plan = [&](const PairRecord &pair_rec, const MatchStats &mstats) {
         if (conf.sched_model == nullptr || !conf.sched_model->loaded)
-            return heuristic_abc_plan(pair_record, match_stats);
+            return heuristic_abc_plan(pair_rec, mstats);
 
-        std::vector<std::pair<double, ActionKind>> ranked_actions;
-        for (auto action : heuristic_abc_plan(pair_record, match_stats))
-            ranked_actions.push_back({predict_sched_cost(*conf.sched_model, get_action_name(action), pair_record, match_stats), action});
+        std::vector<std::pair<double, ActionKind>> ranked;
+        for (auto action : heuristic_abc_plan(pair_rec, mstats))
+            ranked.push_back({predict_sched_cost(*conf.sched_model, get_action_name(action), pair_rec, mstats), action});
 
-        std::sort(ranked_actions.begin(), ranked_actions.end(),
+        std::sort(ranked.begin(), ranked.end(),
             [](const std::pair<double, ActionKind> &lhs, const std::pair<double, ActionKind> &rhs) {
                 if (lhs.first != rhs.first)
                     return lhs.first < rhs.first;
@@ -581,13 +581,13 @@ bool abc_cec_module(const CheckConfig &conf, bool fatal, CommandResult *deciding
             });
 
         std::vector<ActionKind> plan;
-        for (auto &entry : ranked_actions)
+        for (auto &entry : ranked)
             plan.push_back(entry.second);
         return plan;
     };
 
     auto run_abc_action = [&](ActionKind action, const string &match_file, const string &gold_file,
-                              const string &gate_file, RunRecord &run_record) {
+                              const string &gate_file, RunRecord &rec) {
         string abc_cmd;
         switch (action) {
         case ActionKind::CEC_MAP:
@@ -610,43 +610,43 @@ bool abc_cec_module(const CheckConfig &conf, bool fatal, CommandResult *deciding
             {"Miter computation has failed", 3}
         };
         string cmd = stringf("%s -c '%s'", conf.abc_exe_file, abc_cmd);
-        CommandResult command_result;
-        int result_code = 0;
-        string action_name = get_action_name(action);
+        CommandResult cmd_res;
+        int rc = 0;
+        string act = get_action_name(action);
         log("Executing ABC command: '%s'\n", abc_cmd.c_str());
-        int exit_status = exectue_and_check(cmd, result_code, out2result, conf.tempdir_name,
+        int status = exectue_and_check(cmd, rc, out2result, conf.tempdir_name,
                                             "abc-" + sanitize_filename(get_pair_id(conf.gold_mod->name, conf.gate_mod->name)) +
-                                            "-" + action_name,
-                                            &command_result);
-        if (exit_status != 0 || result_code == 0) {
-            command_result.result_code = result_code;
-            emit_failure_packet(conf, "ABC", action_name, command_result, {});
+                                            "-" + act,
+                                            &cmd_res);
+        if (status != 0 || rc == 0) {
+            cmd_res.result_code = rc;
+            emit_failure_packet(conf, "ABC", act, cmd_res, {});
             if (fatal)
                 log_error("Error executing ABC command: %s\n", cmd.c_str());
             log_warning("Error executing ABC command: %s\n", cmd.c_str());
         }
 
-        run_record.pair_id = get_pair_id(conf.gold_mod->name, conf.gate_mod->name);
-        run_record.action = action_name;
-        run_record.exit_status = command_result.exit_status;
-        run_record.result_code = result_code;
-        run_record.runtime_ms = command_result.runtime_ms;
-        run_record.log_file = command_result.log_file;
-        command_result.result_code = result_code;
-        return command_result;
+        rec.pair_id = get_pair_id(conf.gold_mod->name, conf.gate_mod->name);
+        rec.action = act;
+        rec.exit_status = cmd_res.exit_status;
+        rec.result_code = rc;
+        rec.runtime_ms = cmd_res.runtime_ms;
+        rec.log_file = cmd_res.log_file;
+        cmd_res.result_code = rc;
+        return cmd_res;
     };
 
-    auto run_abc_plan = [&](const PairRecord &pair_record, const std::vector<ActionKind> &plan,
+    auto run_abc_plan = [&](const PairRecord &pair_rec, const std::vector<ActionKind> &plan,
                             const string &match_file, const string &gold_file, const string &gate_file,
                             std::vector<RunRecord> *trace, CommandResult *last_result, string *last_action) {
-        bool has_dff = pair_record.gold_dff_cnt != 0 || pair_record.gate_dff_cnt != 0;
+        bool has_dff = pair_rec.gold_dff_cnt != 0 || pair_rec.gate_dff_cnt != 0;
         bool exhaustive = conf.dump_cfg.dump_sched;
         bool strict_order = conf.sched_model != nullptr && conf.sched_model->loaded;
         bool ran_dsec_map = false;
         int prev_result = 0;
         bool solved = false;
-        CommandResult last_command;
-        string last_action_name;
+        CommandResult last_cmd;
+        string last_act;
 
         for (auto action : plan) {
             if (!has_dff && (action == ActionKind::DSEC_MAP || action == ActionKind::DSEC_NOMAP))
@@ -661,18 +661,18 @@ bool abc_cec_module(const CheckConfig &conf, bool fatal, CommandResult *deciding
                     continue;
             }
 
-            RunRecord run_record;
-            CommandResult command_result = run_abc_action(action, match_file, gold_file, gate_file, run_record);
+            RunRecord rec;
+            CommandResult cmd_res = run_abc_action(action, match_file, gold_file, gate_file, rec);
             if (trace != nullptr)
-                trace->push_back(run_record);
+                trace->push_back(rec);
 
-            prev_result = run_record.result_code;
-            last_command = command_result;
-            last_action_name = run_record.action;
+            prev_result = rec.result_code;
+            last_cmd = cmd_res;
+            last_act = rec.action;
             if (action == ActionKind::DSEC_MAP)
                 ran_dsec_map = true;
 
-            if (run_record.result_code == 1) {
+            if (rec.result_code == 1) {
                 solved = true;
                 if (!exhaustive)
                     break;
@@ -680,13 +680,13 @@ bool abc_cec_module(const CheckConfig &conf, bool fatal, CommandResult *deciding
         }
 
         if (last_result != nullptr)
-            *last_result = last_command;
+            *last_result = last_cmd;
         if (last_action != nullptr)
-            *last_action = last_action_name;
+            *last_action = last_act;
         return solved;
     };
 
-    auto dump_sched_sample = [&](const PairRecord &pair_record, const MatchStats &match_stats,
+    auto dump_sched_sample = [&](const PairRecord &pair_rec, const MatchStats &mstats,
                                  const std::vector<RunRecord> &trace) {
         if (!conf.dump_cfg.dump_sched || conf.dump_cfg.sched_jsonl.empty())
             return;
@@ -705,8 +705,8 @@ bool abc_cec_module(const CheckConfig &conf, bool fatal, CommandResult *deciding
         }
 
         append_jsonl(conf.dump_cfg.sched_jsonl, Json::object {
-            {"pair", pair_record_to_json(pair_record)},
-            {"match", match_stats_to_json(match_stats)},
+            {"pair", pair_record_to_json(pair_rec)},
+            {"match", match_stats_to_json(mstats)},
             {"actions", action_json},
             {"label_best_action", best_action}
         });
@@ -715,18 +715,18 @@ bool abc_cec_module(const CheckConfig &conf, bool fatal, CommandResult *deciding
     using clock = std::chrono::steady_clock;
     auto t0 = clock::now();
 
-    int gold_inserted = 0;
-    int gate_inserted = 0;
-    string gold_file = dump_blif_module(conf.design, conf.tempdir_name, conf.gold_mod, conf.lib_file, &gold_inserted);
-    string gate_file = dump_blif_module(conf.design, conf.tempdir_name, conf.gate_mod, conf.lib_file, &gate_inserted);
+    int gold_ins = 0;
+    int gate_ins = 0;
+    string gold_file = dump_blif_module(conf.design, conf.tempdir_name, conf.gold_mod, conf.lib_file, &gold_ins);
+    string gate_file = dump_blif_module(conf.design, conf.tempdir_name, conf.gate_mod, conf.lib_file, &gate_ins);
     string match_file = conf.tempdir_name + "/match_" + RTLIL::unescape_id(conf.gold_mod->name) + "_" +
         RTLIL::unescape_id(conf.gate_mod->name) + ".txt";
 
-    PairRecord pair_record = collect_pair_record(gold_inserted + gate_inserted);
-    MatchStats match_stats = get_match_stats(conf);
-    log("Gold DFF count: %d, Gate DFF count: %d\n", pair_record.gold_dff_cnt, pair_record.gate_dff_cnt);
+    PairRecord pair_rec = collect_pair_record(gold_ins + gate_ins);
+    MatchStats mstats = get_match_stats(conf);
+    log("Gold DFF count: %d, Gate DFF count: %d\n", pair_rec.gold_dff_cnt, pair_rec.gate_dff_cnt);
 
-    std::vector<ActionKind> plan = learned_abc_plan(pair_record, match_stats);
+    std::vector<ActionKind> plan = learned_abc_plan(pair_rec, mstats);
     std::vector<RunRecord> trace;
     CommandResult last_result;
     string last_action;
@@ -734,8 +734,8 @@ bool abc_cec_module(const CheckConfig &conf, bool fatal, CommandResult *deciding
     log("Running ABC.\n");
     fflush(stdout);
 
-    bool solved = run_abc_plan(pair_record, plan, match_file, gold_file, gate_file, &trace, &last_result, &last_action);
-    dump_sched_sample(pair_record, match_stats, trace);
+    bool solved = run_abc_plan(pair_rec, plan, match_file, gold_file, gate_file, &trace, &last_result, &last_action);
+    dump_sched_sample(pair_rec, mstats, trace);
     if (!solved && !last_action.empty())
         emit_failure_packet(conf, "ABC", last_action, last_result, trace);
     if (deciding_result != nullptr)
@@ -789,8 +789,8 @@ static std::vector<std::pair<RTLIL::IdString, bool>> abc_cec(const CheckConfig &
         .lib_file = conf.lib_file,
         .sched_model_file = conf.sched_model_file,
         .match_model_file = conf.match_model_file,
-        .accept_match_suggestions_file = conf.accept_match_suggestions_file,
-        .local_validate_support_slice = conf.local_validate_support_slice,
+        .accept_sugs_file = conf.accept_sugs_file,
+        .local_vali_slice = conf.local_vali_slice,
         .seq_check_cfg = conf.seq_check_cfg,
         .dump_cfg = conf.dump_cfg,
         .sched_model = conf.sched_model,
@@ -1113,8 +1113,8 @@ struct GuideCheckRetimePass : public Pass {
             .lib_file = lib_file,
             .sched_model_file = "",
             .match_model_file = "",
-            .accept_match_suggestions_file = "",
-            .local_validate_support_slice = false,
+            .accept_sugs_file = "",
+            .local_vali_slice = false,
             .seq_check_cfg = SeqCheckConfig{
                 .k_induct = k_induct,
                 .step_skip = step_skip,
@@ -1231,10 +1231,10 @@ struct GuideCheckPass : public Pass {
         bool no_init = false;
         string sched_model_file;
         string match_model_file;
-        string accept_match_suggestions_file;
-        bool local_validate_shadow = false;
-        bool local_validate_support_slice = false;
-        bool partition_prove_mode = false;
+        string accept_sugs_file;
+        bool local_vali_shadow = false;
+        bool local_vali_slice = false;
+        bool part_prove = false;
         MlDumpConfig dump_cfg;
         
         size_t argidx;
@@ -1297,19 +1297,19 @@ struct GuideCheckPass : public Pass {
                 continue;
             }
             if (args[argidx] == "-guide-accept-match-suggestions" && argidx + 1 < args.size()) {
-                accept_match_suggestions_file = args[++argidx];
+                accept_sugs_file = args[++argidx];
                 continue;
             }
             if (args[argidx] == "-local-validate-shadow") {
-                local_validate_shadow = true;
+                local_vali_shadow = true;
                 continue;
             }
             if (args[argidx] == "-local-validate-support-slice") {
-                local_validate_support_slice = true;
+                local_vali_slice = true;
                 continue;
             }
             if (args[argidx] == "-partition-prove") {
-                partition_prove_mode = true;
+                part_prove = true;
                 continue;
             }
             break;
@@ -1410,8 +1410,8 @@ struct GuideCheckPass : public Pass {
             .lib_file = lib_file,
             .sched_model_file = sched_model_file,
             .match_model_file = match_model_file,
-            .accept_match_suggestions_file = accept_match_suggestions_file,
-            .local_validate_support_slice = local_validate_support_slice,
+            .accept_sugs_file = accept_sugs_file,
+            .local_vali_slice = local_vali_slice,
             .seq_check_cfg = seq_conf,
             .dump_cfg = dump_cfg,
             .sched_model = &sched_model,
@@ -1501,14 +1501,14 @@ struct GuideCheckPass : public Pass {
         
 
         auto gold2cutpoints = match_signals(design, conf, mod_map, true, "post_async");
-        if (local_validate_shadow)
-            run_local_validate_shadow(conf, mod_map, gold2cutpoints);
-        int total_applied_match_suggestions = 0;
-        for (auto &it : telemetry.pair_applied_match_suggestions)
-            total_applied_match_suggestions += it.second;
-        if (total_applied_match_suggestions > 0)
+        if (local_vali_shadow)
+            run_local_vali_shadow(conf, mod_map, gold2cutpoints);
+        int total_applied_sugs = 0;
+        for (auto &it : telemetry.pair_applied_sugs)
+            total_applied_sugs += it.second;
+        if (total_applied_sugs > 0)
             log("Applied %d match suggestions into match_file(s).\n",
-                total_applied_match_suggestions);
+                total_applied_sugs);
 
         // remove_subclk(design,conf);
         // RTLIL::Design *design_check = empty_design();
@@ -1519,7 +1519,7 @@ struct GuideCheckPass : public Pass {
         // propagate_child_ports(design_check);
 
         // conf.design = design_check;
-        if (partition_prove_mode)
+        if (part_prove)
             cec_result_mod = partition_prove(conf, mod_map, gold2cutpoints);
         else
             cec_result_mod = abc_cec(conf);

@@ -19,8 +19,8 @@ dict<string, double> scheduler_pair_features(const PairRecord &pair_record, cons
     features["unmatched_gold"] = match_stats.unmatched_gold;
     features["unmatched_gate"] = match_stats.unmatched_gate;
     features["retimed"] = pair_record.retimed ? 1.0 : 0.0;
-    features["touched_by_multiplier"] = pair_record.touched_by_multiplier ? 1.0 : 0.0;
-    features["const_blackbox_inputs_inserted"] = pair_record.const_blackbox_inputs_inserted;
+    features["mul_touched"] = pair_record.mul_touched ? 1.0 : 0.0;
+    features["bb_const_in_cnt"] = pair_record.bb_const_in_cnt;
     return features;
 }
 

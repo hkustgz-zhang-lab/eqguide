@@ -50,7 +50,7 @@ std::vector<string> extract_failure_clues(const string &output)
     return clues;
 }
 
-string partition_unsafe_reason(const CommandResult &command_result)
+string partition_unsafe_why(const CommandResult &command_result)
 {
     const string &output = command_result.output;
     if (output.find("Constant-0 drivers added to") != string::npos)

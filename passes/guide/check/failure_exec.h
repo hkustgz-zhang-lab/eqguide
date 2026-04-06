@@ -11,7 +11,7 @@ void append_jsonl(const string &path, const Json &json);
 string make_command_log_file(const string &tempdir_name, const string &tag);
 string resolve_yosys_smtbmc_executable();
 std::vector<string> extract_failure_clues(const string &output);
-string partition_unsafe_reason(const CommandResult &command_result);
+string partition_unsafe_why(const CommandResult &command_result);
 CommandResult exec_capture(const string &cmd, const string &tempdir_name, const string &tag);
 MatchStats get_match_stats(const CheckConfig &conf);
 int typed_match_total(const MatchStats &stats);
