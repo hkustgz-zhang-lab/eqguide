@@ -267,10 +267,18 @@ struct LocalValidateResult
 	int module_interface_input_count = 0;
 	int state_cut_input_count = 0;
 	int child_boundary_input_count = 0;
+	int passthrough_alias_input_count = 0;
+	int slice_or_concat_residual_count = 0;
+	int traceable_residual_input_count = 0;
+	int promoted_from_trace_count = 0;
 	int promoted_internal_boundary_count = 0;
 	int unresolved_internal_input_count = 0;
+	int unresolved_untraceable_input_count = 0;
+	int constant_completed_traceable_count = 0;
+	int constant_completed_untraceable_count = 0;
 	std::vector<string> promoted_internal_boundary_samples;
 	std::vector<string> unresolved_internal_input_samples;
+	std::vector<string> constant_completed_samples;
 	bool ran = false;
 	bool proved = false;
 	bool residual_hierarchy = false;
@@ -290,6 +298,7 @@ struct ChildBoundaryPort
 	RTLIL::IdString child_mod;
 	RTLIL::IdString port;
 	RTLIL::IdString local_wire;
+	int width = 0;
 	int bit_index = 0;
 };
 
@@ -306,6 +315,7 @@ struct RegionBoundary
 	RTLIL::IdString gold_local_wire;
 	RTLIL::IdString gate_local_wire;
 	RTLIL::IdString canonical_wire;
+	int width = 0;
 	int bit_index = 0;
 	string boundary_kind = "child_output";
 };
@@ -323,9 +333,17 @@ struct PartitionedPair
 	int module_interface_input_count = 0;
 	int state_cut_input_count = 0;
 	int child_boundary_input_count = 0;
+	int passthrough_alias_input_count = 0;
+	int slice_or_concat_residual_count = 0;
+	int traceable_residual_input_count = 0;
+	int promoted_from_trace_count = 0;
 	int promoted_internal_boundary_count = 0;
 	int unresolved_internal_input_count = 0;
+	int unresolved_untraceable_input_count = 0;
 	int unresolved_internal_boundaries = 0;
+	int constant_completed_traceable_count = 0;
+	int constant_completed_untraceable_count = 0;
+	std::vector<string> constant_completed_samples;
 	bool residual_hierarchy = false;
 };
 
@@ -367,10 +385,18 @@ struct RegionProofResult
 	int module_interface_input_count = 0;
 	int state_cut_input_count = 0;
 	int child_boundary_input_count = 0;
+	int passthrough_alias_input_count = 0;
+	int slice_or_concat_residual_count = 0;
+	int traceable_residual_input_count = 0;
+	int promoted_from_trace_count = 0;
 	int promoted_internal_boundary_count = 0;
 	int unresolved_internal_input_count = 0;
+	int unresolved_untraceable_input_count = 0;
+	int constant_completed_traceable_count = 0;
+	int constant_completed_untraceable_count = 0;
 	std::vector<string> promoted_internal_boundary_samples;
 	std::vector<string> unresolved_internal_input_samples;
+	std::vector<string> constant_completed_samples;
 	bool residual_hierarchy = false;
 	double runtime_ms = 0;
 };
