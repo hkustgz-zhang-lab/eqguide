@@ -76,6 +76,7 @@ __pycache__
 *~
 .*.swp
 /.cache
+/.serena
 /.vscode
 /.cproject
 /.project
