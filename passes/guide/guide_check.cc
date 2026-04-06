@@ -35,6 +35,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <unistd.h>
 #include <fstream>
 #include <map>
 #include <sstream>
@@ -227,6 +228,7 @@ struct CheckConfig
     string sched_model_file;
     string match_model_file;
     string accept_match_suggestions_file;
+    bool local_validate_support_slice = false;
     SeqCheckConfig seq_check_cfg;
     MlDumpConfig dump_cfg;
     GuideSchedModel *sched_model = nullptr;
@@ -295,12 +297,37 @@ struct MatchResult
     MatchStats stats;
 };
 
+struct LocalValidateResult
+{
+    string pair_id;
+    int selected_cutpoints = 0;
+    int local_exact_total = 0;
+    bool ran = false;
+    bool proved = false;
+    double runtime_ms = 0;
+    string validator_backend = "local_abc";
+    bool used_bmc_fallback = false;
+};
+
 struct NamedSig {
     RTLIL::SigBit sig;
     MatchType type = MatchType::NONE;
     RTLIL::IdString wire_name;
     int bit_index = 0;
 };
+
+static std::vector<CutPoint> select_local_dff_cutpoints(const std::vector<CutPoint> &all_cps,
+                                                        const CutPoint *extra_cand = nullptr);
+static std::vector<CutPoint> dedup_local_dff_cutpoints(const std::vector<CutPoint> &cutpoints);
+static std::vector<CutPoint> select_support_sliced_dff_cutpoints(RTLIL::Module *gold_mod,
+                                                                 RTLIL::Module *gate_mod,
+                                                                 const std::vector<CutPoint> &all_cps,
+                                                                 const CutPoint &candidate);
+static LocalValidateResult validate_partition_pair(const CheckConfig &conf,
+                                                   RTLIL::Module *gold_mod,
+                                                   RTLIL::Module *gate_mod,
+                                                   const std::vector<CutPoint> &cutpoints);
+static bool bmcinduct_check(const CheckConfig &conf);
 
 static inline void print_timing_stat(const TimingStat& s) {
     std::uint64_t t_total = 0;
@@ -387,6 +414,23 @@ static string sanitize_filename(const string &s)
     return out;
 }
 
+static string path_dirname(const string &path)
+{
+    size_t pos = path.find_last_of('/');
+    if (pos == string::npos)
+        return ".";
+    return path.substr(0, pos);
+}
+
+static string pair_artifact_path(const string &dir_name, const string &prefix,
+                                 RTLIL::Module *gold_mod, RTLIL::Module *gate_mod,
+                                 const string &ext)
+{
+    return dir_name + "/" + prefix + "_" +
+        sanitize_filename(strip_backslash(gold_mod->name)) + "_" +
+        sanitize_filename(strip_backslash(gate_mod->name)) + ext;
+}
+
 static string get_pair_id(const RTLIL::IdString &gold_mod, const RTLIL::IdString &gate_mod)
 {
     return strip_backslash(gold_mod) + "__vs__" + strip_backslash(gate_mod);
@@ -452,6 +496,14 @@ static string make_command_log_file(const string &tempdir_name, const string &ta
     string dir_name = tempdir_name.empty() ? get_base_tmpdir() : tempdir_name;
     string log_file = dir_name + "/" + sanitize_filename(tag) + "-XXXXXX.log";
     return make_temp_file(log_file);
+}
+
+static string resolve_yosys_smtbmc_executable()
+{
+    string local = proc_self_dirname() + proc_program_prefix() + "yosys-smtbmc";
+    if (access(local.c_str(), X_OK) == 0)
+        return local;
+    return "yosys-smtbmc";
 }
 
 static std::vector<string> extract_failure_clues(const string &output)
@@ -1410,6 +1462,15 @@ static string match_suggestions_path(const string &match_jsonl)
     return match_jsonl.substr(0, pos + 1) + "match_suggestions.json";
 }
 
+static string match_artifact_dir(const CheckConfig &conf)
+{
+    if (conf.dump_cfg.dump_match && !conf.dump_cfg.match_jsonl.empty())
+        return path_dirname(conf.dump_cfg.match_jsonl);
+    if (!conf.accept_match_suggestions_file.empty())
+        return path_dirname(conf.accept_match_suggestions_file);
+    return conf.tempdir_name;
+}
+
 static Json::array load_match_suggestions_file(const string &path)
 {
     if (path.empty())
@@ -1430,6 +1491,16 @@ static Json::array load_match_suggestions_file(const string &path)
     return json.array_items();
 }
 
+static void write_match_line(FILE *f, const RTLIL::IdString &name,
+                             RTLIL::SigBit gsig, RTLIL::SigBit ksig, MatchType type)
+{
+    if (f == nullptr)
+        return;
+    fprintf(f, "Matched signal %s: gold %s gate %s, Type %s\n",
+        name.c_str(), log_signal(gsig).c_str(), log_signal(ksig).c_str(),
+        get_match_type_str(type).c_str());
+}
+
 static MatchResult match_signals_module(RTLIL::Design *design, RTLIL::Module *gold_mod, RTLIL::Module *gate_mod,
                                         const CheckConfig &conf, bool emit_match_file, const string &snapshot_name)
 {
@@ -1444,10 +1515,21 @@ static MatchResult match_signals_module(RTLIL::Design *design, RTLIL::Module *go
     string pair_id = get_pair_id(gold_mod->name, gate_mod->name);
     string match_file = conf.tempdir_name + "/match_" + RTLIL::unescape_id(gold_mod->name) + "_" + RTLIL::unescape_id(gate_mod->name) + ".txt";
     result.stats.match_file = match_file;
+    string artifact_dir = match_artifact_dir(conf);
+    string match_exact_file = pair_artifact_path(artifact_dir, "match_exact", gold_mod, gate_mod, ".txt");
+    string match_validated_file = pair_artifact_path(artifact_dir, "match_validated", gold_mod, gate_mod, ".txt");
+    string match_suggestions_jsonl = pair_artifact_path(artifact_dir, "match_suggestions", gold_mod, gate_mod, ".jsonl");
+    string local_validate_jsonl = pair_artifact_path(artifact_dir, "local_validate", gold_mod, gate_mod, ".jsonl");
 
     FILE *f = nullptr;
+    FILE *f_exact = nullptr;
+    FILE *f_validated = nullptr;
     if (emit_match_file)
         f = fopen(match_file.c_str(), "w");
+    if (emit_match_file)
+        f_exact = fopen(match_exact_file.c_str(), "w");
+    if (emit_match_file)
+        f_validated = fopen(match_validated_file.c_str(), "w");
 
     pool<RTLIL::IdString> matched_gold;
     pool<RTLIL::IdString> matched_gate;
@@ -1470,10 +1552,10 @@ static MatchResult match_signals_module(RTLIL::Design *design, RTLIL::Module *go
         // ! Warning: NONE type gentry may has the same signal name with DFF/other type's.
         // This will lead to overwriting in name mapping in ABC. If didn't solve this in 
         // ABC. Please DO NOT dump NONE type entries!
-        if(gentry.type != MatchType::NONE && f != nullptr){
-            fprintf(f, "Matched signal %s: gold %s gate %s, Type %s\n",
-                name.c_str(), log_signal(gsig).c_str(), log_signal(ksig).c_str(), 
-                get_match_type_str(gentry.type).c_str());
+        if (gentry.type != MatchType::NONE) {
+            write_match_line(f, name, gsig, ksig, gentry.type);
+            write_match_line(f_exact, name, gsig, ksig, gentry.type);
+            write_match_line(f_validated, name, gsig, ksig, gentry.type);
         }
         matched_gold.insert(name);
         matched_gate.insert(name);
@@ -1490,6 +1572,8 @@ static MatchResult match_signals_module(RTLIL::Design *design, RTLIL::Module *go
     result.stats.unmatched_gate = GetSize(gate) - GetSize(matched_gate);
 
     int applied_suggestions = 0;
+    int validated_dff_suggestions = 0;
+    int rejected_dff_suggestions = 0;
     if (emit_match_file && !conf.accept_match_suggestions_file.empty()) {
         Json::array accepted = load_match_suggestions_file(conf.accept_match_suggestions_file);
         for (auto &item : accepted) {
@@ -1499,11 +1583,28 @@ static MatchResult match_signals_module(RTLIL::Design *design, RTLIL::Module *go
                 continue;
             if (item["snapshot"].string_value() != "pre_async")
                 continue;
-            if (item["score_margin"].number_value() <= 0)
-                continue;
 
             RTLIL::IdString gold_name = RTLIL::escape_id(item["gold_name"].string_value());
             RTLIL::IdString gate_name = RTLIL::escape_id(item["suggested_gate_name"].string_value());
+            if (item["score_margin"].number_value() <= 0) {
+                append_jsonl(local_validate_jsonl, Json::object {
+                    {"design", strip_backslash(conf.gold_mod->name)},
+                    {"gold_mod", strip_backslash(gold_mod->name)},
+                    {"gate_mod", strip_backslash(gate_mod->name)},
+                    {"pair_id", pair_id},
+                    {"signal_name", strip_backslash(gold_name)},
+                    {"match_type", item["type"].string_value()},
+                    {"source", "ml_raw"},
+                    {"score", item["score"].number_value()},
+                    {"margin", item["score_margin"].number_value()},
+                    {"validator_result", "skip"},
+                    {"skip_reason", "margin_gate"},
+                    {"validator_backend", ""},
+                    {"runtime_ms", 0.0},
+                    {"accepted", false}
+                });
+                continue;
+            }
             if (!gold.count(gold_name) || !gate.count(gate_name))
                 continue;
             if (matched_gold.count(gold_name) || matched_gate.count(gate_name))
@@ -1518,11 +1619,51 @@ static MatchResult match_signals_module(RTLIL::Design *design, RTLIL::Module *go
 
             RTLIL::SigBit gsig = gentry.sig;
             RTLIL::SigBit ksig = kentry.sig;
-            if (f != nullptr) {
-                fprintf(f, "Matched signal %s: gold %s gate %s, Type %s\n",
-                    gold_name.c_str(), log_signal(gsig).c_str(), log_signal(ksig).c_str(),
-                    get_match_type_str(gentry.type).c_str());
+            CutPoint candidate_cutpoint{gold_name, gsig, ksig, gentry.type,
+                    gold_ff_q_map.count(gsig) ? gold_ff_q_map[gsig] : nullptr,
+                    gate_ff_q_map.count(ksig) ? gate_ff_q_map[ksig] : nullptr,
+                    gentry.wire_name, gentry.bit_index,
+                    kentry.wire_name, kentry.bit_index};
+
+            if (gentry.type == MatchType::DFF || gentry.type == MatchType::DFF_PO) {
+                std::vector<CutPoint> local_cutpoints =
+                    conf.local_validate_support_slice ?
+                    select_support_sliced_dff_cutpoints(gold_mod, gate_mod, result.cut_points, candidate_cutpoint) :
+                    select_local_dff_cutpoints(result.cut_points, &candidate_cutpoint);
+                LocalValidateResult local_result =
+                    validate_partition_pair(conf, gold_mod, gate_mod, local_cutpoints);
+                append_jsonl(local_validate_jsonl, Json::object {
+                    {"design", strip_backslash(conf.gold_mod->name)},
+                    {"gold_mod", strip_backslash(gold_mod->name)},
+                    {"gate_mod", strip_backslash(gate_mod->name)},
+                    {"pair_id", pair_id},
+                    {"signal_name", strip_backslash(gold_name)},
+                    {"match_type", get_match_type_str(gentry.type)},
+                    {"source", "ml_raw"},
+                    {"score", item["score"].number_value()},
+                    {"margin", item["score_margin"].number_value()},
+                    {"validator_result", local_result.proved ? "pass" : "fail"},
+                    {"validator_backend", local_result.validator_backend},
+                    {"used_bmc_fallback", local_result.used_bmc_fallback},
+                    {"runtime_ms", local_result.runtime_ms},
+                    {"accepted", local_result.proved},
+                    {"selected_cutpoints", local_result.selected_cutpoints},
+                    {"local_exact_total", local_result.local_exact_total},
+                    {"slice_mode", conf.local_validate_support_slice ? "support_slice" : "all_dff"}
+                });
+                if (!local_result.proved) {
+                    rejected_dff_suggestions++;
+                    log("Rejected DFF suggestion %s -> %s for pair %s: local validation failed.\n",
+                        gold_name.c_str(), gate_name.c_str(), pair_id.c_str());
+                    continue;
+                }
+                validated_dff_suggestions++;
+                log("Validated DFF suggestion %s -> %s for pair %s.\n",
+                    gold_name.c_str(), gate_name.c_str(), pair_id.c_str());
             }
+
+            write_match_line(f, gold_name, gsig, ksig, gentry.type);
+            write_match_line(f_validated, gold_name, gsig, ksig, gentry.type);
 
             matched_gold.insert(gold_name);
             matched_gate.insert(gate_name);
@@ -1540,13 +1681,18 @@ static MatchResult match_signals_module(RTLIL::Design *design, RTLIL::Module *go
         result.stats.unmatched_gate = GetSize(gate) - GetSize(matched_gate);
         if (conf.telemetry != nullptr && applied_suggestions > 0)
             conf.telemetry->pair_applied_match_suggestions[pair_id] = applied_suggestions;
-        if (applied_suggestions > 0)
-            log("Applied %d match suggestions for pair %s.\n",
-                applied_suggestions, pair_id.c_str());
+        if (applied_suggestions > 0 || validated_dff_suggestions > 0 || rejected_dff_suggestions > 0)
+            log("Applied %d match suggestions for pair %s (%d DFF validated, %d DFF rejected).\n",
+                applied_suggestions, pair_id.c_str(),
+                validated_dff_suggestions, rejected_dff_suggestions);
     }
 
     if (f != nullptr)
         fclose(f);
+    if (f_exact != nullptr)
+        fclose(f_exact);
+    if (f_validated != nullptr)
+        fclose(f_validated);
 
     if (conf.dump_cfg.dump_match) {
         Json::array suggestions;
@@ -1638,6 +1784,7 @@ static MatchResult match_signals_module(RTLIL::Design *design, RTLIL::Module *go
                     {"score_margin", score_margin}
                 };
                 suggestions.push_back(suggestion);
+                append_jsonl(match_suggestions_jsonl, suggestion);
                 if (conf.telemetry != nullptr && snapshot_name == "pre_async")
                     conf.telemetry->match_suggestions.push_back(suggestion);
             }
@@ -1753,22 +1900,19 @@ static void cutpoints_to_pi_po(RTLIL::Module *mod,
             continue;
         }
 
-        bool is_dff_po = (cp.type == MatchType::DFF_PO);
         cut_q_bits.insert(qbit_mapped);
         cut_cells.insert(ff);
 
         RTLIL::SigBit pi_bit = qbit_port;
-        if (!is_dff_po) {
-            if (qbit_port.wire->port_output) {
-                RTLIL::Wire *pi_wire = make_port_wire(cp.name, "_pi", 1, true, false);
-                pi_bit = RTLIL::SigBit(pi_wire);
-                pending_q_conns.emplace_back(RTLIL::SigSpec(qbit_port), RTLIL::SigSpec(pi_wire));
-            } else {
-                qbit_port.wire->port_input = true;
-            }
-            if (qbit_mapped != pi_bit)
-                pending_q_conns.emplace_back(RTLIL::SigSpec(qbit_mapped), RTLIL::SigSpec(pi_bit));
+        if (qbit_port.wire->port_output) {
+            RTLIL::Wire *pi_wire = make_port_wire(cp.name, "_pi", 1, true, false);
+            pi_bit = RTLIL::SigBit(pi_wire);
+            pending_q_conns.emplace_back(RTLIL::SigSpec(qbit_port), RTLIL::SigSpec(pi_wire));
+        } else {
+            qbit_port.wire->port_input = true;
         }
+        if (qbit_mapped != pi_bit)
+            pending_q_conns.emplace_back(RTLIL::SigSpec(qbit_mapped), RTLIL::SigSpec(pi_bit));
 
         RTLIL::SigSpec qsig = sigmap(ff->getPort(ID::Q));
         RTLIL::SigSpec dsig = sigmap(ff->getPort(ID::D));
@@ -1799,14 +1943,8 @@ static void cutpoints_to_pi_po(RTLIL::Module *mod,
             continue;
         }
         RTLIL::SigBit dbit = dsig[qidx];
-        if (is_dff_po) {
-            pending_q_conns.emplace_back(RTLIL::SigSpec(qbit_mapped), RTLIL::SigSpec(dbit));
-            if (qbit_port != qbit_mapped)
-                pending_q_conns.emplace_back(RTLIL::SigSpec(qbit_port), RTLIL::SigSpec(qbit_mapped));
-        } else {
-            RTLIL::Wire *w_out = make_port_wire(cp.name, "_po", 1, false, true);
-            mod->connect(RTLIL::SigSpec(w_out), RTLIL::SigSpec(dbit));
-        }
+        RTLIL::Wire *w_out = make_port_wire(cp.name, "_po", 1, false, true);
+        mod->connect(RTLIL::SigSpec(w_out), RTLIL::SigSpec(dbit));
     }
 
     if (!cut_q_bits.empty()) {
@@ -1837,6 +1975,229 @@ static void cutpoints_to_pi_po(RTLIL::Module *mod,
         mod->remove(ff);
 
     mod->fixup_ports();
+}
+
+static std::vector<CutPoint> select_local_dff_cutpoints(const std::vector<CutPoint> &all_cps,
+                                                        const CutPoint *extra_cand)
+{
+    std::vector<CutPoint> out;
+    auto is_dff_cp = [](const CutPoint &cp) {
+        return cp.type == MatchType::DFF;
+    };
+
+    for (auto &cp : all_cps)
+        if (is_dff_cp(cp))
+            out.push_back(cp);
+
+    if (extra_cand != nullptr && is_dff_cp(*extra_cand)) {
+        bool found = false;
+        for (auto &cp : out)
+            if (cp.name == extra_cand->name && cp.type == extra_cand->type) {
+                found = true;
+                break;
+            }
+        if (!found)
+            out.push_back(*extra_cand);
+    }
+
+    return dedup_local_dff_cutpoints(out);
+}
+
+static std::vector<CutPoint> dedup_local_dff_cutpoints(const std::vector<CutPoint> &cutpoints)
+{
+    dict<string, CutPoint> selected;
+
+    auto key_of = [](const CutPoint &cp) {
+        if (cp.gold_ff_cell != nullptr && cp.gate_ff_cell != nullptr)
+            return string("ff:") + cp.gold_ff_cell->name.str() + "||" + cp.gate_ff_cell->name.str();
+        return string("sig:") + log_signal(cp.gold_sig) + "||" + log_signal(cp.gate_sig);
+    };
+
+    auto prefer = [](const CutPoint &candidate, const CutPoint &current) {
+        if (candidate.type == current.type)
+            return false;
+        if (candidate.type == MatchType::DFF && current.type == MatchType::DFF_PO)
+            return true;
+        return false;
+    };
+
+    for (const auto &cp : cutpoints) {
+        string key = key_of(cp);
+        if (!selected.count(key) || prefer(cp, selected.at(key)))
+            selected[key] = cp;
+    }
+
+    std::vector<CutPoint> out;
+    for (const auto &cp : cutpoints) {
+        string key = key_of(cp);
+        if (!selected.count(key))
+            continue;
+        if (selected.at(key).name != cp.name || selected.at(key).type != cp.type)
+            continue;
+        out.push_back(cp);
+        selected.erase(key);
+    }
+    return out;
+}
+
+static RTLIL::SigBit get_cutpoint_d_bit(RTLIL::Module *mod, const CutPoint &cp, bool use_gold, bool &ok)
+{
+    ok = false;
+    SigMap sigmap(mod);
+
+    RTLIL::Cell *ff = use_gold ? cp.gold_ff_cell : cp.gate_ff_cell;
+    if (ff != nullptr)
+        ff = mod->cell(ff->name);
+
+    RTLIL::IdString qwire_name = use_gold ? cp.gold_wire_name : cp.gate_wire_name;
+    int qbit_index = use_gold ? cp.gold_bit_index : cp.gate_bit_index;
+    if (ff == nullptr || qwire_name.empty())
+        return RTLIL::SigBit();
+
+    RTLIL::Wire *qwire = mod->wire(qwire_name);
+    if (qwire == nullptr || qbit_index < 0 || qbit_index >= GetSize(qwire))
+        return RTLIL::SigBit();
+
+    RTLIL::SigBit qbit_port(qwire, qbit_index);
+    RTLIL::SigBit qbit_mapped = sigmap(qbit_port);
+    RTLIL::SigSpec qsig = sigmap(ff->getPort(ID::Q));
+    RTLIL::SigSpec dsig = sigmap(ff->getPort(ID::D));
+
+    int qidx = -1;
+    for (int i = 0; i < GetSize(qsig); i++)
+        if (qsig[i] == qbit_mapped) {
+            qidx = i;
+            break;
+        }
+
+    if (qidx < 0) {
+        if (GetSize(qsig) > 1) {
+            if (qbit_index < 0 || qbit_index >= GetSize(qsig))
+                return RTLIL::SigBit();
+            qidx = qbit_index;
+        } else {
+            qidx = 0;
+        }
+    }
+
+    if (qidx < 0 || qidx >= GetSize(dsig))
+        return RTLIL::SigBit();
+
+    ok = true;
+    return dsig[qidx];
+}
+
+static std::vector<CutPoint> select_support_sliced_dff_cutpoints(RTLIL::Module *gold_mod,
+                                                                 RTLIL::Module *gate_mod,
+                                                                 const std::vector<CutPoint> &all_cps,
+                                                                 const CutPoint &candidate)
+{
+    auto is_dff_cp = [](const CutPoint &cp) {
+        return cp.type == MatchType::DFF;
+    };
+
+    auto collect_slice = [&](RTLIL::Module *mod, bool use_gold, pool<RTLIL::IdString> &selected) {
+        SigMap sigmap(mod);
+        dict<RTLIL::SigBit, const CutPoint*> qbit_to_cp;
+        dict<RTLIL::SigBit, pool<RTLIL::SigBit>> deps;
+
+        for (const auto &cp : all_cps) {
+            if (!is_dff_cp(cp))
+                continue;
+            RTLIL::SigBit qbit = sigmap(use_gold ? cp.gold_sig : cp.gate_sig);
+            if (qbit.is_wire())
+                qbit_to_cp[qbit] = &cp;
+        }
+
+        for (auto &conn : mod->connections()) {
+            RTLIL::SigSpec lhs = sigmap(conn.first);
+            RTLIL::SigSpec rhs = sigmap(conn.second);
+            int width = std::min(GetSize(lhs), GetSize(rhs));
+            for (int i = 0; i < width; i++)
+                if (lhs[i].is_wire() && rhs[i].is_wire() && lhs[i] != rhs[i])
+                    deps[lhs[i]].insert(rhs[i]);
+        }
+
+        for (auto cell : mod->cells()) {
+            pool<RTLIL::SigBit> input_bits;
+            pool<RTLIL::SigBit> output_bits;
+            bool is_ff = cell->is_builtin_ff() || cell->type == ID($anyinit) || cell->type.contains("DFF");
+
+            for (auto &conn : cell->connections()) {
+                RTLIL::IdString port = conn.first;
+                RTLIL::SigSpec sig = sigmap(conn.second);
+                bool is_output = yosys_celltypes.cell_output(cell->type, port);
+                bool is_input = yosys_celltypes.cell_input(cell->type, port);
+
+                if (is_output)
+                    for (auto bit : sig)
+                        if (bit.is_wire())
+                            output_bits.insert(bit);
+                if (!is_output && is_input)
+                    for (auto bit : sig)
+                        if (bit.is_wire())
+                            input_bits.insert(bit);
+            }
+
+            if (is_ff)
+                continue;
+
+            for (auto out_bit : output_bits)
+                for (auto in_bit : input_bits)
+                    if (out_bit != in_bit)
+                        deps[out_bit].insert(in_bit);
+        }
+
+        pool<RTLIL::SigBit> visited;
+        std::vector<RTLIL::SigBit> stack;
+        bool ok = false;
+        RTLIL::SigBit seed = sigmap(get_cutpoint_d_bit(mod, candidate, use_gold, ok));
+        if (!ok || !seed.is_wire())
+            return;
+        stack.push_back(seed);
+
+        while (!stack.empty()) {
+            RTLIL::SigBit bit = stack.back();
+            stack.pop_back();
+            if (!bit.is_wire() || visited.count(bit))
+                continue;
+            visited.insert(bit);
+
+            if (qbit_to_cp.count(bit)) {
+                selected.insert(qbit_to_cp.at(bit)->name);
+                continue;
+            }
+
+            if (bit.wire->port_input)
+                continue;
+            if (!deps.count(bit))
+                continue;
+            for (auto dep_bit : deps.at(bit))
+                if (dep_bit.is_wire() && !visited.count(dep_bit))
+                    stack.push_back(dep_bit);
+        }
+    };
+
+    pool<RTLIL::IdString> selected_names;
+    collect_slice(gold_mod, true, selected_names);
+    collect_slice(gate_mod, false, selected_names);
+    selected_names.insert(candidate.name);
+
+    std::vector<CutPoint> out;
+    for (const auto &cp : all_cps)
+        if (is_dff_cp(cp) && selected_names.count(cp.name))
+            out.push_back(cp);
+    if (is_dff_cp(candidate)) {
+        bool found = false;
+        for (const auto &cp : out)
+            if (cp.name == candidate.name && cp.type == candidate.type) {
+                found = true;
+                break;
+            }
+        if (!found)
+            out.push_back(candidate);
+    }
+    return dedup_local_dff_cutpoints(out);
 }
 
 
@@ -1944,6 +2305,21 @@ static void submod_to_pi_po(RTLIL::Design *design, RTLIL::Module *mod)
     mod->fixup_ports();
 }
 
+static void restrict_local_output_ports(RTLIL::Module *mod)
+{
+    for (auto *w : mod->wires()) {
+        if (!w->port_output)
+            continue;
+        string name = strip_backslash(w->name);
+        if (name.size() >= 3 && name.substr(name.size() - 3) == "_po")
+            continue;
+        w->port_output = false;
+    }
+    mod->fixup_ports();
+}
+
+static bool abc_cec_module(const CheckConfig &conf, bool fatal = true);
+
 static std::vector<RTLIL::Module*> topo_sort_modules(RTLIL::Design *design, const RTLIL::IdString& root);
 
 // The function still has bug
@@ -1968,26 +2344,35 @@ static std::pair<RTLIL::Module*, RTLIL::Module*> partition_module(RTLIL::Design 
     RTLIL::Module *gold_mod, RTLIL::Module *gate_mod,  //pointer in design
     const std::vector<CutPoint>& cutpoints, const CheckConfig& conf)
 {
-    // Maybe implement further.
-    assert(0);
-    (void) design;
-    (void) design_check;
+    log_assert(design);
+    log_assert(design_check);
+    log_assert(gold_mod);
+    log_assert(gate_mod);
     (void) conf;
 
     RTLIL::Module *gold_clone = gold_mod->clone();
     RTLIL::Module *gate_clone = gate_mod->clone();
 
+    gold_clone->name = RTLIL::escape_id(strip_backslash(gold_mod->name) + "__local");
+    gate_clone->name = RTLIL::escape_id(strip_backslash(gate_mod->name) + "__local");
+
     // convert_ff_to_fine(gold_clone);
     // convert_ff_to_fine(gate_clone);
-
 
     cutpoints_to_pi_po(gold_clone, cutpoints, true);
     cutpoints_to_pi_po(gate_clone, cutpoints, false);
 
-    // blackbox_to_pi_po(design, gold_clone);
-    // blackbox_to_pi_po(design, gate_clone);
+    submod_to_pi_po(design, gold_clone);
+    submod_to_pi_po(design, gate_clone);
+    restrict_local_output_ports(gold_clone);
+    restrict_local_output_ports(gate_clone);
 
-    return {gold_clone, gate_clone};
+    design_check->add(gold_clone);
+    design_check->add(gate_clone);
+    run_pass("opt_clean", design_check);
+    run_pass("check", design_check);
+
+    return {design_check->module(gold_clone->name), design_check->module(gate_clone->name)};
 }
 
 // Maybe implement further.
@@ -2002,9 +2387,126 @@ static std::pair<RTLIL::Module*, RTLIL::Module*> partition_module(RTLIL::Design 
 
         auto module_partition = 
             partition_module(design, design_check, gold_mod, gate_mod, cutpoints, conf);
-        design_check->add(module_partition.first);
-        design_check->add(module_partition.second);
+        (void)module_partition;
     }
+}
+
+static LocalValidateResult validate_partition_pair(const CheckConfig &conf,
+                                                   RTLIL::Module *gold_mod,
+                                                   RTLIL::Module *gate_mod,
+                                                   const std::vector<CutPoint> &cutpoints)
+{
+    auto t_start = std::chrono::steady_clock::now();
+    LocalValidateResult result;
+    result.pair_id = get_pair_id(gold_mod->name, gate_mod->name);
+    result.selected_cutpoints = GetSize(cutpoints);
+    if (cutpoints.empty())
+        return result;
+
+    RTLIL::Design *design_check = empty_design();
+    auto local_pair = partition_module(conf.design, design_check, gold_mod, gate_mod, cutpoints, conf);
+
+    GuideTelemetry local_telemetry;
+    CheckConfig local_conf = conf;
+    local_conf.design = design_check;
+    local_conf.gold_mod = local_pair.first;
+    local_conf.gate_mod = local_pair.second;
+    local_conf.sched_model_file = "";
+    local_conf.match_model_file = "";
+    local_conf.accept_match_suggestions_file = "";
+    local_conf.dump_cfg = MlDumpConfig();
+    local_conf.sched_model = nullptr;
+    local_conf.match_model = nullptr;
+    local_conf.telemetry = &local_telemetry;
+
+    MatchResult local_match =
+        match_signals_module(design_check, local_conf.gold_mod, local_conf.gate_mod,
+                             local_conf, true, "local_partition");
+    local_telemetry.pair_match_stats[get_pair_id(local_conf.gold_mod->name, local_conf.gate_mod->name)] =
+        local_match.stats;
+
+    result.local_exact_total = local_match.stats.exact_total;
+    result.ran = true;
+    result.proved = abc_cec_module(local_conf, false);
+    result.validator_backend = "local_abc";
+    if (!result.proved) {
+        bool residual_state = module_has_dff(local_conf.gold_mod, false) || module_has_dff(local_conf.gate_mod, true);
+        bool residual_hierarchy = module_has_submodule(design_check, local_conf.gold_mod) || module_has_submodule(design_check, local_conf.gate_mod);
+        if (residual_state || residual_hierarchy) {
+            result.used_bmc_fallback = true;
+            bool bmc_ok = bmcinduct_check(local_conf);
+            result.validator_backend = "local_abc_bmc";
+            if (bmc_ok)
+                result.proved = true;
+        }
+    }
+    auto t_end = std::chrono::steady_clock::now();
+    result.runtime_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_end - t_start).count();
+
+    delete design_check;
+    return result;
+}
+
+static void run_local_validate_shadow(const CheckConfig &conf, ModMap &mod_map,
+                                      const dict<RTLIL::Module*, std::vector<CutPoint>> &gold2cutpoints)
+{
+    int ran_pairs = 0;
+    int skipped_pairs = 0;
+    int passed_pairs = 0;
+    int failed_pairs = 0;
+
+    log("Running local DFF shadow validation.\n");
+    string artifact_dir = match_artifact_dir(conf);
+    for (const auto &[gold_name, gate_name] : mod_map.mod_map_gold) {
+        RTLIL::Module *gold_mod = conf.design->module(gold_name);
+        RTLIL::Module *gate_mod = conf.design->module(gate_name);
+        if (gold_mod == nullptr || gate_mod == nullptr)
+            continue;
+        if (!gold2cutpoints.count(gold_mod))
+            continue;
+
+        std::vector<CutPoint> local_cutpoints = select_local_dff_cutpoints(gold2cutpoints.at(gold_mod));
+        if (local_cutpoints.empty()) {
+            skipped_pairs++;
+            log("LOCAL_VALIDATE shadow skipped for %s: no DFF cutpoints.\n",
+                get_pair_id(gold_name, gate_name).c_str());
+            continue;
+        }
+
+        LocalValidateResult result = validate_partition_pair(conf, gold_mod, gate_mod, local_cutpoints);
+        append_jsonl(pair_artifact_path(artifact_dir, "local_validate", gold_mod, gate_mod, ".jsonl"), Json::object {
+            {"design", strip_backslash(conf.gold_mod->name)},
+            {"gold_mod", strip_backslash(gold_mod->name)},
+            {"gate_mod", strip_backslash(gate_mod->name)},
+            {"pair_id", result.pair_id},
+            {"signal_name", ""},
+            {"match_type", "DFF_SET"},
+            {"source", "shadow_dff_set"},
+            {"score", 0},
+            {"margin", 0},
+            {"validator_result", result.proved ? "pass" : "fail"},
+            {"validator_backend", result.validator_backend},
+            {"used_bmc_fallback", result.used_bmc_fallback},
+            {"runtime_ms", result.runtime_ms},
+            {"accepted", false},
+            {"selected_cutpoints", result.selected_cutpoints},
+            {"local_exact_total", result.local_exact_total}
+        });
+        ran_pairs++;
+        if (result.proved)
+            passed_pairs++;
+        else
+            failed_pairs++;
+
+        log("LOCAL_VALIDATE shadow for %s: %s (%d DFF cutpoints, local exact=%d).\n",
+            result.pair_id.c_str(),
+            result.proved ? "\033[1;32mPASSED\033[0m" : "\033[1;31mFAILED\033[0m",
+            result.selected_cutpoints,
+            result.local_exact_total);
+    }
+
+    log("LOCAL_VALIDATE shadow summary: ran %d pair(s), passed %d, failed %d, skipped %d.\n",
+        ran_pairs, passed_pairs, failed_pairs, skipped_pairs);
 }
 
 static int exectue_and_check(const std::string & cmd, bool & correct,
@@ -2805,7 +3307,7 @@ static bool abc_check(const CheckConfig &conf, bool use_blif=false, string check
 
 
 
-static bool abc_cec_module(const CheckConfig &conf){
+static bool abc_cec_module(const CheckConfig &conf, bool fatal){
     auto count_module_dffs = [](RTLIL::Module *mod, bool gate_side) {
         int count = 0;
         for (auto cell : mod->cells()) {
@@ -2909,7 +3411,9 @@ static bool abc_cec_module(const CheckConfig &conf){
         if (exit_status != 0 || result_code == 0) {
             command_result.result_code = result_code;
             emit_failure_packet(conf, "ABC", action_name, command_result, {});
-            log_error("Error executing ABC command: %s\n", cmd.c_str());
+            if (fatal)
+                log_error("Error executing ABC command: %s\n", cmd.c_str());
+            log_warning("Error executing ABC command: %s\n", cmd.c_str());
         }
 
         run_record.pair_id = get_pair_id(conf.gold_mod->name, conf.gate_mod->name);
@@ -3074,6 +3578,7 @@ static std::vector<std::pair<RTLIL::IdString, bool>> abc_cec(const CheckConfig &
         .sched_model_file = conf.sched_model_file,
         .match_model_file = conf.match_model_file,
         .accept_match_suggestions_file = conf.accept_match_suggestions_file,
+        .local_validate_support_slice = conf.local_validate_support_slice,
         .seq_check_cfg = conf.seq_check_cfg,
         .dump_cfg = conf.dump_cfg,
         .sched_model = conf.sched_model,
@@ -3130,7 +3635,7 @@ static bool bmcinduct_check(const CheckConfig &conf){
 
     auto smt2_file = dump_smt2(conf.design, conf.tempdir_name, {conf.gold_mod, conf.gate_mod}, "");
 
-    string cmd = proc_self_dirname() + proc_program_prefix() + "yosys-smtbmc ";
+    string cmd = resolve_yosys_smtbmc_executable() + " ";
 
     if(conf.seq_check_cfg.no_init){
         cmd += "-noinit ";
@@ -3348,6 +3853,7 @@ Results check_retime(const CheckConfig &conf,
             .sched_model_file = conf.sched_model_file,
             .match_model_file = conf.match_model_file,
             .accept_match_suggestions_file = conf.accept_match_suggestions_file,
+            .local_validate_support_slice = conf.local_validate_support_slice,
             .seq_check_cfg = conf.seq_check_cfg,
             .dump_cfg = conf.dump_cfg,
             .sched_model = conf.sched_model,
@@ -3634,6 +4140,7 @@ struct GuideCheckRetimePass : public Pass {
             .sched_model_file = "",
             .match_model_file = "",
             .accept_match_suggestions_file = "",
+            .local_validate_support_slice = false,
             .seq_check_cfg = SeqCheckConfig{
                 .k_induct = k_induct,
                 .step_skip = step_skip,
@@ -3724,6 +4231,12 @@ struct GuideCheckPass : public Pass {
         log("    -guide-accept-match-suggestions <file>\n");
         log("        append accepted suggestions from the JSON file into match_file.\n");
         log("\n");
+        log("    -local-validate-shadow\n");
+        log("        shadow-run DFF-only local partition proofs without changing the final result.\n");
+        log("\n");
+        log("    -local-validate-support-slice\n");
+        log("        use candidate-centered support slicing for DFF suggestion validation.\n");
+        log("\n");
 	}
 	void execute(std::vector<std::string> args, RTLIL::Design *design) override
 	{
@@ -3742,6 +4255,8 @@ struct GuideCheckPass : public Pass {
         string sched_model_file;
         string match_model_file;
         string accept_match_suggestions_file;
+        bool local_validate_shadow = false;
+        bool local_validate_support_slice = false;
         MlDumpConfig dump_cfg;
         
         size_t argidx;
@@ -3805,6 +4320,14 @@ struct GuideCheckPass : public Pass {
             }
             if (args[argidx] == "-guide-accept-match-suggestions" && argidx + 1 < args.size()) {
                 accept_match_suggestions_file = args[++argidx];
+                continue;
+            }
+            if (args[argidx] == "-local-validate-shadow") {
+                local_validate_shadow = true;
+                continue;
+            }
+            if (args[argidx] == "-local-validate-support-slice") {
+                local_validate_support_slice = true;
                 continue;
             }
             break;
@@ -3906,6 +4429,7 @@ struct GuideCheckPass : public Pass {
             .sched_model_file = sched_model_file,
             .match_model_file = match_model_file,
             .accept_match_suggestions_file = accept_match_suggestions_file,
+            .local_validate_support_slice = local_validate_support_slice,
             .seq_check_cfg = seq_conf,
             .dump_cfg = dump_cfg,
             .sched_model = &sched_model,
@@ -3995,7 +4519,8 @@ struct GuideCheckPass : public Pass {
         
 
         auto gold2cutpoints = match_signals(design, conf, mod_map, true, "post_async");
-        (void)gold2cutpoints;
+        if (local_validate_shadow)
+            run_local_validate_shadow(conf, mod_map, gold2cutpoints);
         int total_applied_match_suggestions = 0;
         for (auto &it : telemetry.pair_applied_match_suggestions)
             total_applied_match_suggestions += it.second;
