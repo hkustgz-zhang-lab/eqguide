@@ -253,6 +253,21 @@ struct MatchResult
 	MatchStats stats;
 };
 
+struct LocalBitOrigin
+{
+	string origin_kind;
+	string source_id;
+	string orig_mod;
+	string orig_wire;
+	int orig_bit_index = -1;
+	string local_bit_name;
+	bool came_from_state_cut = false;
+	bool came_from_child_boundary = false;
+	bool came_from_promoted_boundary = false;
+	bool came_from_clone_wire = false;
+	bool came_from_alias_or_slice = false;
+};
+
 struct LocalValidateResult
 {
 	string pair_id;
@@ -279,11 +294,29 @@ struct LocalValidateResult
 	int const_comp_trace_rem_cnt = 0;
 	int const_comp_trace_cnt = 0;
 	int const_comp_untrace_cnt = 0;
+	int preblif_res_cnt = 0;
+	int preblif_trace_cnt = 0;
+	int preblif_prom_cnt = 0;
+	int preblif_untrace_cnt = 0;
+	int preblif_promoted_cnt = 0;
+	int blif_res_cnt = 0;
+	int blif_trace_cnt = 0;
+	int blif_prom_cnt = 0;
+	int blif_opaque_out_cnt = 0;
+	int blif_lib_resolved_cnt = 0;
+	int blif_untrace_cnt = 0;
+	int blif_promoted_cnt = 0;
 	std::vector<string> prom_int_bnd_samps;
 	std::vector<string> unr_int_in_samps;
 	std::vector<string> const_comp_prom_samps;
 	std::vector<string> const_comp_rem_samps;
 	std::vector<string> const_comp_samps;
+	std::vector<string> preblif_res_samps;
+	std::vector<string> preblif_prom_samps;
+	std::vector<string> preblif_rem_samps;
+	std::vector<string> blif_res_samps;
+	std::vector<string> blif_prom_samps;
+	std::vector<string> blif_rem_samps;
 	int shell_refine_iter_cnt = 0;
 	bool ran = false;
 	bool proved = false;
@@ -334,6 +367,8 @@ struct PartitionedPair
 	pool<string> boundary_bit_names;
 	pool<string> promoted_internal_boundary_bit_names;
 	pool<string> allowed_shell_input_bit_names;
+	dict<string, LocalBitOrigin> gold_bit_origins;
+	dict<string, LocalBitOrigin> gate_bit_origins;
 	std::vector<string> prom_int_bnd_samps;
 	std::vector<string> unr_int_in_samps;
 	int iface_in_cnt = 0;
@@ -352,9 +387,27 @@ struct PartitionedPair
 	int const_comp_trace_rem_cnt = 0;
 	int const_comp_trace_cnt = 0;
 	int const_comp_untrace_cnt = 0;
+	int preblif_res_cnt = 0;
+	int preblif_trace_cnt = 0;
+	int preblif_prom_cnt = 0;
+	int preblif_untrace_cnt = 0;
+	int preblif_promoted_cnt = 0;
+	int blif_res_cnt = 0;
+	int blif_trace_cnt = 0;
+	int blif_prom_cnt = 0;
+	int blif_opaque_out_cnt = 0;
+	int blif_lib_resolved_cnt = 0;
+	int blif_untrace_cnt = 0;
+	int blif_promoted_cnt = 0;
 	std::vector<string> const_comp_prom_samps;
 	std::vector<string> const_comp_rem_samps;
 	std::vector<string> const_comp_samps;
+	std::vector<string> preblif_res_samps;
+	std::vector<string> preblif_prom_samps;
+	std::vector<string> preblif_rem_samps;
+	std::vector<string> blif_res_samps;
+	std::vector<string> blif_prom_samps;
+	std::vector<string> blif_rem_samps;
 	int shell_refine_iter_cnt = 0;
 	bool resid_hier = false;
 };
@@ -409,11 +462,29 @@ struct RegionProofResult
 	int const_comp_trace_rem_cnt = 0;
 	int const_comp_trace_cnt = 0;
 	int const_comp_untrace_cnt = 0;
+	int preblif_res_cnt = 0;
+	int preblif_trace_cnt = 0;
+	int preblif_prom_cnt = 0;
+	int preblif_untrace_cnt = 0;
+	int preblif_promoted_cnt = 0;
+	int blif_res_cnt = 0;
+	int blif_trace_cnt = 0;
+	int blif_prom_cnt = 0;
+	int blif_opaque_out_cnt = 0;
+	int blif_lib_resolved_cnt = 0;
+	int blif_untrace_cnt = 0;
+	int blif_promoted_cnt = 0;
 	std::vector<string> prom_int_bnd_samps;
 	std::vector<string> unr_int_in_samps;
 	std::vector<string> const_comp_prom_samps;
 	std::vector<string> const_comp_rem_samps;
 	std::vector<string> const_comp_samps;
+	std::vector<string> preblif_res_samps;
+	std::vector<string> preblif_prom_samps;
+	std::vector<string> preblif_rem_samps;
+	std::vector<string> blif_res_samps;
+	std::vector<string> blif_prom_samps;
+	std::vector<string> blif_rem_samps;
 	int shell_refine_iter_cnt = 0;
 	bool resid_hier = false;
 	double runtime_ms = 0;

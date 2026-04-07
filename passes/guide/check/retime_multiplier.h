@@ -28,6 +28,9 @@ std::vector<RTLIL::Module*> topo_sort_modules(RTLIL::Design *design, const RTLIL
 Results check_retime(const CheckConfig &conf,
                      std::set<std::pair<RTLIL::IdString, RTLIL::IdString>> &retimed_mods);
 Results check_extract_retime(const ModMap &mmap, const CheckConfig &conf);
+RTLIL::Design *prepare_blif_module_design(RTLIL::Design *design, RTLIL::Module *mod,
+                                          const string &lib_file = string(),
+                                          int *inserted_bbconsts = nullptr);
 
 } // namespace guide_check
 YOSYS_NAMESPACE_END

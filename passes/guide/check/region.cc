@@ -25,6 +25,7 @@ static pool<string> region_boundary_bit_names(const std::vector<RegionBoundary> 
 static pool<string> collect_module_interface_input_bit_names(RTLIL::Module *mod);
 static pool<string> collect_state_cut_input_bit_names(const std::vector<CutPoint> &cutpoints);
 static void collect_wire_usage(RTLIL::Module *mod, pool<string> &driven_bits, pool<string> &used_bits);
+static bool find_module_bit(RTLIL::Module *mod, const string &bit_name, RTLIL::Wire *&wire, int &bit_idx);
 static void refine_shell_closure(PartitionedPair &pair, RTLIL::Module *gold_orig, RTLIL::Module *gate_orig,
                                  const std::vector<CutPoint> &cutpoints);
 static std::vector<ChildBoundaryPort> submod_to_pi_po(RTLIL::Design *design, RTLIL::Module *mod);
@@ -88,6 +89,8 @@ struct ShellAuditInfo
 
 struct ConstantCompletionAudit
 {
+    int total_count = 0;
+    int traceable_count = 0;
     int promotable_count = 0;
     int traceable_remaining_count = 0;
     int untraceable_count = 0;
@@ -96,7 +99,41 @@ struct ConstantCompletionAudit
     std::vector<TraceBoundaryPair> promotions;
 };
 
+struct LocalTraceDB
+{
+    pool<string> module_input_bits;
+    pool<string> used_bits;
+    pool<string> driven_bits;
+    dict<string, std::pair<string, string>> assign_source;
+    dict<string, string> cell_output_driver;
+    const dict<string, LocalBitOrigin> *origins = nullptr;
+};
+
+struct ResidualBitInfo
+{
+    string bit_name;
+    LocalBitOrigin origin;
+    bool traceable = false;
+    bool promotable = false;
+    string why;
+};
+
+struct BlifResidualInfo
+{
+    string blif_net_name;
+    string cell_name;
+    string port_name;
+    int bit_index = -1;
+    string local_bit_name;
+    ResidualBitInfo local_info;
+    bool opaque_cell_output = false;
+    bool library_resolved = false;
+};
+
 } // namespace
+
+static LocalTraceDB build_local_trace_db(RTLIL::Module *mod, const dict<string, LocalBitOrigin> &origins);
+static ResidualBitInfo trace_local_residual_origin(const LocalTraceDB &db, const string &bit_name);
 
 std::vector<CutPoint> select_local_dff_cutpoints(const std::vector<CutPoint> &all_cps,
                                                         const CutPoint *extra_cand)
@@ -412,6 +449,198 @@ void add_sample_name(std::vector<string> &samples, const string &name, size_t li
     samples.push_back(name);
 }
 
+static string make_origin_wire_source(const RTLIL::IdString &mod_name, const RTLIL::IdString &wire_name, int bit_idx)
+{
+    return stringf("orig:%s:%s[%d]",
+        strip_backslash(mod_name).c_str(),
+        strip_backslash(wire_name).c_str(),
+        bit_idx);
+}
+
+static LocalBitOrigin make_clone_bit_origin(RTLIL::Module *orig_mod, RTLIL::Wire *orig_wire, int bit_idx,
+                                            const string &local_bit_name)
+{
+    LocalBitOrigin origin;
+    origin.origin_kind = orig_wire->port_input ? "module_interface_input" : "clone_wire";
+    origin.source_id = orig_wire->port_input ?
+        stringf("if:%s:%s[%d]",
+            strip_backslash(orig_mod->name).c_str(),
+            strip_backslash(orig_wire->name).c_str(),
+            bit_idx) :
+        make_origin_wire_source(orig_mod->name, orig_wire->name, bit_idx);
+    origin.orig_mod = strip_backslash(orig_mod->name);
+    origin.orig_wire = strip_backslash(orig_wire->name);
+    origin.orig_bit_index = bit_idx;
+    origin.local_bit_name = local_bit_name;
+    origin.came_from_clone_wire = true;
+    return origin;
+}
+
+static void set_bit_origin(dict<string, LocalBitOrigin> &origins, const string &bit_name, LocalBitOrigin origin)
+{
+    origin.local_bit_name = bit_name;
+    origins[bit_name] = origin;
+}
+
+static void rename_bit_origin(dict<string, LocalBitOrigin> &origins, const string &old_bit_name,
+                              const string &new_bit_name, const char *kind_override = nullptr,
+                              bool mark_promoted = false)
+{
+    if (!origins.count(old_bit_name))
+        return;
+    LocalBitOrigin origin = origins.at(old_bit_name);
+    origins.erase(old_bit_name);
+    origin.local_bit_name = new_bit_name;
+    if (kind_override != nullptr)
+        origin.origin_kind = kind_override;
+    if (mark_promoted)
+        origin.came_from_promoted_boundary = true;
+    origins[new_bit_name] = origin;
+}
+
+static string child_boundary_source_id(const CheckConfig &conf, const ChildBoundaryPort &boundary, bool use_gold)
+{
+    RTLIL::IdString child_orig = get_orignal_mod_name(boundary.child_mod,
+        use_gold ? conf.gold_mod->name : conf.gate_mod->name,
+        use_gold ? conf.gold_prefix : conf.gate_prefix);
+    return stringf("child:%s:%s:%s[%d]",
+        strip_backslash(child_orig).c_str(),
+        strip_backslash(boundary.child_cell).c_str(),
+        strip_backslash(boundary.port).c_str(),
+        boundary.bit_index);
+}
+
+static void seed_clone_origins(dict<string, LocalBitOrigin> &origins, RTLIL::Module *local_mod, RTLIL::Module *orig_mod)
+{
+    for (auto *wire : local_mod->wires()) {
+        RTLIL::Wire *orig_wire = orig_mod->wire(wire->name);
+        if (orig_wire == nullptr)
+            continue;
+        int width = std::min(std::max(1, GetSize(wire)), std::max(1, GetSize(orig_wire)));
+        for (int i = 0; i < width; i++) {
+            string bit_name = wire_bit_name(wire->name, std::max(1, GetSize(wire)), i);
+            set_bit_origin(origins, bit_name, make_clone_bit_origin(orig_mod, orig_wire, i, bit_name));
+        }
+    }
+}
+
+static void seed_state_cut_origins(dict<string, LocalBitOrigin> &origins, const std::vector<CutPoint> &cutpoints)
+{
+    for (const auto &cp : cutpoints) {
+        string bit_name = wire_bit_name(RTLIL::escape_id(strip_backslash(cp.name) + "_pi"), 1, 0);
+        LocalBitOrigin origin;
+        origin.origin_kind = "state_cut";
+        origin.source_id = "state:" + strip_backslash(cp.name);
+        origin.orig_wire = strip_backslash(cp.name);
+        origin.orig_bit_index = 0;
+        origin.came_from_state_cut = true;
+        set_bit_origin(origins, bit_name, origin);
+    }
+}
+
+static void seed_child_boundary_origins(dict<string, LocalBitOrigin> &origins, const CheckConfig &conf,
+                                        const std::vector<ChildBoundaryPort> &boundaries, bool use_gold)
+{
+    for (const auto &boundary : boundaries) {
+        string bit_name = wire_bit_name(boundary.local_wire, std::max(1, boundary.width), boundary.bit_index);
+        LocalBitOrigin origin;
+        origin.origin_kind = "child_boundary";
+        origin.source_id = child_boundary_source_id(conf, boundary, use_gold);
+        origin.orig_mod = strip_backslash(boundary.child_mod);
+        origin.orig_wire = strip_backslash(boundary.port);
+        origin.orig_bit_index = boundary.bit_index;
+        origin.came_from_child_boundary = true;
+        set_bit_origin(origins, bit_name, origin);
+    }
+}
+
+static string residual_origin_sample(const char *side, const ResidualBitInfo &info)
+{
+    string kind = !info.origin.origin_kind.empty() ? info.origin.origin_kind : info.why;
+    string payload = !info.origin.source_id.empty() ? info.origin.source_id : kind;
+    return stringf("%s:%s:%s", side, info.bit_name.c_str(), payload.c_str());
+}
+
+static string blif_pin_name(const RTLIL::Cell *cell, const RTLIL::IdString &port, int bit_idx)
+{
+    if (bit_idx < 0)
+        return stringf("%s.%s", strip_backslash(cell->name).c_str(), strip_backslash(port).c_str());
+    return stringf("%s.%s[%d]", strip_backslash(cell->name).c_str(), strip_backslash(port).c_str(), bit_idx);
+}
+
+static string blif_residual_sample(const char *side, const BlifResidualInfo &info)
+{
+    string payload = info.blif_net_name;
+    if (!info.local_info.origin.source_id.empty())
+        payload += ":" + info.local_info.origin.source_id;
+    else if (!info.local_info.why.empty())
+        payload += ":" + info.local_info.why;
+    return stringf("%s:%s", side, payload.c_str());
+}
+
+static bool origin_is_promotable(const LocalBitOrigin &origin)
+{
+    if (origin.source_id.empty())
+        return false;
+    return origin.origin_kind == "module_interface_input" ||
+        origin.origin_kind == "clone_wire" ||
+        origin.origin_kind == "state_cut" ||
+        origin.origin_kind == "child_boundary" ||
+        origin.origin_kind == "promoted_boundary";
+}
+
+static void classify_blif_residual_names(const PartitionedPair &pair, const std::vector<string> &names,
+                                         int &blif_res_cnt, int &blif_trace_cnt, int &blif_prom_cnt,
+                                         int &blif_opaque_out_cnt, int &blif_untrace_cnt,
+                                         std::vector<string> &blif_res_samps,
+                                         std::vector<string> &blif_rem_samps)
+{
+    blif_res_cnt = 0;
+    blif_trace_cnt = 0;
+    blif_prom_cnt = 0;
+    blif_opaque_out_cnt = 0;
+    blif_untrace_cnt = 0;
+    blif_res_samps.clear();
+    blif_rem_samps.clear();
+
+    LocalTraceDB gold_db = build_local_trace_db(pair.gold_local, pair.gold_bit_origins);
+    LocalTraceDB gate_db = build_local_trace_db(pair.gate_local, pair.gate_bit_origins);
+    for (const auto &name : names) {
+        bool matched = false;
+        for (int side = 0; side < 2; side++) {
+            RTLIL::Module *mod = side == 0 ? pair.gold_local : pair.gate_local;
+            const LocalTraceDB &db = side == 0 ? gold_db : gate_db;
+            RTLIL::Wire *wire = nullptr;
+            int bit_idx = -1;
+            if (!find_module_bit(mod, name, wire, bit_idx))
+                continue;
+            matched = true;
+            blif_res_cnt++;
+            ResidualBitInfo info = trace_local_residual_origin(db, name);
+            string sample = residual_origin_sample(side == 0 ? "gold" : "gate", info);
+            add_sample_name(blif_res_samps, sample, 16);
+            if (name.find('.') != string::npos)
+                blif_opaque_out_cnt++;
+            if (info.traceable)
+                blif_trace_cnt++;
+            else
+                blif_untrace_cnt++;
+            if (info.promotable)
+                blif_prom_cnt++;
+            else
+                add_sample_name(blif_rem_samps, sample, 16);
+        }
+        if (!matched) {
+            blif_res_cnt++;
+            if (name.find('.') != string::npos)
+                blif_opaque_out_cnt++;
+            blif_untrace_cnt++;
+            add_sample_name(blif_res_samps, "abc:" + name, 16);
+            add_sample_name(blif_rem_samps, "abc:" + name, 16);
+        }
+    }
+}
+
 int parse_name_map_applied(const string &output)
 {
     size_t pos = output.find("Name map: applied ");
@@ -431,6 +660,59 @@ int parse_const_comp_net_cnt(const string &output)
         total += atoi(output.c_str() + pos);
     }
     return total;
+}
+
+static std::vector<string> parse_const_comp_net_names(const string &output)
+{
+    std::vector<string> out;
+    const string exact_prefix = "ABC_CONST0_NET ";
+    size_t exact_pos = 0;
+    while ((exact_pos = output.find(exact_prefix, exact_pos)) != string::npos) {
+        size_t line_end = output.find('\n', exact_pos);
+        if (line_end == string::npos)
+            line_end = output.size();
+        string line = output.substr(exact_pos + exact_prefix.size(), line_end - exact_pos - exact_prefix.size());
+        size_t sp = line.find(' ');
+        string net_name = sp == string::npos ? line : line.substr(sp + 1);
+        while (!net_name.empty() && std::isspace(static_cast<unsigned char>(net_name.front())))
+            net_name.erase(net_name.begin());
+        while (!net_name.empty() && std::isspace(static_cast<unsigned char>(net_name.back())))
+            net_name.pop_back();
+        if (!net_name.empty())
+            add_sample_name(out, net_name, 4096);
+        exact_pos = line_end;
+    }
+    if (!out.empty())
+        return out;
+
+    const string pattern = "Constant-0 drivers added to ";
+    size_t pos = 0;
+    while ((pos = output.find(pattern, pos)) != string::npos) {
+        size_t line_end = output.find('\n', pos);
+        if (line_end == string::npos)
+            break;
+        size_t next = line_end + 1;
+        size_t next_end = output.find('\n', next);
+        if (next_end == string::npos)
+            next_end = output.size();
+        string line = output.substr(next, next_end - next);
+        size_t start = 0;
+        while (start < line.size()) {
+            while (start < line.size() && std::isspace(static_cast<unsigned char>(line[start])))
+                start++;
+            size_t comma = line.find(',', start);
+            string token = comma == string::npos ? line.substr(start) : line.substr(start, comma - start);
+            while (!token.empty() && std::isspace(static_cast<unsigned char>(token.back())))
+                token.pop_back();
+            if (!token.empty() && token != "..." && token.find("...") == string::npos)
+                add_sample_name(out, token, 32);
+            if (comma == string::npos)
+                break;
+            start = comma + 1;
+        }
+        pos = next_end;
+    }
+    return out;
 }
 
 string canonical_region_boundary_wire(const CheckConfig &conf,
@@ -650,6 +932,147 @@ static BitTraceDB build_bit_trace_db(RTLIL::Module *mod)
     }
 
     return db;
+}
+
+static LocalTraceDB build_local_trace_db(RTLIL::Module *mod, const dict<string, LocalBitOrigin> &origins)
+{
+    LocalTraceDB db;
+    db.origins = &origins;
+    SigMap sigmap(mod);
+
+    for (auto *w : mod->wires()) {
+        int width = std::max(1, GetSize(w));
+        for (int i = 0; i < width; i++)
+            if (w->port_input)
+                db.module_input_bits.insert(wire_bit_name(w->name, width, i));
+    }
+
+    for (auto &conn : mod->connections()) {
+        RTLIL::SigSpec lhs_sig = conn.first;
+        RTLIL::SigSpec rhs_sig = conn.second;
+        int width = std::min(GetSize(lhs_sig), GetSize(rhs_sig));
+        for (int i = 0; i < width; i++) {
+            RTLIL::SigBit lhs = sigmap(lhs_sig[i]);
+            RTLIL::SigBit rhs = sigmap(rhs_sig[i]);
+            if (!lhs.is_wire())
+                continue;
+            string lhs_name = wire_bit_name(lhs.wire->name, std::max(1, GetSize(lhs.wire)), lhs.offset);
+            db.driven_bits.insert(lhs_name);
+            if (rhs.is_wire()) {
+                string rhs_name = wire_bit_name(rhs.wire->name, std::max(1, GetSize(rhs.wire)), rhs.offset);
+                string edge_kind =
+                    (GetSize(lhs.wire) == GetSize(rhs.wire) && lhs.offset == rhs.offset) ?
+                    "alias" : "slice_or_concat";
+                if (!db.assign_source.count(lhs_name))
+                    db.assign_source[lhs_name] = std::make_pair(rhs_name, edge_kind);
+                else
+                    db.assign_source[lhs_name] = std::make_pair(string(), "multi_driver");
+                db.used_bits.insert(rhs_name);
+            } else {
+                if (!db.assign_source.count(lhs_name))
+                    db.assign_source[lhs_name] = std::make_pair(string(), "const");
+                else
+                    db.assign_source[lhs_name] = std::make_pair(string(), "multi_driver");
+            }
+        }
+    }
+
+    for (auto *cell : mod->cells()) {
+        for (auto &conn : cell->connections()) {
+            RTLIL::IdString port = conn.first;
+            RTLIL::SigSpec sig = sigmap(conn.second);
+            bool is_output = yosys_celltypes.cell_output(cell->type, port);
+            bool is_input = yosys_celltypes.cell_input(cell->type, port);
+
+            for (auto bit : sig) {
+                if (!bit.is_wire())
+                    continue;
+                string bit_name = wire_bit_name(bit.wire->name, std::max(1, GetSize(bit.wire)), bit.offset);
+                if (is_output) {
+                    db.driven_bits.insert(bit_name);
+                    if (!db.cell_output_driver.count(bit_name))
+                        db.cell_output_driver[bit_name] = strip_backslash(cell->type);
+                }
+                if (is_input)
+                    db.used_bits.insert(bit_name);
+            }
+        }
+    }
+
+    return db;
+}
+
+static ResidualBitInfo trace_local_residual_origin(const LocalTraceDB &db, const string &bit_name)
+{
+    ResidualBitInfo info;
+    info.bit_name = bit_name;
+    string current = bit_name;
+    pool<string> seen;
+    bool saw_alias = false;
+    bool saw_slice_or_concat = false;
+    int depth = 0;
+
+    while (depth++ < 64) {
+        if (seen.count(current)) {
+            info.why = "other_unresolved";
+            return info;
+        }
+        seen.insert(current);
+
+        if (db.origins != nullptr && db.origins->count(current)) {
+            info.origin = db.origins->at(current);
+            info.origin.local_bit_name = bit_name;
+            info.origin.came_from_alias_or_slice |= saw_alias || saw_slice_or_concat;
+            info.traceable = !info.origin.source_id.empty();
+            info.promotable = info.traceable && origin_is_promotable(info.origin);
+            info.why = info.origin.origin_kind;
+            return info;
+        }
+
+        if (db.module_input_bits.count(current)) {
+            info.why = saw_slice_or_concat ? "slice_or_concat_residual" :
+                (saw_alias ? "passthrough_alias_input" : "module_input_unknown");
+            return info;
+        }
+
+        if (db.cell_output_driver.count(current)) {
+            info.why = "cell_output_residual";
+            return info;
+        }
+
+        if (db.assign_source.count(current)) {
+            auto edge = db.assign_source.at(current);
+            if (edge.second == "multi_driver") {
+                info.why = "other_unresolved";
+                return info;
+            }
+            if (edge.second == "const") {
+                info.why = "const_residual";
+                return info;
+            }
+            if (edge.first.empty()) {
+                info.why = "other_unresolved";
+                return info;
+            }
+            saw_alias = true;
+            if (edge.second == "slice_or_concat")
+                saw_slice_or_concat = true;
+            current = edge.first;
+            continue;
+        }
+
+        if (!db.driven_bits.count(current) && db.used_bits.count(current)) {
+            info.why = "undriven_unknown";
+            return info;
+        }
+
+        info.why = saw_slice_or_concat ? "slice_or_concat_residual" :
+            (saw_alias ? "passthrough_alias_input" : "other_unresolved");
+        return info;
+    }
+
+    info.why = "other_unresolved";
+    return info;
 }
 
 static BitTraceInfo trace_residual_source(const BitTraceDB &db, const string &bit_name)
@@ -945,34 +1368,30 @@ static ShellAuditInfo audit_shell_inputs(RTLIL::Module *gold_local,
 
 static ConstantCompletionAudit audit_constant_completed_nets(RTLIL::Module *gold_local,
                                                             RTLIL::Module *gate_local,
-                                                            const BitTraceDB &gold_db,
-                                                            const BitTraceDB &gate_db)
+                                                            const dict<string, LocalBitOrigin> &gold_origins,
+                                                            const dict<string, LocalBitOrigin> &gate_origins)
 {
-    ConstantCompletionAudit audit;
+    LocalTraceDB gold_db = build_local_trace_db(gold_local, gold_origins);
+    LocalTraceDB gate_db = build_local_trace_db(gate_local, gate_origins);
     pool<string> gold_bits = collect_undriven_used_internal_bit_names(gold_local);
     pool<string> gate_bits = collect_undriven_used_internal_bit_names(gate_local);
-    dict<string, BitTraceInfo> gold_info, gate_info;
+    ConstantCompletionAudit audit;
+    dict<string, ResidualBitInfo> gold_info, gate_info;
     dict<string, std::vector<string>> gold_prom_by_source, gate_prom_by_source;
 
-    auto sample_name = [](const char *side, const string &bit_name, const BitTraceInfo &trace) {
-        string kind = trace.kind.empty() ? "other_unresolved" : trace.kind;
-        if (!trace.source_id.empty())
-            return stringf("%s:%s:%s", side, bit_name.c_str(), trace.source_id.c_str());
-        return stringf("%s:%s:%s", side, bit_name.c_str(), kind.c_str());
+    auto fill_side = [&](const pool<string> &bits, const LocalTraceDB &db,
+                         dict<string, ResidualBitInfo> &info_map,
+                         dict<string, std::vector<string>> &prom_by_source) {
+        for (const auto &bit_name : bits) {
+            ResidualBitInfo info = trace_local_residual_origin(db, bit_name);
+            info_map[bit_name] = info;
+            if (info.promotable && !info.origin.source_id.empty())
+                prom_by_source[info.origin.source_id].push_back(bit_name);
+        }
     };
 
-    for (const auto &bit_name : gold_bits) {
-        BitTraceInfo trace = trace_residual_source(gold_db, bit_name);
-        gold_info[bit_name] = trace;
-        if (trace.traceable && trace.promotable && !trace.source_id.empty())
-            gold_prom_by_source[trace.source_id].push_back(bit_name);
-    }
-    for (const auto &bit_name : gate_bits) {
-        BitTraceInfo trace = trace_residual_source(gate_db, bit_name);
-        gate_info[bit_name] = trace;
-        if (trace.traceable && trace.promotable && !trace.source_id.empty())
-            gate_prom_by_source[trace.source_id].push_back(bit_name);
-    }
+    fill_side(gold_bits, gold_db, gold_info, gold_prom_by_source);
+    fill_side(gate_bits, gate_db, gate_info, gate_prom_by_source);
 
     pool<string> promotable_sources;
     for (const auto &it : gold_prom_by_source) {
@@ -987,27 +1406,30 @@ static ConstantCompletionAudit audit_constant_completed_nets(RTLIL::Module *gold
         audit.promotions.push_back({source_id, gold_names.front(), gate_names.front(), true});
     }
 
-    auto classify_side = [&](const char *side, const pool<string> &bits, const dict<string, BitTraceInfo> &info_map,
+    auto classify_side = [&](const char *side, const pool<string> &bits, const dict<string, ResidualBitInfo> &info_map,
                              const dict<string, std::vector<string>> &prom_by_source) {
         for (const auto &bit_name : bits) {
-            BitTraceInfo trace;
+            ResidualBitInfo info;
             if (info_map.count(bit_name))
-                trace = info_map.at(bit_name);
+                info = info_map.at(bit_name);
+            audit.total_count++;
             bool paired_promotable =
-                trace.traceable && trace.promotable && !trace.source_id.empty() &&
-                promotable_sources.count(trace.source_id) &&
-                prom_by_source.count(trace.source_id) &&
-                GetSize(prom_by_source.at(trace.source_id)) == 1 &&
-                prom_by_source.at(trace.source_id).front() == bit_name;
+                info.promotable && !info.origin.source_id.empty() &&
+                promotable_sources.count(info.origin.source_id) &&
+                prom_by_source.count(info.origin.source_id) &&
+                GetSize(prom_by_source.at(info.origin.source_id)) == 1 &&
+                prom_by_source.at(info.origin.source_id).front() == bit_name;
             if (paired_promotable) {
                 audit.promotable_count++;
-                add_sample_name(audit.promotable_samples, sample_name(side, bit_name, trace), 8);
-            } else if (trace.traceable) {
+                audit.traceable_count++;
+                add_sample_name(audit.promotable_samples, residual_origin_sample(side, info), 8);
+            } else if (info.traceable) {
                 audit.traceable_remaining_count++;
-                add_sample_name(audit.remaining_samples, sample_name(side, bit_name, trace), 8);
+                audit.traceable_count++;
+                add_sample_name(audit.remaining_samples, residual_origin_sample(side, info), 8);
             } else {
                 audit.untraceable_count++;
-                add_sample_name(audit.remaining_samples, sample_name(side, bit_name, trace), 8);
+                add_sample_name(audit.remaining_samples, residual_origin_sample(side, info), 8);
             }
         }
     };
@@ -1015,6 +1437,329 @@ static ConstantCompletionAudit audit_constant_completed_nets(RTLIL::Module *gold
     classify_side("gold", gold_bits, gold_info, gold_prom_by_source);
     classify_side("gate", gate_bits, gate_info, gate_prom_by_source);
     return audit;
+}
+
+static ConstantCompletionAudit audit_preblif_residual_nets(const PartitionedPair &pair)
+{
+    ConstantCompletionAudit audit;
+    RTLIL::Design *design_copy = clone_design_for_passes(pair.gold_local->design);
+    for (auto *mod : design_copy->modules())
+        if (mod->name != pair.gold_local->name && mod->name != pair.gate_local->name)
+            mod->set_bool_attribute(ID(blackbox), true);
+
+    RTLIL::Module *gold_mod = design_copy->module(pair.gold_local->name);
+    RTLIL::Module *gate_mod = design_copy->module(pair.gate_local->name);
+    if (gold_mod != nullptr)
+        materialize_blackbox_input_consts(design_copy, gold_mod);
+    if (gate_mod != nullptr)
+        materialize_blackbox_input_consts(design_copy, gate_mod);
+    auto collect_preblif_bits = [&](RTLIL::Module *mod) {
+        pool<string> driven_bits, used_bits, out;
+        SigMap sigmap(mod);
+        auto add_sig = [&](const RTLIL::SigSpec &sig, pool<string> &dst) {
+            RTLIL::SigSpec mapped = sigmap(sig);
+            for (auto bit : mapped) {
+                if (!bit.is_wire())
+                    continue;
+                RTLIL::Wire *w = bit.wire;
+                dst.insert(wire_bit_name(w->name, std::max(1, GetSize(w)), bit.offset));
+            }
+        };
+
+        for (auto &conn : mod->connections()) {
+            add_sig(conn.first, driven_bits);
+            add_sig(conn.second, used_bits);
+        }
+
+        for (auto *cell : mod->cells()) {
+            RTLIL::Module *submod = design_copy->module(cell->type);
+            bool cell_is_blackbox =
+                submod != nullptr ? submod->get_blackbox_attribute() :
+                !yosys_celltypes.cell_known(cell->type);
+            for (auto &conn : cell->connections()) {
+                RTLIL::IdString port = conn.first;
+                if (yosys_celltypes.cell_input(cell->type, port) || (cell_is_blackbox && !yosys_celltypes.cell_output(cell->type, port)))
+                    add_sig(conn.second, used_bits);
+                if (yosys_celltypes.cell_output(cell->type, port) && !cell_is_blackbox)
+                    add_sig(conn.second, driven_bits);
+            }
+        }
+
+        for (const auto &bit_name : used_bits) {
+            if (driven_bits.count(bit_name))
+                continue;
+            RTLIL::Wire *wire = nullptr;
+            int bit_idx = -1;
+            if (!find_module_bit(mod, bit_name, wire, bit_idx) || wire == nullptr)
+                continue;
+            if (!wire->port_input)
+                out.insert(bit_name);
+        }
+        return out;
+    };
+
+    if (gold_mod != nullptr && gate_mod != nullptr) {
+        LocalTraceDB gold_db = build_local_trace_db(gold_mod, pair.gold_bit_origins);
+        LocalTraceDB gate_db = build_local_trace_db(gate_mod, pair.gate_bit_origins);
+        pool<string> gold_bits = collect_preblif_bits(gold_mod);
+        pool<string> gate_bits = collect_preblif_bits(gate_mod);
+        audit = audit_constant_completed_nets(gold_mod, gate_mod, pair.gold_bit_origins, pair.gate_bit_origins);
+        audit.total_count = 0;
+        audit.traceable_count = 0;
+        audit.promotable_count = 0;
+        audit.traceable_remaining_count = 0;
+        audit.untraceable_count = 0;
+        audit.promotable_samples.clear();
+        audit.remaining_samples.clear();
+        audit.promotions.clear();
+
+        dict<string, ResidualBitInfo> gold_info, gate_info;
+        dict<string, std::vector<string>> gold_prom_by_source, gate_prom_by_source;
+        auto fill_side = [&](const pool<string> &bits, const LocalTraceDB &db,
+                             dict<string, ResidualBitInfo> &info_map,
+                             dict<string, std::vector<string>> &prom_by_source) {
+            for (const auto &bit_name : bits) {
+                ResidualBitInfo info = trace_local_residual_origin(db, bit_name);
+                info_map[bit_name] = info;
+                if (info.promotable && !info.origin.source_id.empty())
+                    prom_by_source[info.origin.source_id].push_back(bit_name);
+            }
+        };
+        fill_side(gold_bits, gold_db, gold_info, gold_prom_by_source);
+        fill_side(gate_bits, gate_db, gate_info, gate_prom_by_source);
+
+        pool<string> promotable_sources;
+        for (const auto &it : gold_prom_by_source) {
+            const string &source_id = it.first;
+            if (!gate_prom_by_source.count(source_id))
+                continue;
+            const auto &gold_names = it.second;
+            const auto &gate_names = gate_prom_by_source.at(source_id);
+            if (GetSize(gold_names) != 1 || GetSize(gate_names) != 1)
+                continue;
+            promotable_sources.insert(source_id);
+            audit.promotions.push_back({source_id, gold_names.front(), gate_names.front(), true});
+        }
+
+        auto classify = [&](const char *side, const pool<string> &bits, const dict<string, ResidualBitInfo> &info_map,
+                            const dict<string, std::vector<string>> &prom_by_source) {
+            for (const auto &bit_name : bits) {
+                ResidualBitInfo info;
+                if (info_map.count(bit_name))
+                    info = info_map.at(bit_name);
+                audit.total_count++;
+                bool paired_promotable =
+                    info.promotable && !info.origin.source_id.empty() &&
+                    promotable_sources.count(info.origin.source_id) &&
+                    prom_by_source.count(info.origin.source_id) &&
+                    GetSize(prom_by_source.at(info.origin.source_id)) == 1 &&
+                    prom_by_source.at(info.origin.source_id).front() == bit_name;
+                if (paired_promotable) {
+                    audit.promotable_count++;
+                    audit.traceable_count++;
+                    add_sample_name(audit.promotable_samples, residual_origin_sample(side, info), 8);
+                } else if (info.traceable) {
+                    audit.traceable_remaining_count++;
+                    audit.traceable_count++;
+                    add_sample_name(audit.remaining_samples, residual_origin_sample(side, info), 8);
+                } else {
+                    audit.untraceable_count++;
+                    add_sample_name(audit.remaining_samples, residual_origin_sample(side, info), 8);
+                }
+            }
+        };
+        classify("gold", gold_bits, gold_info, gold_prom_by_source);
+        classify("gate", gate_bits, gate_info, gate_prom_by_source);
+    }
+
+    delete design_copy;
+    return audit;
+}
+
+static ConstantCompletionAudit audit_blif_residual_nets(const PartitionedPair &pair,
+                                                        std::vector<string> *res_samples,
+                                                        std::vector<string> *prom_samples,
+                                                        std::vector<string> *rem_samples,
+                                                        int *opaque_out_cnt,
+                                                        int *lib_resolved_cnt)
+{
+    ConstantCompletionAudit audit;
+    if (res_samples != nullptr)
+        res_samples->clear();
+    if (prom_samples != nullptr)
+        prom_samples->clear();
+    if (rem_samples != nullptr)
+        rem_samples->clear();
+    if (opaque_out_cnt != nullptr)
+        *opaque_out_cnt = 0;
+    if (lib_resolved_cnt != nullptr)
+        *lib_resolved_cnt = 0;
+
+    RTLIL::Design *design_copy = clone_design_for_passes(pair.gold_local->design);
+    for (auto *mod : design_copy->modules())
+        if (mod->name != pair.gold_local->name && mod->name != pair.gate_local->name)
+            mod->set_bool_attribute(ID(blackbox), true);
+
+    auto classify_mod = [&](RTLIL::Module *mod, const dict<string, LocalBitOrigin> &origins,
+                            const char *side, dict<string, std::vector<BlifResidualInfo>> &by_source,
+                            std::vector<BlifResidualInfo> &all_infos) {
+        if (mod == nullptr)
+            return;
+        LocalTraceDB db = build_local_trace_db(mod, origins);
+        pool<string> driven_bits, used_bits;
+        SigMap sigmap(mod);
+
+        auto add_bit = [&](RTLIL::SigBit bit, pool<string> &dst) {
+            RTLIL::SigBit mapped = sigmap(bit);
+            if (!mapped.is_wire())
+                return;
+            dst.insert(wire_bit_name(mapped.wire->name, std::max(1, GetSize(mapped.wire)), mapped.offset));
+        };
+
+        for (auto &conn : mod->connections()) {
+            RTLIL::SigSpec lhs = sigmap(conn.first);
+            RTLIL::SigSpec rhs = sigmap(conn.second);
+            for (auto bit : lhs)
+                add_bit(bit, driven_bits);
+            for (auto bit : rhs)
+                add_bit(bit, used_bits);
+        }
+
+        for (auto *w : mod->wires())
+            if (w->port_output)
+                for (int i = 0; i < std::max(1, GetSize(w)); i++)
+                    used_bits.insert(wire_bit_name(w->name, std::max(1, GetSize(w)), i));
+
+        for (auto *cell : mod->cells()) {
+            RTLIL::Module *submod = design_copy->module(cell->type);
+            bool has_mod = submod != nullptr;
+            bool cell_is_opaque = has_mod ? submod->get_blackbox_attribute() : !yosys_celltypes.cell_known(cell->type);
+
+            for (auto &conn : cell->connections()) {
+                RTLIL::IdString port = conn.first;
+                RTLIL::SigSpec sig = sigmap(conn.second);
+                bool is_output = false;
+                bool is_input = false;
+                if (has_mod) {
+                    RTLIL::Wire *pw = submod->wire(port);
+                    if (pw != nullptr) {
+                        is_output = pw->port_output;
+                        is_input = pw->port_input;
+                    }
+                } else {
+                    is_output = yosys_celltypes.cell_output(cell->type, port);
+                    is_input = yosys_celltypes.cell_input(cell->type, port);
+                    if (!is_output && !is_input) {
+                        string p = strip_backslash(port);
+                        if (p == "Y" || p == "Z" || p == "ZN" || p == "Q" || p == "QN" || p == "O" || p == "OUT")
+                            is_output = true;
+                    }
+                }
+
+                if (is_input)
+                    for (auto bit : sig)
+                        add_bit(bit, used_bits);
+                if (is_output && !cell_is_opaque)
+                    for (auto bit : sig)
+                        add_bit(bit, driven_bits);
+                if (!is_output || !cell_is_opaque)
+                    continue;
+
+                int idx = 0;
+                for (auto bit : sig) {
+                    RTLIL::SigBit mapped = sigmap(bit);
+                    if (!mapped.is_wire()) {
+                        idx++;
+                        continue;
+                    }
+                    string local_bit = wire_bit_name(mapped.wire->name, std::max(1, GetSize(mapped.wire)), mapped.offset);
+                    if (!used_bits.count(local_bit)) {
+                        idx++;
+                        continue;
+                    }
+                    BlifResidualInfo info;
+                    info.blif_net_name = blif_pin_name(cell, port, GetSize(sig) > 1 ? idx : -1);
+                    info.cell_name = strip_backslash(cell->name);
+                    info.port_name = strip_backslash(port);
+                    info.bit_index = GetSize(sig) > 1 ? idx : -1;
+                    info.local_bit_name = local_bit;
+                    info.local_info = trace_local_residual_origin(db, local_bit);
+                    info.opaque_cell_output = true;
+                    all_infos.push_back(info);
+                    if (info.local_info.promotable && !info.local_info.origin.source_id.empty())
+                        by_source[info.local_info.origin.source_id].push_back(info);
+                    if (res_samples != nullptr)
+                        add_sample_name(*res_samples, blif_residual_sample(side, info), 8);
+                    if (opaque_out_cnt != nullptr)
+                        (*opaque_out_cnt)++;
+                    idx++;
+                }
+            }
+        }
+    };
+
+    dict<string, std::vector<BlifResidualInfo>> gold_by_source, gate_by_source;
+    std::vector<BlifResidualInfo> gold_infos, gate_infos;
+    classify_mod(design_copy->module(pair.gold_local->name), pair.gold_bit_origins, "gold", gold_by_source, gold_infos);
+    classify_mod(design_copy->module(pair.gate_local->name), pair.gate_bit_origins, "gate", gate_by_source, gate_infos);
+
+    pool<string> promotable_sources;
+    for (const auto &it : gold_by_source) {
+        const string &source_id = it.first;
+        if (!gate_by_source.count(source_id))
+            continue;
+        if (GetSize(it.second) != 1 || GetSize(gate_by_source.at(source_id)) != 1)
+            continue;
+        promotable_sources.insert(source_id);
+        audit.promotions.push_back({source_id, it.second.front().local_bit_name, gate_by_source.at(source_id).front().local_bit_name, true});
+    }
+
+    auto classify_infos = [&](const char *side, const std::vector<BlifResidualInfo> &infos,
+                              const dict<string, std::vector<BlifResidualInfo>> &by_source) {
+        for (const auto &info : infos) {
+            audit.total_count++;
+            bool paired_promotable =
+                info.local_info.promotable && !info.local_info.origin.source_id.empty() &&
+                promotable_sources.count(info.local_info.origin.source_id) &&
+                by_source.count(info.local_info.origin.source_id) &&
+                GetSize(by_source.at(info.local_info.origin.source_id)) == 1 &&
+                by_source.at(info.local_info.origin.source_id).front().blif_net_name == info.blif_net_name;
+            if (paired_promotable) {
+                audit.traceable_count++;
+                audit.promotable_count++;
+                add_sample_name(audit.promotable_samples, blif_residual_sample(side, info), 8);
+                if (prom_samples != nullptr)
+                    add_sample_name(*prom_samples, blif_residual_sample(side, info), 8);
+            } else if (info.local_info.traceable) {
+                audit.traceable_count++;
+                audit.traceable_remaining_count++;
+                add_sample_name(audit.remaining_samples, blif_residual_sample(side, info), 8);
+                if (rem_samples != nullptr)
+                    add_sample_name(*rem_samples, blif_residual_sample(side, info), 8);
+            } else {
+                audit.untraceable_count++;
+                add_sample_name(audit.remaining_samples, blif_residual_sample(side, info), 8);
+                if (rem_samples != nullptr)
+                    add_sample_name(*rem_samples, blif_residual_sample(side, info), 8);
+            }
+        }
+    };
+
+    classify_infos("gold", gold_infos, gold_by_source);
+    classify_infos("gate", gate_infos, gate_by_source);
+
+    delete design_copy;
+    return audit;
+}
+
+static void set_promoted_boundary_origin(dict<string, LocalBitOrigin> &origins, const string &canonical_bit,
+                                         const ResidualBitInfo &info)
+{
+    LocalBitOrigin origin = info.origin;
+    origin.origin_kind = "promoted_boundary";
+    origin.came_from_promoted_boundary = true;
+    origin.local_bit_name = canonical_bit;
+    origins[canonical_bit] = origin;
 }
 
 void refine_shell_closure(PartitionedPair &pair, RTLIL::Module *gold_orig, RTLIL::Module *gate_orig,
@@ -1102,20 +1847,31 @@ void refine_shell_closure(PartitionedPair &pair, RTLIL::Module *gold_orig, RTLIL
                 continue;
             if (trace_pair.count_as_promoted) {
                 pair.promoted_internal_boundary_bit_names.insert(canonical_bit);
+                rename_bit_origin(pair.gold_bit_origins, trace_pair.gold_bit_name, canonical_bit,
+                    "promoted_boundary", true);
+                rename_bit_origin(pair.gate_bit_origins, trace_pair.gate_bit_name, canonical_bit,
+                    "promoted_boundary", true);
                 trace_prom_cnt++;
             } else {
                 canon_alias_in.insert(canonical_bit);
+                rename_bit_origin(pair.gold_bit_origins, trace_pair.gold_bit_name, canonical_bit);
+                rename_bit_origin(pair.gate_bit_origins, trace_pair.gate_bit_name, canonical_bit);
             }
         }
     }
 
+    LocalTraceDB gold_local_db = build_local_trace_db(pair.gold_local, pair.gold_bit_origins);
+    LocalTraceDB gate_local_db = build_local_trace_db(pair.gate_local, pair.gate_bit_origins);
     ConstantCompletionAudit cc_before =
-        audit_constant_completed_nets(pair.gold_local, pair.gate_local, gold_db, gate_db);
+        audit_constant_completed_nets(pair.gold_local, pair.gate_local,
+                                     pair.gold_bit_origins, pair.gate_bit_origins);
     pair.const_comp_prom_cnt = cc_before.promotable_count;
     pair.const_comp_promoted_cnt = 0;
     pair.const_comp_prom_samps.clear();
     for (const auto &promotion : cc_before.promotions) {
         RTLIL::IdString canonical = RTLIL::escape_id(canonical_trace_boundary_wire(promotion.source_id));
+        ResidualBitInfo gold_info = trace_local_residual_origin(gold_local_db, promotion.gold_bit_name);
+        ResidualBitInfo gate_info = trace_local_residual_origin(gate_local_db, promotion.gate_bit_name);
         if (!can_promote_internal_boundary_bit(pair.gold_local, promotion.gold_bit_name, canonical))
             continue;
         if (!can_promote_internal_boundary_bit(pair.gate_local, promotion.gate_bit_name, canonical))
@@ -1126,8 +1882,47 @@ void refine_shell_closure(PartitionedPair &pair, RTLIL::Module *gold_orig, RTLIL
             continue;
         string canonical_bit = wire_bit_name(canonical, 1, 0);
         pair.promoted_internal_boundary_bit_names.insert(canonical_bit);
+        set_promoted_boundary_origin(pair.gold_bit_origins, canonical_bit, gold_info);
+        set_promoted_boundary_origin(pair.gate_bit_origins, canonical_bit, gate_info);
         pair.const_comp_promoted_cnt += 2;
         add_sample_name(pair.const_comp_prom_samps, canonical_bit, 8);
+    }
+
+    ConstantCompletionAudit preblif_before = audit_preblif_residual_nets(pair);
+    pair.preblif_res_cnt = preblif_before.total_count;
+    pair.preblif_trace_cnt = preblif_before.traceable_count;
+    pair.preblif_prom_cnt = preblif_before.promotable_count;
+    pair.preblif_untrace_cnt = preblif_before.untraceable_count;
+    pair.preblif_promoted_cnt = 0;
+    pair.preblif_res_samps = preblif_before.remaining_samples;
+    for (const auto &name : preblif_before.promotable_samples)
+        add_sample_name(pair.preblif_res_samps, name, 8);
+    pair.preblif_prom_samps.clear();
+
+    if (!preblif_before.promotions.empty()) {
+        gold_local_db = build_local_trace_db(pair.gold_local, pair.gold_bit_origins);
+        gate_local_db = build_local_trace_db(pair.gate_local, pair.gate_bit_origins);
+    }
+    for (const auto &promotion : preblif_before.promotions) {
+        RTLIL::IdString canonical = RTLIL::escape_id(canonical_trace_boundary_wire(promotion.source_id));
+        ResidualBitInfo gold_info = trace_local_residual_origin(gold_local_db, promotion.gold_bit_name);
+        ResidualBitInfo gate_info = trace_local_residual_origin(gate_local_db, promotion.gate_bit_name);
+        if (!gold_info.promotable || !gate_info.promotable)
+            continue;
+        if (!can_promote_internal_boundary_bit(pair.gold_local, promotion.gold_bit_name, canonical))
+            continue;
+        if (!can_promote_internal_boundary_bit(pair.gate_local, promotion.gate_bit_name, canonical))
+            continue;
+        if (!promote_internal_boundary_bit(pair.gold_local, promotion.gold_bit_name, canonical))
+            continue;
+        if (!promote_internal_boundary_bit(pair.gate_local, promotion.gate_bit_name, canonical))
+            continue;
+        string canonical_bit = wire_bit_name(canonical, 1, 0);
+        pair.promoted_internal_boundary_bit_names.insert(canonical_bit);
+        set_promoted_boundary_origin(pair.gold_bit_origins, canonical_bit, gold_info);
+        set_promoted_boundary_origin(pair.gate_bit_origins, canonical_bit, gate_info);
+        pair.preblif_promoted_cnt += 2;
+        add_sample_name(pair.preblif_prom_samps, canonical_bit, 8);
     }
 
     allowed = base_allowed();
@@ -1171,7 +1966,8 @@ void refine_shell_closure(PartitionedPair &pair, RTLIL::Module *gold_orig, RTLIL
     pair.unr_int_bnd_cnt = audit.unr_int_bnd_cnt;
 
     ConstantCompletionAudit cc_after =
-        audit_constant_completed_nets(pair.gold_local, pair.gate_local, gold_db, gate_db);
+        audit_constant_completed_nets(pair.gold_local, pair.gate_local,
+                                     pair.gold_bit_origins, pair.gate_bit_origins);
     pair.const_comp_trace_rem_cnt = cc_after.traceable_remaining_count + cc_after.promotable_count;
     pair.const_comp_trace_cnt = pair.const_comp_trace_rem_cnt;
     pair.const_comp_untrace_cnt = cc_after.untraceable_count;
@@ -1179,7 +1975,30 @@ void refine_shell_closure(PartitionedPair &pair, RTLIL::Module *gold_orig, RTLIL
     for (const auto &name : cc_after.promotable_samples)
         add_sample_name(pair.const_comp_rem_samps, name, 8);
     pair.const_comp_samps = pair.const_comp_rem_samps;
-    pair.shell_refine_iter_cnt = 2;
+
+    ConstantCompletionAudit preblif_after = audit_preblif_residual_nets(pair);
+    pair.preblif_res_cnt = preblif_after.total_count;
+    pair.preblif_trace_cnt = preblif_after.traceable_count;
+    pair.preblif_prom_cnt = preblif_after.promotable_count;
+    pair.preblif_untrace_cnt = preblif_after.untraceable_count;
+    pair.preblif_res_samps = preblif_after.remaining_samples;
+    for (const auto &name : preblif_after.promotable_samples)
+        add_sample_name(pair.preblif_res_samps, name, 8);
+    pair.preblif_rem_samps = preblif_after.remaining_samples;
+    for (const auto &name : preblif_after.promotable_samples)
+        add_sample_name(pair.preblif_rem_samps, name, 8);
+
+    ConstantCompletionAudit blif_after = audit_blif_residual_nets(pair, &pair.blif_res_samps,
+                                                                  &pair.blif_prom_samps,
+                                                                  &pair.blif_rem_samps,
+                                                                  &pair.blif_opaque_out_cnt,
+                                                                  &pair.blif_lib_resolved_cnt);
+    pair.blif_res_cnt = blif_after.total_count;
+    pair.blif_trace_cnt = blif_after.traceable_count;
+    pair.blif_prom_cnt = blif_after.promotable_count;
+    pair.blif_untrace_cnt = blif_after.untraceable_count;
+    pair.blif_promoted_cnt = 0;
+    pair.shell_refine_iter_cnt = 3;
 }
 
 std::vector<ChildBoundaryPort> submod_to_pi_po(RTLIL::Design *design, RTLIL::Module *mod)
@@ -1343,21 +2162,42 @@ PartitionedPair partition_module(RTLIL::Design *design, RTLIL::Design *design_ch
 
     RTLIL::Module *gold_clone = gold_mod->clone();
     RTLIL::Module *gate_clone = gate_mod->clone();
+    dict<string, LocalBitOrigin> gold_origins, gate_origins;
 
     gold_clone->name = RTLIL::escape_id(strip_backslash(gold_mod->name) + "__local");
     gate_clone->name = RTLIL::escape_id(strip_backslash(gate_mod->name) + "__local");
+    seed_clone_origins(gold_origins, gold_clone, gold_mod);
+    seed_clone_origins(gate_origins, gate_clone, gate_mod);
 
     // convert_ff_to_fine(gold_clone);
     // convert_ff_to_fine(gate_clone);
 
     cutpoints_to_pi_po(gold_clone, cutpoints, true);
     cutpoints_to_pi_po(gate_clone, cutpoints, false);
+    seed_state_cut_origins(gold_origins, cutpoints);
+    seed_state_cut_origins(gate_origins, cutpoints);
 
     std::vector<ChildBoundaryPort> gold_boundaries = submod_to_pi_po(design, gold_clone);
     std::vector<ChildBoundaryPort> gate_boundaries = submod_to_pi_po(design, gate_clone);
+    seed_child_boundary_origins(gold_origins, conf, gold_boundaries, true);
+    seed_child_boundary_origins(gate_origins, conf, gate_boundaries, false);
     std::vector<RegionBoundary> boundaries =
         merge_region_boundaries(conf, gold_mod, gate_mod, gold_boundaries, gate_boundaries);
+
+    std::vector<std::pair<string, string>> gold_boundary_renames, gate_boundary_renames;
+    for (const auto &boundary : boundaries) {
+        gold_boundary_renames.emplace_back(
+            wire_bit_name(boundary.gold_local_wire, std::max(1, boundary.width), boundary.bit_index),
+            wire_bit_name(boundary.canonical_wire, std::max(1, boundary.width), boundary.bit_index));
+        gate_boundary_renames.emplace_back(
+            wire_bit_name(boundary.gate_local_wire, std::max(1, boundary.width), boundary.bit_index),
+            wire_bit_name(boundary.canonical_wire, std::max(1, boundary.width), boundary.bit_index));
+    }
     apply_region_boundary_canonical_names(gold_clone, gate_clone, boundaries);
+    for (const auto &it : gold_boundary_renames)
+        rename_bit_origin(gold_origins, it.first, it.second);
+    for (const auto &it : gate_boundary_renames)
+        rename_bit_origin(gate_origins, it.first, it.second);
     restrict_local_output_ports(gold_clone);
     restrict_local_output_ports(gate_clone);
 
@@ -1371,6 +2211,8 @@ PartitionedPair partition_module(RTLIL::Design *design, RTLIL::Design *design_ch
     result.gate_local = design_check->module(gate_clone->name);
     result.boundaries = boundaries;
     result.boundary_bit_names = region_boundary_bit_names(boundaries);
+    result.gold_bit_origins = gold_origins;
+    result.gate_bit_origins = gate_origins;
     result.resid_hier = !result.boundaries.empty();
     refine_shell_closure(result, gold_mod, gate_mod, cutpoints);
     return result;
@@ -1429,6 +2271,24 @@ LocalValidateResult validate_partition_pair(const CheckConfig &conf,
     result.const_comp_prom_samps = local_pair.const_comp_prom_samps;
     result.const_comp_rem_samps = local_pair.const_comp_rem_samps;
     result.const_comp_samps = local_pair.const_comp_samps;
+    result.preblif_res_cnt = local_pair.preblif_res_cnt;
+    result.preblif_trace_cnt = local_pair.preblif_trace_cnt;
+    result.preblif_prom_cnt = local_pair.preblif_prom_cnt;
+    result.preblif_untrace_cnt = local_pair.preblif_untrace_cnt;
+    result.preblif_promoted_cnt = local_pair.preblif_promoted_cnt;
+    result.preblif_res_samps = local_pair.preblif_res_samps;
+    result.preblif_prom_samps = local_pair.preblif_prom_samps;
+    result.preblif_rem_samps = local_pair.preblif_rem_samps;
+    result.blif_res_cnt = local_pair.blif_res_cnt;
+    result.blif_trace_cnt = local_pair.blif_trace_cnt;
+    result.blif_prom_cnt = local_pair.blif_prom_cnt;
+    result.blif_opaque_out_cnt = local_pair.blif_opaque_out_cnt;
+    result.blif_lib_resolved_cnt = local_pair.blif_lib_resolved_cnt;
+    result.blif_untrace_cnt = local_pair.blif_untrace_cnt;
+    result.blif_promoted_cnt = local_pair.blif_promoted_cnt;
+    result.blif_res_samps = local_pair.blif_res_samps;
+    result.blif_prom_samps = local_pair.blif_prom_samps;
+    result.blif_rem_samps = local_pair.blif_rem_samps;
     result.shell_refine_iter_cnt = local_pair.shell_refine_iter_cnt;
     result.resid_hier = local_pair.resid_hier;
 
@@ -1465,6 +2325,7 @@ LocalValidateResult validate_partition_pair(const CheckConfig &conf,
     if (result.bnd_map_app == 0 && abc_name_map_applied > 0)
         result.bnd_map_app = std::min(result.bnd_map_exp, abc_name_map_applied);
     result.const_comp_net_cnt = parse_const_comp_net_cnt(local_abc_result.output);
+    std::vector<string> abc_const_comp_names = parse_const_comp_net_names(local_abc_result.output);
     int classified_constant_completed =
         result.const_comp_trace_rem_cnt + result.const_comp_untrace_cnt;
     if (result.const_comp_net_cnt > classified_constant_completed) {
@@ -1473,6 +2334,10 @@ LocalValidateResult validate_partition_pair(const CheckConfig &conf,
         add_sample_name(result.const_comp_rem_samps, "abc_constant_completed_unclassified", 8);
     }
     result.const_comp_samps = result.const_comp_rem_samps;
+    classify_blif_residual_names(local_pair, abc_const_comp_names,
+        result.blif_res_cnt, result.blif_trace_cnt, result.blif_prom_cnt,
+        result.blif_opaque_out_cnt, result.blif_untrace_cnt,
+        result.blif_res_samps, result.blif_rem_samps);
     result.unsafe_why = partition_unsafe_why(local_abc_result);
     if (!result.unsafe_why.empty())
         result.auth_ok = false;
@@ -1580,12 +2445,30 @@ void run_local_vali_shadow(const CheckConfig &conf, ModMap &mod_map,
             {"constant_completed_traceable_remaining_count", result.const_comp_trace_rem_cnt},
             {"constant_completed_traceable_count", result.const_comp_trace_cnt},
             {"constant_completed_untraceable_count", result.const_comp_untrace_cnt},
+            {"preblif_residual_count", result.preblif_res_cnt},
+            {"preblif_traceable_residual_count", result.preblif_trace_cnt},
+            {"preblif_promotable_residual_count", result.preblif_prom_cnt},
+            {"preblif_untraceable_residual_count", result.preblif_untrace_cnt},
+            {"promoted_from_preblif_residual_count", result.preblif_promoted_cnt},
+            {"blif_residual_count", result.blif_res_cnt},
+            {"blif_residual_traceable_count", result.blif_trace_cnt},
+            {"blif_residual_promotable_count", result.blif_prom_cnt},
+            {"blif_residual_opaque_cell_output_count", result.blif_opaque_out_cnt},
+            {"blif_residual_library_resolved_count", result.blif_lib_resolved_cnt},
+            {"blif_residual_untraceable_count", result.blif_untrace_cnt},
+            {"promoted_from_blif_residual_count", result.blif_promoted_cnt},
             {"shell_refinement_iterations", result.shell_refine_iter_cnt},
             {"promoted_internal_boundary_samples", json_array_from_strings(result.prom_int_bnd_samps)},
             {"promoted_from_constant_completion_samples", json_array_from_strings(result.const_comp_prom_samps)},
             {"unresolved_internal_input_samples", json_array_from_strings(result.unr_int_in_samps)},
             {"constant_completed_remaining_samples", json_array_from_strings(result.const_comp_rem_samps)},
             {"constant_completed_samples", json_array_from_strings(result.const_comp_samps)},
+            {"preblif_residual_samples", json_array_from_strings(result.preblif_res_samps)},
+            {"preblif_promoted_samples", json_array_from_strings(result.preblif_prom_samps)},
+            {"preblif_remaining_samples", json_array_from_strings(result.preblif_rem_samps)},
+            {"blif_residual_samples", json_array_from_strings(result.blif_res_samps)},
+            {"blif_promoted_samples", json_array_from_strings(result.blif_prom_samps)},
+            {"blif_remaining_samples", json_array_from_strings(result.blif_rem_samps)},
             {"unresolved_internal_boundaries", result.unr_int_bnd_cnt},
             {"child_boundary_count", result.child_bnd_cnt},
             {"unresolved_child_boundaries", result.unr_child_bnd_cnt}
@@ -1811,6 +2694,24 @@ Results partition_prove(const CheckConfig &conf, ModMap &mod_map,
             region_result.const_comp_prom_samps = shell_result.const_comp_prom_samps;
             region_result.const_comp_rem_samps = shell_result.const_comp_rem_samps;
             region_result.const_comp_samps = shell_result.const_comp_samps;
+            region_result.preblif_res_cnt = shell_result.preblif_res_cnt;
+            region_result.preblif_trace_cnt = shell_result.preblif_trace_cnt;
+            region_result.preblif_prom_cnt = shell_result.preblif_prom_cnt;
+            region_result.preblif_untrace_cnt = shell_result.preblif_untrace_cnt;
+            region_result.preblif_promoted_cnt = shell_result.preblif_promoted_cnt;
+            region_result.preblif_res_samps = shell_result.preblif_res_samps;
+            region_result.preblif_prom_samps = shell_result.preblif_prom_samps;
+            region_result.preblif_rem_samps = shell_result.preblif_rem_samps;
+            region_result.blif_res_cnt = shell_result.blif_res_cnt;
+            region_result.blif_trace_cnt = shell_result.blif_trace_cnt;
+            region_result.blif_prom_cnt = shell_result.blif_prom_cnt;
+            region_result.blif_opaque_out_cnt = shell_result.blif_opaque_out_cnt;
+            region_result.blif_lib_resolved_cnt = shell_result.blif_lib_resolved_cnt;
+            region_result.blif_untrace_cnt = shell_result.blif_untrace_cnt;
+            region_result.blif_promoted_cnt = shell_result.blif_promoted_cnt;
+            region_result.blif_res_samps = shell_result.blif_res_samps;
+            region_result.blif_prom_samps = shell_result.blif_prom_samps;
+            region_result.blif_rem_samps = shell_result.blif_rem_samps;
             region_result.shell_refine_iter_cnt = shell_result.shell_refine_iter_cnt;
             region_result.resid_hier = shell_result.resid_hier;
             region_result.runtime_ms = shell_result.runtime_ms;
@@ -1879,12 +2780,30 @@ Results partition_prove(const CheckConfig &conf, ModMap &mod_map,
                 {"constant_completed_traceable_remaining_count", shell_result.const_comp_trace_rem_cnt},
                 {"constant_completed_traceable_count", shell_result.const_comp_trace_cnt},
                 {"constant_completed_untraceable_count", shell_result.const_comp_untrace_cnt},
+                {"preblif_residual_count", shell_result.preblif_res_cnt},
+                {"preblif_traceable_residual_count", shell_result.preblif_trace_cnt},
+                {"preblif_promotable_residual_count", shell_result.preblif_prom_cnt},
+                {"preblif_untraceable_residual_count", shell_result.preblif_untrace_cnt},
+                {"promoted_from_preblif_residual_count", shell_result.preblif_promoted_cnt},
+                {"blif_residual_count", shell_result.blif_res_cnt},
+                {"blif_residual_traceable_count", shell_result.blif_trace_cnt},
+                {"blif_residual_promotable_count", shell_result.blif_prom_cnt},
+                {"blif_residual_opaque_cell_output_count", shell_result.blif_opaque_out_cnt},
+                {"blif_residual_library_resolved_count", shell_result.blif_lib_resolved_cnt},
+                {"blif_residual_untraceable_count", shell_result.blif_untrace_cnt},
+                {"promoted_from_blif_residual_count", shell_result.blif_promoted_cnt},
                 {"shell_refinement_iterations", shell_result.shell_refine_iter_cnt},
                 {"promoted_internal_boundary_samples", json_array_from_strings(shell_result.prom_int_bnd_samps)},
                 {"promoted_from_constant_completion_samples", json_array_from_strings(shell_result.const_comp_prom_samps)},
                 {"unresolved_internal_input_samples", json_array_from_strings(shell_result.unr_int_in_samps)},
                 {"constant_completed_remaining_samples", json_array_from_strings(shell_result.const_comp_rem_samps)},
                 {"constant_completed_samples", json_array_from_strings(shell_result.const_comp_samps)},
+                {"preblif_residual_samples", json_array_from_strings(shell_result.preblif_res_samps)},
+                {"preblif_promoted_samples", json_array_from_strings(shell_result.preblif_prom_samps)},
+                {"preblif_remaining_samples", json_array_from_strings(shell_result.preblif_rem_samps)},
+                {"blif_residual_samples", json_array_from_strings(shell_result.blif_res_samps)},
+                {"blif_promoted_samples", json_array_from_strings(shell_result.blif_prom_samps)},
+                {"blif_remaining_samples", json_array_from_strings(shell_result.blif_rem_samps)},
                 {"unresolved_internal_boundaries", shell_result.unr_int_bnd_cnt},
                 {"child_boundary_count", shell_result.child_bnd_cnt},
                 {"unresolved_child_boundaries", shell_result.unr_child_bnd_cnt}
@@ -1952,12 +2871,30 @@ Results partition_prove(const CheckConfig &conf, ModMap &mod_map,
             {"constant_completed_traceable_remaining_count", region_result.const_comp_trace_rem_cnt},
             {"constant_completed_traceable_count", region_result.const_comp_trace_cnt},
             {"constant_completed_untraceable_count", region_result.const_comp_untrace_cnt},
+            {"preblif_residual_count", region_result.preblif_res_cnt},
+            {"preblif_traceable_residual_count", region_result.preblif_trace_cnt},
+            {"preblif_promotable_residual_count", region_result.preblif_prom_cnt},
+            {"preblif_untraceable_residual_count", region_result.preblif_untrace_cnt},
+            {"promoted_from_preblif_residual_count", region_result.preblif_promoted_cnt},
+            {"blif_residual_count", region_result.blif_res_cnt},
+            {"blif_residual_traceable_count", region_result.blif_trace_cnt},
+            {"blif_residual_promotable_count", region_result.blif_prom_cnt},
+            {"blif_residual_opaque_cell_output_count", region_result.blif_opaque_out_cnt},
+            {"blif_residual_library_resolved_count", region_result.blif_lib_resolved_cnt},
+            {"blif_residual_untraceable_count", region_result.blif_untrace_cnt},
+            {"promoted_from_blif_residual_count", region_result.blif_promoted_cnt},
             {"shell_refinement_iterations", region_result.shell_refine_iter_cnt},
             {"promoted_internal_boundary_samples", json_array_from_strings(region_result.prom_int_bnd_samps)},
             {"promoted_from_constant_completion_samples", json_array_from_strings(region_result.const_comp_prom_samps)},
             {"unresolved_internal_input_samples", json_array_from_strings(region_result.unr_int_in_samps)},
             {"constant_completed_remaining_samples", json_array_from_strings(region_result.const_comp_rem_samps)},
             {"constant_completed_samples", json_array_from_strings(region_result.const_comp_samps)},
+            {"preblif_residual_samples", json_array_from_strings(region_result.preblif_res_samps)},
+            {"preblif_promoted_samples", json_array_from_strings(region_result.preblif_prom_samps)},
+            {"preblif_remaining_samples", json_array_from_strings(region_result.preblif_rem_samps)},
+            {"blif_residual_samples", json_array_from_strings(region_result.blif_res_samps)},
+            {"blif_promoted_samples", json_array_from_strings(region_result.blif_prom_samps)},
+            {"blif_remaining_samples", json_array_from_strings(region_result.blif_rem_samps)},
             {"unresolved_internal_boundaries", region_result.unr_int_bnd_cnt},
             {"unresolved_child_boundaries", region_result.unr_child_bnd_cnt},
             {"residual_hierarchy", region_result.resid_hier}

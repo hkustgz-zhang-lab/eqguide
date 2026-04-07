@@ -347,6 +347,31 @@ int materialize_blackbox_input_consts(RTLIL::Design *design, RTLIL::Module *mod)
     return inserted;
 }
 
+RTLIL::Design *prepare_blif_module_design(RTLIL::Design *design, RTLIL::Module *mod,
+                                                 const string &lib_file,
+                                                 int *inserted_bbconsts)
+{
+    RTLIL::Design *design_copy = clone_design_for_passes(design);
+
+    if (!lib_file.empty() && lib_file.size() >= 2 && lib_file.substr(lib_file.size() - 2) == ".v") {
+        run_pass(stringf("read_verilog -overwrite -noblackbox %s", lib_file), design_copy);
+        run_pass("proc", design_copy);
+    }
+
+    for (auto mod_ : design_copy->modules())
+        if (mod_->name != mod->name)
+            mod_->set_bool_attribute(ID(blackbox), true);
+
+    RTLIL::Module *target_mod = design_copy->module(mod->name);
+    if (target_mod != nullptr) {
+        int inserted = materialize_blackbox_input_consts(design_copy, target_mod);
+        if (inserted_bbconsts != nullptr)
+            *inserted_bbconsts = inserted;
+    }
+
+    return design_copy;
+}
+
 string dump_blif_module(RTLIL::Design* design, const string &dir_name, RTLIL::Module *mod, const string& lib_file,
                                int *inserted_bbconsts){
 
@@ -363,30 +388,7 @@ string dump_blif_module(RTLIL::Design* design, const string &dir_name, RTLIL::Mo
 
     // log_files.clear(); // TODO: Maybe it's not a good ieda... 
     // log_streams.clear(); // TODO: We can not see any log...
-    RTLIL::Design *design_copy = clone_design_for_passes(design);
-    // (void)lib_file;
-    // if(!lib_file.empty())
-    //     run_pass(stringf("read_verilog -overwrite %s", lib_file), design_copy);
-    
-    // run_pass(stringf("flatten"), design_copy);
-    // run_pass(stringf("hierarchy -top %s", mod->name.str()), design_copy);
-    // run_pass(stringf("proc"), design_copy);
-    // run_pass(stringf("opt"), design_copy);
-    // run_pass(stringf("memory_map"), design_copy);
-
-    for(auto mod_: design_copy->modules()){
-        if(mod_->name != mod->name){
-            mod_->set_bool_attribute(ID(blackbox), true);
-            // log("Current Module: %s, Set Module `%s` to blackbox.\n", mod->name.str(), mod_->name.str());
-        }
-    }
-    RTLIL::Module *target_mod = design_copy->module(mod->name);
-    if (target_mod != nullptr) {
-        int inserted = materialize_blackbox_input_consts(design_copy, target_mod);
-        if (inserted_bbconsts != nullptr)
-            *inserted_bbconsts = inserted;
-    }
-    (void)lib_file;
+    RTLIL::Design *design_copy = prepare_blif_module_design(design, mod, lib_file, inserted_bbconsts);
     // if(!lib_file.empty())
     //     run_pass(stringf("read_verilog -overwrite %s", lib_file), design_copy);
     // run_pass(stringf("hierarchy -top %s", mod->name.str()), design_copy);
@@ -399,6 +401,7 @@ string dump_blif_module(RTLIL::Design* design, const string &dir_name, RTLIL::Mo
         "write_blif -blackbox -top %s -false + __const0 -true + __const1 -undef + __constx %s",
         mod_name, blif_file),
         design_copy);
+    delete design_copy;
 
     log_files = log_files_backup;
     log_streams = log_streams_backup;
