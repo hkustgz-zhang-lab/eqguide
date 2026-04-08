@@ -1,5 +1,5 @@
-#include "passes/guide/check/matching.h"
-#include "passes/guide/check/failure_exec.h"
+#include "passes/guide/check/match.h"
+#include "passes/guide/check/fail_exec.h"
 #include "passes/guide/check/scheduler.h"
 #include "passes/guide/check/region.h"
 

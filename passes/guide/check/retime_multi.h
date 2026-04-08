@@ -1,5 +1,5 @@
-#ifndef YOSYS_PASSES_GUIDE_CHECK_RETIME_MULTIPLIER_H
-#define YOSYS_PASSES_GUIDE_CHECK_RETIME_MULTIPLIER_H
+#ifndef YOSYS_PASSES_GUIDE_CHECK_RETIME_MULTI_H
+#define YOSYS_PASSES_GUIDE_CHECK_RETIME_MULTI_H
 
 #include "passes/guide/check/shared.h"
 #include "passes/guide/check/check.h"

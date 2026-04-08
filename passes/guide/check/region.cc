@@ -1,7 +1,7 @@
 #include "passes/guide/check/region.h"
-#include "passes/guide/check/failure_exec.h"
-#include "passes/guide/check/matching.h"
-#include "passes/guide/check/retime_multiplier.h"
+#include "passes/guide/check/fail_exec.h"
+#include "passes/guide/check/match.h"
+#include "passes/guide/check/retime_multi.h"
 
 YOSYS_NAMESPACE_BEGIN
 namespace guide_check {

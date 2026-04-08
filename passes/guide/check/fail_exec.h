@@ -1,5 +1,5 @@
-#ifndef YOSYS_PASSES_GUIDE_CHECK_FAILURE_EXEC_H
-#define YOSYS_PASSES_GUIDE_CHECK_FAILURE_EXEC_H
+#ifndef YOSYS_PASSES_GUIDE_CHECK_FAIL_EXEC_H
+#define YOSYS_PASSES_GUIDE_CHECK_FAIL_EXEC_H
 
 #include "passes/guide/check/shared.h"
 #include "passes/guide/check/check.h"

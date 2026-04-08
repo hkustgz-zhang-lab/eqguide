@@ -1,5 +1,5 @@
-#include "passes/guide/check/retime_multiplier.h"
-#include "passes/guide/check/failure_exec.h"
+#include "passes/guide/check/retime_multi.h"
+#include "passes/guide/check/fail_exec.h"
 
 YOSYS_NAMESPACE_BEGIN
 namespace guide_check {
