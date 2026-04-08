@@ -641,13 +641,43 @@ static void classify_blif_residual_names(const PartitionedPair &pair, const std:
     }
 }
 
-int parse_name_map_applied(const string &output)
+struct NameMapAudit
 {
+    bool seen = false;
+    int applied = 0;
+    int missing1 = 0;
+    int missing2 = 0;
+    int conflicts = 0;
+};
+
+static NameMapAudit parse_name_map_audit(const string &output)
+{
+    NameMapAudit audit;
     size_t pos = output.find("Name map: applied ");
     if (pos == string::npos)
-        return 0;
+        return audit;
+    audit.seen = true;
     pos += strlen("Name map: applied ");
-    return atoi(output.c_str() + pos);
+    audit.applied = atoi(output.c_str() + pos);
+
+    size_t miss1 = output.find("missing1 ", pos);
+    if (miss1 != string::npos)
+        audit.missing1 = atoi(output.c_str() + miss1 + strlen("missing1 "));
+
+    size_t miss2 = output.find("missing2 ", pos);
+    if (miss2 != string::npos)
+        audit.missing2 = atoi(output.c_str() + miss2 + strlen("missing2 "));
+
+    size_t conf = output.find("conflicts ", pos);
+    if (conf != string::npos)
+        audit.conflicts = atoi(output.c_str() + conf + strlen("conflicts "));
+
+    return audit;
+}
+
+int parse_name_map_applied(const string &output)
+{
+    return parse_name_map_audit(output).applied;
 }
 
 int parse_const_comp_net_cnt(const string &output)
@@ -1925,6 +1955,46 @@ void refine_shell_closure(PartitionedPair &pair, RTLIL::Module *gold_orig, RTLIL
         add_sample_name(pair.preblif_prom_samps, canonical_bit, 8);
     }
 
+    pair.blif_promoted_cnt = 0;
+    pair.blif_prom_samps.clear();
+    {
+        std::vector<string> blif_res_samps, blif_prom_samps, blif_rem_samps;
+        int blif_opaque_out_cnt = 0;
+        int blif_lib_resolved_cnt = 0;
+        ConstantCompletionAudit blif_before = audit_blif_residual_nets(pair, &blif_res_samps,
+                                                                       &blif_prom_samps,
+                                                                       &blif_rem_samps,
+                                                                       &blif_opaque_out_cnt,
+                                                                       &blif_lib_resolved_cnt);
+        if (!blif_before.promotions.empty()) {
+            gold_local_db = build_local_trace_db(pair.gold_local, pair.gold_bit_origins);
+            gate_local_db = build_local_trace_db(pair.gate_local, pair.gate_bit_origins);
+        }
+        for (const auto &promotion : blif_before.promotions) {
+            RTLIL::IdString canonical = RTLIL::escape_id(canonical_trace_boundary_wire(promotion.source_id));
+            string canonical_bit = wire_bit_name(canonical, 1, 0);
+            ResidualBitInfo gold_info = trace_local_residual_origin(gold_local_db, promotion.gold_bit_name);
+            ResidualBitInfo gate_info = trace_local_residual_origin(gate_local_db, promotion.gate_bit_name);
+            if (!gold_info.promotable || !gate_info.promotable)
+                continue;
+            if (pair.promoted_internal_boundary_bit_names.count(canonical_bit))
+                continue;
+            if (!can_promote_internal_boundary_bit(pair.gold_local, promotion.gold_bit_name, canonical))
+                continue;
+            if (!can_promote_internal_boundary_bit(pair.gate_local, promotion.gate_bit_name, canonical))
+                continue;
+            if (!promote_internal_boundary_bit(pair.gold_local, promotion.gold_bit_name, canonical))
+                continue;
+            if (!promote_internal_boundary_bit(pair.gate_local, promotion.gate_bit_name, canonical))
+                continue;
+            pair.promoted_internal_boundary_bit_names.insert(canonical_bit);
+            set_promoted_boundary_origin(pair.gold_bit_origins, canonical_bit, gold_info);
+            set_promoted_boundary_origin(pair.gate_bit_origins, canonical_bit, gate_info);
+            pair.blif_promoted_cnt += 2;
+            add_sample_name(pair.blif_prom_samps, canonical_bit, 8);
+        }
+    }
+
     allowed = base_allowed();
     alias_in.clear();
     gold_trace_info.clear();
@@ -1997,8 +2067,7 @@ void refine_shell_closure(PartitionedPair &pair, RTLIL::Module *gold_orig, RTLIL
     pair.blif_trace_cnt = blif_after.traceable_count;
     pair.blif_prom_cnt = blif_after.promotable_count;
     pair.blif_untrace_cnt = blif_after.untraceable_count;
-    pair.blif_promoted_cnt = 0;
-    pair.shell_refine_iter_cnt = 3;
+    pair.shell_refine_iter_cnt = 4;
 }
 
 std::vector<ChildBoundaryPort> submod_to_pi_po(RTLIL::Design *design, RTLIL::Module *mod)
@@ -2312,16 +2381,21 @@ LocalValidateResult validate_partition_pair(const CheckConfig &conf,
         local_match.stats;
 
     result.exact_cnt = local_match.stats.exact_total;
-    for (const auto &cp : local_match.cut_points)
+    bool need_name_map = false;
+    for (const auto &cp : local_match.cut_points) {
+        if (log_signal(cp.gold_sig) != log_signal(cp.gate_sig))
+            need_name_map = true;
         if (local_pair.boundary_bit_names.count(strip_backslash(cp.name)) ||
             local_pair.promoted_internal_boundary_bit_names.count(strip_backslash(cp.name)))
             result.bnd_map_app++;
+    }
 
     result.ran = true;
     CommandResult local_abc_result;
     result.proved = abc_cec_module(local_conf, false, &local_abc_result);
     result.vali_backend = "local_abc";
-    int abc_name_map_applied = parse_name_map_applied(local_abc_result.output);
+    NameMapAudit name_map_audit = parse_name_map_audit(local_abc_result.output);
+    int abc_name_map_applied = name_map_audit.applied;
     if (result.bnd_map_app == 0 && abc_name_map_applied > 0)
         result.bnd_map_app = std::min(result.bnd_map_exp, abc_name_map_applied);
     result.const_comp_net_cnt = parse_const_comp_net_cnt(local_abc_result.output);
@@ -2339,6 +2413,16 @@ LocalValidateResult validate_partition_pair(const CheckConfig &conf,
         result.blif_opaque_out_cnt, result.blif_untrace_cnt,
         result.blif_res_samps, result.blif_rem_samps);
     result.unsafe_why = partition_unsafe_why(local_abc_result);
+    if (name_map_audit.seen) {
+        bool name_map_bad =
+            name_map_audit.conflicts > 0 ||
+            name_map_audit.missing2 > 0 ||
+            (need_name_map && name_map_audit.applied == 0);
+        if (name_map_bad)
+            result.unsafe_why = "name_map_not_applied";
+        else if (result.unsafe_why == "name_map_not_applied")
+            result.unsafe_why.clear();
+    }
     if (!result.unsafe_why.empty())
         result.auth_ok = false;
     if (result.unr_int_bnd_cnt > 0) {

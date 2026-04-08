@@ -352,14 +352,39 @@ RTLIL::Design *prepare_blif_module_design(RTLIL::Design *design, RTLIL::Module *
                                                  int *inserted_bbconsts)
 {
     RTLIL::Design *design_copy = clone_design_for_passes(design);
+    string mod_name = strip_backslash(mod->name);
+    bool local_shell = mod_name.size() >= 7 && mod_name.substr(mod_name.size() - 7) == "__local";
+    pool<RTLIL::IdString> lib_mods;
 
     if (!lib_file.empty() && lib_file.size() >= 2 && lib_file.substr(lib_file.size() - 2) == ".v") {
+        pool<RTLIL::IdString> mod_names_before;
+        for (auto mod_ : design_copy->modules())
+            mod_names_before.insert(mod_->name);
         run_pass(stringf("read_verilog -overwrite -noblackbox %s", lib_file), design_copy);
         run_pass("proc", design_copy);
+        for (auto mod_ : design_copy->modules())
+            if (!mod_names_before.count(mod_->name))
+                lib_mods.insert(mod_->name);
     }
 
+    if (!local_shell) {
+        for (auto mod_ : design_copy->modules())
+            if (mod_->name != mod->name)
+                mod_->set_bool_attribute(ID(blackbox), true);
+
+        RTLIL::Module *target_mod = design_copy->module(mod->name);
+        if (target_mod != nullptr) {
+            int inserted = materialize_blackbox_input_consts(design_copy, target_mod);
+            if (inserted_bbconsts != nullptr)
+                *inserted_bbconsts = inserted;
+        }
+        return design_copy;
+    }
+
+    run_pass(stringf("hierarchy -top %s", mod->name.str()), design_copy);
+
     for (auto mod_ : design_copy->modules())
-        if (mod_->name != mod->name)
+        if (mod_->name != mod->name && !lib_mods.count(mod_->name))
             mod_->set_bool_attribute(ID(blackbox), true);
 
     RTLIL::Module *target_mod = design_copy->module(mod->name);
@@ -368,6 +393,37 @@ RTLIL::Design *prepare_blif_module_design(RTLIL::Design *design, RTLIL::Module *
         if (inserted_bbconsts != nullptr)
             *inserted_bbconsts = inserted;
     }
+
+    run_pass(stringf("flatten %s", mod->name.str()), design_copy);
+    pool<RTLIL::IdString> keep_mods;
+    std::vector<RTLIL::IdString> worklist;
+    keep_mods.insert(mod->name);
+    worklist.push_back(mod->name);
+    while (!worklist.empty()) {
+        RTLIL::IdString mod_name = worklist.back();
+        worklist.pop_back();
+        RTLIL::Module *cur = design_copy->module(mod_name);
+        if (cur == nullptr)
+            continue;
+        for (auto *cell : cur->cells()) {
+            RTLIL::Module *sub = design_copy->module(cell->type);
+            if (sub == nullptr || keep_mods.count(sub->name))
+                continue;
+            keep_mods.insert(sub->name);
+            worklist.push_back(sub->name);
+        }
+    }
+    std::vector<RTLIL::Module*> rm_mods;
+    for (auto mod_ : design_copy->modules())
+        if (!keep_mods.count(mod_->name))
+            rm_mods.push_back(mod_);
+    for (auto mod_ : rm_mods)
+        design_copy->remove(mod_);
+    run_pass("opt", design_copy);
+    run_pass("memory_map", design_copy);
+    run_pass("techmap", design_copy);
+    run_pass("dffunmap", design_copy);
+    run_pass("opt_clean", design_copy);
 
     return design_copy;
 }
@@ -385,6 +441,8 @@ string dump_blif_module(RTLIL::Design* design, const string &dir_name, RTLIL::Mo
     
     auto log_files_backup = log_files;
     auto log_streams_backup = log_streams;
+    string mod_name_str = strip_backslash(mod->name);
+    bool local_shell = mod_name_str.size() >= 7 && mod_name_str.substr(mod_name_str.size() - 7) == "__local";
 
     // log_files.clear(); // TODO: Maybe it's not a good ieda... 
     // log_streams.clear(); // TODO: We can not see any log...
@@ -397,10 +455,16 @@ string dump_blif_module(RTLIL::Design* design, const string &dir_name, RTLIL::Mo
     // run_pass(stringf("techmap"), design_copy);
     // run_pass(stringf("dffunmap"), design_copy);
     // run_pass(stringf("write_blif -impltf -blackbox -top %s %s", mod_name, blif_file), design_copy);
-    run_pass(stringf(
-        "write_blif -blackbox -top %s -false + __const0 -true + __const1 -undef + __constx %s",
-        mod_name, blif_file),
-        design_copy);
+    if (local_shell)
+        run_pass(stringf(
+            "write_blif -impltf -blackbox -top %s %s",
+            mod_name, blif_file),
+            design_copy);
+    else
+        run_pass(stringf(
+            "write_blif -blackbox -top %s -false + __const0 -true + __const1 -undef + __constx %s",
+            mod_name, blif_file),
+            design_copy);
     delete design_copy;
 
     log_files = log_files_backup;
