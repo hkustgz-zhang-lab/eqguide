@@ -147,16 +147,21 @@ struct FailurePacket
 	std::vector<string> clues;
 	MatchStats match;
 	int exit_status = -1;
+	int raw_result_code = 0;
 	int result_code = 0;
+	string proof_outcome;
 	double runtime_ms = 0;
 	string log_file;
+	string fingerprint;
 	std::vector<string> recent_actions;
 };
 
 struct CommandResult
 {
 	int exit_status = -1;
+	int raw_result_code = 0;
 	int result_code = 0;
+	string proof_outcome;
 	double runtime_ms = 0;
 	string output;
 	string log_file;

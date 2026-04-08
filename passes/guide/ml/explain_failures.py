@@ -88,15 +88,32 @@ def summarize_packet(packet: dict[str, Any]) -> str:
     stage = packet.get("stage", "UNKNOWN")
     pair_id = packet.get("pair_id", "unknown_pair")
     clues = packet.get("clues", [])
+    proof_outcome = packet.get("proof_outcome", "unknown")
 
     if teacher_class == "abc_miter_failed":
         return f"{stage} failed for {pair_id} while running {action}; ABC could not build a usable miter."
+    if teacher_class == "not_equivalent_after_structural_hashing":
+        return f"{stage} reported non-equivalence for {pair_id} during structural hashing while running {action}."
+    if teacher_class == "not_equivalent_after_sat":
+        return f"{stage} reported non-equivalence for {pair_id} after SAT while running {action}."
+    if teacher_class == "not_equivalent_after_fraiging":
+        return f"{stage} reported non-equivalence for {pair_id} after fraiging while running {action}."
+    if teacher_class == "not_equivalent_after_partitioning":
+        return f"{stage} reported non-equivalence for {pair_id} after partitioning while running {action}."
+    if teacher_class == "not_equivalent_after_framing":
+        return f"{stage} reported non-equivalence for {pair_id} after framing while running {action}."
+    if teacher_class == "not_equivalent_after_simulation":
+        return f"{stage} reported non-equivalence for {pair_id} after simulation while running {action}."
     if teacher_class == "retime_or_warmup_issue":
         return f"{stage} failed for {pair_id} while running {action}; the packet looks consistent with a retime or warmup issue."
     if teacher_class == "multiplier_annotation_or_sca_issue":
         return f"{stage} failed for {pair_id} while running {action}; the multiplier-specific flow rejected the candidate module."
     if teacher_class == "not_equivalent_counterexample":
         return f"{stage} reported a non-equivalence result for {pair_id} while running {action}."
+    if proof_outcome == "tool_error":
+        return f"{stage} hit a tool-side execution error for {pair_id} while running {action}."
+    if proof_outcome == "timeout":
+        return f"{stage} timed out for {pair_id} while running {action}."
     if clues:
         return f"{stage} failed for {pair_id} while running {action}; primary clue: {clues[0]}."
     return f"{stage} failed for {pair_id} while running {action}; inspect the command log for the root cause."
@@ -109,6 +126,36 @@ def rule_explanation(packet: dict[str, Any]) -> dict[str, Any]:
             "miter construction failed before proof completed",
             "signal name mapping may be too sparse or misleading",
             "the current action ordering may not fit this module pair",
+        ],
+        "not_equivalent_after_structural_hashing": [
+            "a mismatch is visible before deeper proof engines are needed",
+            "boundary naming or trivial signal alignment may already differ",
+            "the pair may have a real shallow combinational mismatch",
+        ],
+        "not_equivalent_after_sat": [
+            "SAT found a concrete counterexample after hashing did not settle the pair",
+            "the pair likely differs semantically, not just syntactically",
+            "the mismatch may be concentrated in a small cone of logic",
+        ],
+        "not_equivalent_after_fraiging": [
+            "fraiging exposed a semantic mismatch after structural simplification",
+            "the difference may be sensitive to internal rewriting choices",
+            "the pair may need cone-level inspection rather than name-based triage",
+        ],
+        "not_equivalent_after_partitioning": [
+            "partition-local reasoning found a real mismatch",
+            "a partition boundary may be exposing an actual functional delta",
+            "the failing partition should be inspected before changing shell heuristics",
+        ],
+        "not_equivalent_after_framing": [
+            "sequential framing exposed a real mismatch",
+            "reset or init handling may be involved in the failing trace",
+            "the mismatch may depend on time-step alignment",
+        ],
+        "not_equivalent_after_simulation": [
+            "simulation found an early counterexample before deeper proof completed",
+            "the mismatch may be easy to reproduce from a short trace",
+            "waveform-style triage is likely useful here",
         ],
         "retime_or_warmup_issue": [
             "sequential proof depth may be too small",
@@ -132,6 +179,12 @@ def rule_explanation(packet: dict[str, Any]) -> dict[str, Any]:
     }
     confidence = {
         "abc_miter_failed": "medium",
+        "not_equivalent_after_structural_hashing": "high",
+        "not_equivalent_after_sat": "high",
+        "not_equivalent_after_fraiging": "high",
+        "not_equivalent_after_partitioning": "high",
+        "not_equivalent_after_framing": "high",
+        "not_equivalent_after_simulation": "high",
         "retime_or_warmup_issue": "medium",
         "multiplier_annotation_or_sca_issue": "high",
         "not_equivalent_counterexample": "medium",
@@ -139,6 +192,12 @@ def rule_explanation(packet: dict[str, Any]) -> dict[str, Any]:
     }
     failure_kind = {
         "abc_miter_failed": "proof_path_blocked",
+        "not_equivalent_after_structural_hashing": "not_equivalent",
+        "not_equivalent_after_sat": "not_equivalent",
+        "not_equivalent_after_fraiging": "not_equivalent",
+        "not_equivalent_after_partitioning": "not_equivalent",
+        "not_equivalent_after_framing": "not_equivalent",
+        "not_equivalent_after_simulation": "not_equivalent",
         "retime_or_warmup_issue": "sequential_proof_blocked",
         "multiplier_annotation_or_sca_issue": "multiplier_verification_blocked",
         "not_equivalent_counterexample": "possible_real_mismatch",

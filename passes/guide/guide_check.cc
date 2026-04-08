@@ -613,11 +613,24 @@ bool abc_cec_module(const CheckConfig &conf, bool fatal, CommandResult *deciding
         CommandResult cmd_res;
         int rc = 0;
         string act = get_action_name(action);
+        string log_dir = failure_log_dir(conf.dump_cfg);
         log("Executing ABC command: '%s'\n", abc_cmd.c_str());
         int status = exectue_and_check(cmd, rc, out2result, conf.tempdir_name,
                                             "abc-" + sanitize_filename(get_pair_id(conf.gold_mod->name, conf.gate_mod->name)) +
                                             "-" + act,
+                                            log_dir,
                                             &cmd_res);
+        cmd_res.raw_result_code = rc;
+        if (rc == 1)
+            cmd_res.proof_outcome = "equivalent";
+        else if (rc == 2)
+            cmd_res.proof_outcome = "not_equivalent";
+        else if (rc == 3)
+            cmd_res.proof_outcome = "blocked";
+        else if (rc == 0)
+            cmd_res.proof_outcome = "blocked";
+        else if (status != 0)
+            cmd_res.proof_outcome = "tool_error";
         if (status != 0 || rc == 0) {
             cmd_res.result_code = rc;
             emit_failure_packet(conf, "ABC", act, cmd_res, {});
@@ -859,8 +872,10 @@ bool bmcinduct_check(const CheckConfig &conf){
         cmd += std::to_string(conf.seq_check_cfg.step_skip) + ":" + std::to_string(conf.seq_check_cfg.k_induct) + " ";
 
         CommandResult weak_capture;
+        string log_dir = failure_log_dir(conf.dump_cfg);
         int ret = exec_cmd(cmd + smt2_file, conf.tempdir_name,
                            "smtbmc-weak-" + sanitize_filename(get_pair_id(conf.gold_mod->name, conf.gate_mod->name)),
+                           log_dir,
                            &weak_capture);
         if(ret != 0){
             log("BMC-Induct failed in weak mode.\n");
@@ -876,8 +891,10 @@ bool bmcinduct_check(const CheckConfig &conf){
 
     cmd_bmc += " -t " + std::to_string(conf.seq_check_cfg.step_skip) + ":" + std::to_string(conf.seq_check_cfg.k_induct) + " ";
     CommandResult bmc_capture;
+    string log_dir = failure_log_dir(conf.dump_cfg);
     int ret = exec_cmd(cmd_bmc + smt2_file, conf.tempdir_name,
                        "smtbmc-bmc-" + sanitize_filename(get_pair_id(conf.gold_mod->name, conf.gate_mod->name)),
+                       log_dir,
                        &bmc_capture);
     if(ret != 0){
         log("BMC-Induct failed in BMC phase.\n");
@@ -890,6 +907,7 @@ bool bmcinduct_check(const CheckConfig &conf){
     CommandResult induct_capture;
     ret = exec_cmd(cmd_induct + smt2_file, conf.tempdir_name,
                    "smtbmc-induct-" + sanitize_filename(get_pair_id(conf.gold_mod->name, conf.gate_mod->name)),
+                   log_dir,
                    &induct_capture);
     if(ret != 0){
         log("BMC-Induct failed in Induct phase.\n");

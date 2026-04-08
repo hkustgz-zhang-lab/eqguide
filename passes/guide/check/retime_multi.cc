@@ -534,15 +534,18 @@ bool check_multi(RTLIL::Design* design, RTLIL::Module* mod, const string& tempdi
         auto amulet_sub_cmd = "amulet -substitute " + aig_file + " " + miter_tmp_file  + " " + rewritten_tmp_file + (is_signed? " -signed" : "");
         std::cout << "Running amulet: " << amulet_sub_cmd << std::endl;
         CommandResult substitute_capture;
-        exec_cmd(amulet_sub_cmd, tempdir_name, "amulet-substitute-" + sanitize_filename(strip_backslash(mod->name)), &substitute_capture);
+        string log_dir = failure_log_dir(dump_cfg);
+        exec_cmd(amulet_sub_cmd, tempdir_name, "amulet-substitute-" + sanitize_filename(strip_backslash(mod->name)), log_dir, &substitute_capture);
         auto amulet_veri_cmd = "amulet -verify " + rewritten_tmp_file + (is_signed ? " -signed" : "");
         std::cout << "Running amulet: " << amulet_veri_cmd << std::endl;
         CommandResult verify_capture;
-        auto ret = exec_cmd(amulet_veri_cmd, tempdir_name, "amulet-verify-" + sanitize_filename(strip_backslash(mod->name)), &verify_capture);
+        auto ret = exec_cmd(amulet_veri_cmd, tempdir_name, "amulet-verify-" + sanitize_filename(strip_backslash(mod->name)), log_dir, &verify_capture);
         if(ret != 1){
             log("Amulet Verify failed.\n");
             verify_capture.output += "Amulet Verify failed.\n";
+            verify_capture.raw_result_code = ret;
             verify_capture.result_code = ret;
+            verify_capture.proof_outcome = "blocked";
             emit_failure_packet(dump_cfg, pair_id, "AMULET", "amulet_verify", gold_mod_name, gate_mod_name, verify_capture);
             return false;
         }
@@ -554,9 +557,12 @@ bool check_multi(RTLIL::Design* design, RTLIL::Module* mod, const string& tempdi
         CommandResult capture;
         exectue_and_check(cmd, correct, "CIRCUIT IS CORRECT", tempdir_name,
                           "dynphaseorderopt-" + sanitize_filename(strip_backslash(mod->name)),
+                          failure_log_dir(dump_cfg),
                           &capture);
         if (!correct) {
+            capture.raw_result_code = capture.exit_status;
             capture.result_code = capture.exit_status;
+            capture.proof_outcome = "blocked";
             emit_failure_packet(dump_cfg, pair_id, "AMULET", "dynphaseorderopt", gold_mod_name, gate_mod_name, capture);
         }
         return correct;
