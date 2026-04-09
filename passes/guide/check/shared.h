@@ -91,6 +91,7 @@ struct RunRecord
 	string action;
 	int exit_status = -1;
 	int result_code = 0;
+	string proof_outcome;
 	double runtime_ms = 0;
 	string log_file;
 };
@@ -141,10 +142,16 @@ struct GuideSchedModel
 
 struct FailurePacket
 {
+	int schema_version = 1;
+	string packet_id;
+	string design;
 	string pair_id;
+	string engine;
+	string scope;
 	string stage;
 	string action;
 	std::vector<string> clues;
+	PairRecord pair;
 	MatchStats match;
 	int exit_status = -1;
 	int raw_result_code = 0;
@@ -154,6 +161,7 @@ struct FailurePacket
 	string log_file;
 	string fingerprint;
 	std::vector<string> recent_actions;
+	std::vector<RunRecord> trace;
 };
 
 struct CommandResult
@@ -167,9 +175,22 @@ struct CommandResult
 	string log_file;
 };
 
+struct ShadowValiSummary
+{
+	bool ran = false;
+	bool proved = false;
+	bool auth_ok = true;
+	int cut_cnt = 0;
+	string vali_backend;
+	string unsafe_why;
+	string fb_why;
+};
+
 struct GuideTelemetry
 {
 	std::map<string, MatchStats> pair_match_stats;
+	std::map<string, PairRecord> pair_records;
+	std::map<string, ShadowValiSummary> shadow_vali;
 	dict<string, int> pair_applied_sugs;
 	pool<RTLIL::IdString> retimed_mods;
 	pool<RTLIL::IdString> multiplier_mods;
@@ -440,6 +461,7 @@ struct RegionProofResult
 	bool oblig_done = false;
 	bool proved = false;
 	bool auth_ok = true;
+	bool used_bmc_fb = false;
 	string backend;
 	string unsafe_why;
 	string auth_why;
@@ -447,6 +469,8 @@ struct RegionProofResult
 	int cut_cnt = 0;
 	int exact_cnt = 0;
 	int child_bnd_cnt = 0;
+	int plan_unr_child_bnd_cnt = 0;
+	int shell_unr_child_bnd_cnt = 0;
 	int unr_child_bnd_cnt = 0;
 	int bnd_map_exp = 0;
 	int bnd_map_app = 0;

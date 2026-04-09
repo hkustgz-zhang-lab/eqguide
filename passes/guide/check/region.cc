@@ -2448,6 +2448,9 @@ LocalValidateResult validate_partition_pair(const CheckConfig &conf,
         bool resid_hier = module_has_submodule(design_check, local_conf.gold_mod) || module_has_submodule(design_check, local_conf.gate_mod);
         if (residual_state || resid_hier) {
             result.used_bmc_fb = true;
+            result.auth_ok = false;
+            if (result.fb_why.empty())
+                result.fb_why = "used_bmc_fallback";
             bool bmc_ok = bmcinduct_check(local_conf);
             result.vali_backend = "local_abc_bmc";
             if (bmc_ok)
@@ -2490,6 +2493,17 @@ void run_local_vali_shadow(const CheckConfig &conf, ModMap &mod_map,
         }
 
         LocalValidateResult result = validate_partition_pair(conf, gold_mod, gate_mod, local_cutpoints, false);
+        if (conf.telemetry != nullptr) {
+            ShadowValiSummary summary;
+            summary.ran = result.ran;
+            summary.proved = result.proved;
+            summary.auth_ok = result.auth_ok;
+            summary.cut_cnt = result.cut_cnt;
+            summary.vali_backend = result.vali_backend;
+            summary.unsafe_why = result.unsafe_why;
+            summary.fb_why = result.fb_why;
+            conf.telemetry->shadow_vali[result.pair_id] = summary;
+        }
         append_jsonl(pair_artifact_path(artifact_dir, "local_validate", gold_mod, gate_mod, ".jsonl"), Json::object {
             {"design", strip_backslash(conf.gold_mod->name)},
             {"gold_mod", strip_backslash(gold_mod->name)},
@@ -2731,6 +2745,8 @@ Results partition_prove(const CheckConfig &conf, ModMap &mod_map,
         RegionProofResult region_result;
         region_result.region_id = node.region_id;
         region_result.child_bnd_cnt = GetSize(node.child_boundaries);
+        region_result.plan_unr_child_bnd_cnt = node.unresolved_child_bnd_cnt;
+        region_result.shell_unr_child_bnd_cnt = 0;
         region_result.unr_child_bnd_cnt = node.unresolved_child_bnd_cnt;
 
         bool child_done = true;
@@ -2746,14 +2762,30 @@ Results partition_prove(const CheckConfig &conf, ModMap &mod_map,
         std::vector<CutPoint> local_cutpoints =
             filter_materializable_cutpoints(node.gold_mod, node.gate_mod, node.state_cutpoints);
         bool shell_attempted = !local_cutpoints.empty() || !node.child_boundaries.empty();
+        ShadowValiSummary shadow_summary;
+        bool have_shadow = false;
+        string pair_id = get_pair_id(node.gold_mod->name, node.gate_mod->name);
+        if (conf.telemetry != nullptr) {
+            auto it = conf.telemetry->shadow_vali.find(pair_id);
+            if (it != conf.telemetry->shadow_vali.end()) {
+                shadow_summary = it->second;
+                have_shadow = shadow_summary.ran;
+            }
+        }
         if (shell_attempted) {
             LocalValidateResult shell_result =
                 validate_partition_pair(conf, node.gold_mod, node.gate_mod, local_cutpoints, true);
+            bool shadow_blocks_auth =
+                have_shadow &&
+                shadow_summary.cut_cnt >= shell_result.cut_cnt &&
+                (!shadow_summary.proved || !shadow_summary.auth_ok);
             region_result.shell_proved = shell_result.proved;
             region_result.cut_cnt = shell_result.cut_cnt;
             region_result.exact_cnt = shell_result.exact_cnt;
             region_result.child_bnd_cnt = shell_result.child_bnd_cnt;
-            region_result.unr_child_bnd_cnt = shell_result.unr_child_bnd_cnt;
+            region_result.shell_unr_child_bnd_cnt = shell_result.unr_child_bnd_cnt;
+            region_result.unr_child_bnd_cnt =
+                std::max(region_result.plan_unr_child_bnd_cnt, region_result.shell_unr_child_bnd_cnt);
             region_result.bnd_map_exp = shell_result.bnd_map_exp;
             region_result.bnd_map_app = shell_result.bnd_map_app;
             region_result.const_comp_net_cnt = shell_result.const_comp_net_cnt;
@@ -2800,9 +2832,12 @@ Results partition_prove(const CheckConfig &conf, ModMap &mod_map,
             region_result.resid_hier = shell_result.resid_hier;
             region_result.runtime_ms = shell_result.runtime_ms;
             region_result.backend = shell_result.vali_backend;
+            region_result.used_bmc_fb = shell_result.used_bmc_fb;
             region_result.unsafe_why = shell_result.unsafe_why;
             region_result.auth_ok =
                 shell_result.auth_ok &&
+                !shell_result.used_bmc_fb &&
+                !shadow_blocks_auth &&
                 region_result.unr_child_bnd_cnt == 0 &&
                 region_result.unr_int_bnd_cnt == 0 &&
                 region_result.const_comp_net_cnt == 0 &&
@@ -2818,6 +2853,18 @@ Results partition_prove(const CheckConfig &conf, ModMap &mod_map,
                 region_result.fb_why = "constant_completed_nets";
             if (region_result.bnd_map_exp > 0 && region_result.bnd_map_app == 0 && region_result.fb_why.empty())
                 region_result.fb_why = "boundary_map_not_applied";
+            if (shell_result.used_bmc_fb && region_result.fb_why.empty())
+                region_result.fb_why = "used_bmc_fallback";
+            if (shadow_blocks_auth && region_result.fb_why.empty()) {
+                if (!shadow_summary.proved)
+                    region_result.fb_why = "shadow_failed";
+                else if (!shadow_summary.fb_why.empty())
+                    region_result.fb_why = "shadow_" + shadow_summary.fb_why;
+                else if (!shadow_summary.unsafe_why.empty())
+                    region_result.fb_why = "shadow_" + shadow_summary.unsafe_why;
+                else
+                    region_result.fb_why = "shadow_non_authoritative";
+            }
             if (!shell_result.auth_ok && region_result.fb_why.empty())
                 region_result.fb_why = !shell_result.fb_why.empty() ? shell_result.fb_why : shell_result.unsafe_why;
             region_result.proved = region_result.shell_proved && child_done;
@@ -2838,6 +2885,11 @@ Results partition_prove(const CheckConfig &conf, ModMap &mod_map,
                 {"validator_result", shell_result.proved ? "pass" : "fail"},
                 {"validator_backend", shell_result.vali_backend},
                 {"used_bmc_fallback", shell_result.used_bmc_fb},
+                {"shadow_validator_ran", have_shadow},
+                {"shadow_validator_proved", shadow_summary.proved},
+                {"shadow_validator_authoritative_ok", shadow_summary.auth_ok},
+                {"shadow_validator_cutpoints", shadow_summary.cut_cnt},
+                {"shadow_validator_backend", shadow_summary.vali_backend},
                 {"authoritative_ok", region_result.auth_ok},
                 {"authoritative_reason", region_result.auth_why},
                 {"unsafe_reason", shell_result.unsafe_why},
@@ -2890,7 +2942,9 @@ Results partition_prove(const CheckConfig &conf, ModMap &mod_map,
                 {"blif_remaining_samples", json_array_from_strings(shell_result.blif_rem_samps)},
                 {"unresolved_internal_boundaries", shell_result.unr_int_bnd_cnt},
                 {"child_boundary_count", shell_result.child_bnd_cnt},
-                {"unresolved_child_boundaries", shell_result.unr_child_bnd_cnt}
+                {"plan_unresolved_child_boundaries", region_result.plan_unr_child_bnd_cnt},
+                {"shell_unresolved_child_boundaries", region_result.shell_unr_child_bnd_cnt},
+                {"unresolved_child_boundaries", region_result.unr_child_bnd_cnt}
             });
         } else {
             region_result.fb_why = "no_shell_obligation";
@@ -2931,6 +2985,12 @@ Results partition_prove(const CheckConfig &conf, ModMap &mod_map,
             {"authoritative_ok", region_result.auth_ok},
             {"authoritative_reason", region_result.auth_why},
             {"proved", region_result.proved},
+            {"used_bmc_fallback", region_result.used_bmc_fb},
+            {"shadow_validator_ran", have_shadow},
+            {"shadow_validator_proved", shadow_summary.proved},
+            {"shadow_validator_authoritative_ok", shadow_summary.auth_ok},
+            {"shadow_validator_cutpoints", shadow_summary.cut_cnt},
+            {"shadow_validator_backend", shadow_summary.vali_backend},
             {"unsafe_reason", region_result.unsafe_why},
             {"fallback_reason", region_result.fb_why},
             {"backend", region_result.backend},
@@ -2979,6 +3039,8 @@ Results partition_prove(const CheckConfig &conf, ModMap &mod_map,
             {"blif_residual_samples", json_array_from_strings(region_result.blif_res_samps)},
             {"blif_promoted_samples", json_array_from_strings(region_result.blif_prom_samps)},
             {"blif_remaining_samples", json_array_from_strings(region_result.blif_rem_samps)},
+            {"plan_unresolved_child_boundaries", region_result.plan_unr_child_bnd_cnt},
+            {"shell_unresolved_child_boundaries", region_result.shell_unr_child_bnd_cnt},
             {"unresolved_internal_boundaries", region_result.unr_int_bnd_cnt},
             {"unresolved_child_boundaries", region_result.unr_child_bnd_cnt},
             {"residual_hierarchy", region_result.resid_hier}
