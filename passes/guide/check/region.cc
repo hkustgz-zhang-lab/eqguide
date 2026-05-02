@@ -2482,9 +2482,10 @@ void run_local_vali_shadow(const CheckConfig &conf, ModMap &mod_map,
         if (!gold2cutpoints.count(gold_mod))
             continue;
 
+        std::vector<CutPoint> all_dff_cps =
+            select_local_dff_cutpoints(gold2cutpoints.at(gold_mod));
         std::vector<CutPoint> local_cutpoints =
-            filter_materializable_cutpoints(gold_mod, gate_mod,
-                select_local_dff_cutpoints(gold2cutpoints.at(gold_mod)));
+            filter_materializable_cutpoints(gold_mod, gate_mod, all_dff_cps);
         if (local_cutpoints.empty()) {
             skipped_pairs++;
             log("LOCAL_VALIDATE shadow skipped for %s: no DFF cutpoints.\n",
@@ -2503,6 +2504,37 @@ void run_local_vali_shadow(const CheckConfig &conf, ModMap &mod_map,
             summary.unsafe_why = result.unsafe_why;
             summary.fb_why = result.fb_why;
             conf.telemetry->shadow_vali[result.pair_id] = summary;
+        }
+
+        int sliced_cut_cnt = 0;
+        LocalValidateResult sliced_result;
+        if (conf.local_vali_slice) {
+            pool<IdString> sliced_set;
+            for (const auto &cp : local_cutpoints) {
+                auto slice = select_support_sliced_dff_cutpoints(
+                    gold_mod, gate_mod, gold2cutpoints.at(gold_mod), cp);
+                for (const auto &sc : slice)
+                    sliced_set.insert(sc.name);
+            }
+            std::vector<CutPoint> sliced_cps;
+            for (const auto &cp : local_cutpoints)
+                if (sliced_set.count(cp.name))
+                    sliced_cps.push_back(cp);
+            if (!sliced_cps.empty()) {
+                sliced_result = validate_partition_pair(conf, gold_mod, gate_mod, sliced_cps, false);
+                sliced_cut_cnt = sliced_result.cut_cnt;
+            }
+            if (conf.telemetry != nullptr) {
+                ShadowValiSummary sum;
+                sum.ran = sliced_result.ran;
+                sum.proved = sliced_result.proved;
+                sum.auth_ok = sliced_result.auth_ok;
+                sum.cut_cnt = sliced_cut_cnt;
+                sum.vali_backend = sliced_result.vali_backend;
+                sum.unsafe_why = sliced_result.unsafe_why;
+                sum.fb_why = sliced_result.fb_why;
+                conf.telemetry->shadow_vali_sliced[result.pair_id] = sum;
+            }
         }
         append_jsonl(pair_artifact_path(artifact_dir, "local_validate", gold_mod, gate_mod, ".jsonl"), Json::object {
             {"design", strip_backslash(conf.gold_mod->name)},
@@ -2569,7 +2601,10 @@ void run_local_vali_shadow(const CheckConfig &conf, ModMap &mod_map,
             {"blif_remaining_samples", json_array_from_strings(result.blif_rem_samps)},
             {"unresolved_internal_boundaries", result.unr_int_bnd_cnt},
             {"child_boundary_count", result.child_bnd_cnt},
-            {"unresolved_child_boundaries", result.unr_child_bnd_cnt}
+            {"unresolved_child_boundaries", result.unr_child_bnd_cnt},
+            {"support_slice_cutpoint_count", sliced_cut_cnt},
+            {"support_slice_proved", conf.local_vali_slice ? sliced_result.proved : false},
+            {"support_slice_backend", conf.local_vali_slice ? sliced_result.vali_backend : ""}
         });
         ran_pairs++;
         if (result.proved)

@@ -191,6 +191,7 @@ struct GuideTelemetry
 	std::map<string, MatchStats> pair_match_stats;
 	std::map<string, PairRecord> pair_records;
 	std::map<string, ShadowValiSummary> shadow_vali;
+	std::map<string, ShadowValiSummary> shadow_vali_sliced;
 	dict<string, int> pair_applied_sugs;
 	pool<RTLIL::IdString> retimed_mods;
 	pool<RTLIL::IdString> multiplier_mods;
