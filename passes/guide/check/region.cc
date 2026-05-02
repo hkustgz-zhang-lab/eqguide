@@ -2446,15 +2446,25 @@ LocalValidateResult validate_partition_pair(const CheckConfig &conf,
     if (!result.proved && allow_bmc_fallback) {
         bool residual_state = module_has_dff(local_conf.gold_mod, false) || module_has_dff(local_conf.gate_mod, true);
         bool resid_hier = module_has_submodule(design_check, local_conf.gold_mod) || module_has_submodule(design_check, local_conf.gate_mod);
-        if (residual_state || resid_hier) {
+        int bmc_max_unresolved = 32;
+        if ((residual_state || resid_hier) && result.unr_int_in_cnt <= bmc_max_unresolved) {
             result.used_bmc_fb = true;
             result.auth_ok = false;
-            if (result.fb_why.empty())
-                result.fb_why = "used_bmc_fallback";
+            if (result.fb_why.empty()) {
+                if (local_abc_result.proof_outcome == "timeout")
+                    result.fb_why = "abc_timeout_bmc_fallback";
+                else if (local_abc_result.proof_outcome == "tool_error")
+                    result.fb_why = "abc_tool_error_bmc_fallback";
+                else
+                    result.fb_why = "abc_not_equivalent_bmc_fallback";
+            }
             bool bmc_ok = bmcinduct_check(local_conf);
             result.vali_backend = "local_abc_bmc";
             if (bmc_ok)
                 result.proved = true;
+        } else if (residual_state || resid_hier) {
+            if (result.fb_why.empty())
+                result.fb_why = stringf("bmc_skipped_unresolved_%d", result.unr_int_in_cnt);
         }
     }
     auto t_end = std::chrono::steady_clock::now();
