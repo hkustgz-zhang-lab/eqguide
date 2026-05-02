@@ -2838,6 +2838,7 @@ Results partition_prove(const CheckConfig &conf, ModMap &mod_map,
                 shell_result.auth_ok &&
                 !shell_result.used_bmc_fb &&
                 !shadow_blocks_auth &&
+                !(!have_shadow && region_result.child_bnd_cnt > 0) &&
                 region_result.unr_child_bnd_cnt == 0 &&
                 region_result.unr_int_bnd_cnt == 0 &&
                 region_result.const_comp_net_cnt == 0 &&
@@ -2855,6 +2856,8 @@ Results partition_prove(const CheckConfig &conf, ModMap &mod_map,
                 region_result.fb_why = "boundary_map_not_applied";
             if (shell_result.used_bmc_fb && region_result.fb_why.empty())
                 region_result.fb_why = "used_bmc_fallback";
+            if (!have_shadow && region_result.child_bnd_cnt > 0 && region_result.fb_why.empty())
+                region_result.fb_why = "shadow_required_for_child_boundaries";
             if (shadow_blocks_auth && region_result.fb_why.empty()) {
                 if (!shadow_summary.proved)
                     region_result.fb_why = "shadow_failed";
