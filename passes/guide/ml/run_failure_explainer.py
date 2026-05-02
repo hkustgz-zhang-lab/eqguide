@@ -17,34 +17,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "-o",
         "--output",
-        default="failure_explained.json",
+        default="failure_hints.json",
         help="Output JSON file. If a testcase directory is given, this is relative to that directory.",
     )
     parser.add_argument(
-        "--use-openai",
+        "--rule",
         action="store_true",
-        help="Use the OpenAI-backed explainer path.",
+        help="Use rule-only mode without the online OpenAI-compatible API.",
     )
     parser.add_argument(
-        "--use-gemini",
-        action="store_true",
-        help="Use the Gemini-backed explainer path.",
-    )
-    parser.add_argument(
-        "--use-qwen",
-        action="store_true",
-        help="Use the Qwen-backed explainer path.",
-    )
-    parser.add_argument(
-        "--online",
-        action="store_true",
-        help="Use the default online provider (Qwen).",
+        "--model",
+        default="",
+        help="Model to use for the selected provider.",
     )
     parser.add_argument(
         "--max-packets",
         type=int,
         default=0,
         help="Limit the number of packets to explain. 0 means no limit.",
+    )
+    parser.add_argument(
+        "--eval",
+        metavar="LABELS_JSON",
+        default="",
+        help="After producing failure_hints.json, run eval_failure_hints.py against the given curated labels.",
     )
     return parser.parse_args()
 
@@ -68,14 +64,10 @@ def main() -> int:
         "-o",
         args.output,
     ]
-    if args.use_openai:
-        cmd.append("--use-openai")
-    if args.use_gemini:
-        cmd.append("--use-gemini")
-    if args.use_qwen:
-        cmd.append("--use-qwen")
-    if args.online:
-        cmd.append("--online")
+    if args.rule:
+        cmd.append("--rule")
+    if args.model:
+        cmd.extend(["--model", args.model])
     if args.max_packets > 0:
         cmd.extend(["--max-packets", str(args.max_packets)])
 
@@ -84,6 +76,20 @@ def main() -> int:
         raise SystemExit(proc.stderr.strip() or proc.stdout.strip() or "failure explainer failed")
 
     print(f"Wrote {workdir / args.output}")
+
+    if args.eval:
+        eval_script = pathlib.Path(__file__).with_name("eval_failure_hints.py")
+        eval_cmd = [
+            sys.executable,
+            str(eval_script),
+            str(workdir / args.output),
+            args.eval,
+        ]
+        eval_proc = subprocess.run(eval_cmd, cwd=workdir, text=True, capture_output=True)
+        print(f"Evaluation:\n{eval_proc.stdout.strip()}")
+        if eval_proc.returncode != 0:
+            print(f"Eval stderr: {eval_proc.stderr}")
+
     return 0
 
 
