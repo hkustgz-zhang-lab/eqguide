@@ -7,6 +7,32 @@
 YOSYS_NAMESPACE_BEGIN
 namespace guide_check {
 
+struct CutPoint {
+	RTLIL::IdString name;
+	RTLIL::SigBit gold_sig;
+	RTLIL::SigBit gate_sig;
+	MatchType type = MatchType::NONE;
+	RTLIL::Cell *gold_ff_cell = nullptr;
+	RTLIL::Cell *gate_ff_cell = nullptr;
+	RTLIL::IdString gold_wire_name;
+	int gold_bit_index = 0;
+	RTLIL::IdString gate_wire_name;
+	int gate_bit_index = 0;
+};
+
+struct MatchResult
+{
+	std::vector<CutPoint> cut_points;
+	MatchStats stats;
+};
+
+struct NamedSig {
+	RTLIL::SigBit sig;
+	MatchType type = MatchType::NONE;
+	RTLIL::IdString wire_name;
+	int bit_index = 0;
+};
+
 void write_match_suggestions(const string &path, const Json::array &suggestions);
 string match_suggestions_path(const string &match_jsonl);
 string match_artifact_dir(const CheckConfig &conf);

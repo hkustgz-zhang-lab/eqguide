@@ -7,6 +7,30 @@
 YOSYS_NAMESPACE_BEGIN
 namespace guide_check {
 
+struct FailurePacket
+{
+	int schema_version = 1;
+	string packet_id;
+	string design;
+	string pair_id;
+	string engine;
+	string scope;
+	string stage;
+	string action;
+	std::vector<string> clues;
+	PairRecord pair;
+	MatchStats match;
+	int exit_status = -1;
+	int raw_result_code = 0;
+	int result_code = 0;
+	string proof_outcome;
+	double runtime_ms = 0;
+	string log_file;
+	string fingerprint;
+	std::vector<string> recent_actions;
+	std::vector<RunRecord> trace;
+};
+
 struct FailureTeacher
 {
 	string cls;
