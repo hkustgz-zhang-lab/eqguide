@@ -171,6 +171,7 @@ Json run_record_to_json(const RunRecord &record)
         {"action", record.action},
         {"exit_status", record.exit_status},
         {"result_code", record.result_code},
+        {"proof_outcome", record.proof_outcome},
         {"runtime_ms", record.runtime_ms},
         {"log_file", record.log_file}
     };
@@ -643,6 +644,7 @@ bool abc_cec_module(const CheckConfig &conf, bool fatal, CommandResult *deciding
         rec.action = act;
         rec.exit_status = cmd_res.exit_status;
         rec.result_code = rc;
+        rec.proof_outcome = cmd_res.proof_outcome;
         rec.runtime_ms = cmd_res.runtime_ms;
         rec.log_file = cmd_res.log_file;
         cmd_res.result_code = rc;
@@ -736,6 +738,8 @@ bool abc_cec_module(const CheckConfig &conf, bool fatal, CommandResult *deciding
         RTLIL::unescape_id(conf.gate_mod->name) + ".txt";
 
     PairRecord pair_rec = collect_pair_record(gold_ins + gate_ins);
+    if (conf.telemetry != nullptr)
+        conf.telemetry->pair_records[pair_rec.pair_id] = pair_rec;
     MatchStats mstats = get_match_stats(conf);
     log("Gold DFF count: %d, Gate DFF count: %d\n", pair_rec.gold_dff_cnt, pair_rec.gate_dff_cnt);
 
@@ -1564,10 +1568,10 @@ struct GuideCheckPass : public Pass {
                 match_suggestions_path(dump_cfg.match_jsonl).c_str());
         }
         if (dump_cfg.dump_fail) {
+            string hints_path = path_dirname(dump_cfg.fail_jsonl) + "/failure_hints.json";
+            write_failure_hints(dump_cfg.fail_jsonl, hints_path);
             log("Failure explainer hint:\n");
             log("  python3 passes/guide/ml/run_failure_explainer.py %s\n",
-                dump_cfg.fail_jsonl.c_str());
-            log("  python3 passes/guide/ml/run_failure_explainer.py %s --use-openai\n",
                 dump_cfg.fail_jsonl.c_str());
         }
 
