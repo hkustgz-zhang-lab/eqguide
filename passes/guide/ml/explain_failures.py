@@ -1,61 +1,142 @@
 #!/usr/bin/env python3
 
 import argparse
+import hashlib
 import json
 import os
 import sys
-import urllib.error
-import urllib.request
 from typing import Any
 
-import dashscope
-from dashscope import Generation
 from openai import OpenAI
 
 
-DEFAULT_MODEL = "GLM-4.7"
-DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
-DEFAULT_QWEN_MODEL = "qwen-max"
+SCHEMA_VERSION = 1
+DEFAULT_OPENAI_MODEL = "gpt-5-mini"
 
+LEGACY_STEP_IDS = {
+    "try -n fallback": "retry_cec_nomap",
+    "inspect match density": "inspect_match_density",
+    "inspect pi and cutpoint alignment": "inspect_match_density",
+    "check trivial boundary mismatches": "inspect_match_density",
+    "inspect sat counterexample-bearing signals": "inspect_counterexample",
+    "inspect fraiging-sensitive cone differences": "inspect_counterexample",
+    "inspect partition boundary assumptions": "inspect_partition_boundary",
+    "inspect simulation counterexample": "inspect_counterexample",
+    "inspect early mismatch-producing signals": "inspect_counterexample",
+    "inspect sequential framing assumptions": "inspect_retime_pair",
+    "check reset/init handling": "inspect_upstream_transforms",
+    "increase -skip": "increase_bmc_skip",
+    "increase -k": "increase_bmc_k",
+    "inspect retimed pair": "inspect_retime_pair",
+    "check multiplier width/sign": "check_multiplier_sign_width",
+    "check blackboxing path": "check_blackboxing_path",
+    "inspect counterexample-producing module pair": "inspect_counterexample",
+    "check upstream transforms": "inspect_upstream_transforms",
+    "inspect command log": "inspect_command_log",
+    "replay failing action manually": "replay_failing_action",
+}
 
-def env_first(*names: str, default: str = "") -> str:
-    for name in names:
-        value = os.environ.get(name)
-        if value:
-            return value
-    return default
+STEP_REASON = {
+    "retry_cec_nomap": "Retry the pair without the current name map to see whether mapping sparsity is blocking the proof path.",
+    "retry_dsec_map": "Escalate to the sequential engine on the mapped pair when combinational checks are inconclusive.",
+    "inspect_match_density": "Inspect exact and typed match counts before changing the proof flow.",
+    "increase_bmc_skip": "Give the BMC warmup more room before concluding the sequential proof path is blocked.",
+    "increase_bmc_k": "Increase the search depth so the failing sequential proof has a chance to settle.",
+    "inspect_retime_pair": "Inspect retimed structure and warmup alignment on this module pair.",
+    "check_multiplier_sign_width": "Check multiplier signedness and width assumptions against the extracted cone.",
+    "check_blackboxing_path": "Verify the multiplier blackboxing/substitution path before changing the proof result.",
+    "replay_failing_action": "Replay the exact failing action with the captured log to confirm the failure mode.",
+    "inspect_counterexample": "Inspect the earliest counterexample-bearing signals before changing transforms or matching.",
+    "inspect_upstream_transforms": "Check whether preprocessing or structural rewrites changed the behavior or proof contract.",
+    "inspect_partition_boundary": "Inspect partition boundary assumptions before trusting a local mismatch.",
+    "inspect_command_log": "Read the captured command log before changing policy or classification.",
+}
+
+LIKELY_CAUSES = {
+    "abc_miter_failed": [
+        "ABC could not build a usable miter for this pair",
+        "the current match density may be too sparse or misleading",
+        "the mapped fallback path may not fit this pair",
+    ],
+    "abc_not_equivalent_struct_hash": [
+        "a shallow mismatch is already visible before deeper proof phases",
+        "boundary naming or cutpoint alignment may be off",
+        "the pair may contain a real combinational mismatch",
+    ],
+    "abc_not_equivalent_sat": [
+        "SAT found a concrete mismatch after structural hashing did not settle the pair",
+        "the mismatch is likely semantic rather than purely syntactic",
+        "the failing cone is often small enough to inspect directly",
+    ],
+    "abc_not_equivalent_generic": [
+        "the proof engines found a concrete mismatch on this pair",
+        "upstream transforms or matching may have misaligned the pair",
+        "the failing cone should be replayed before changing policy",
+    ],
+    "bmc_weak_failed": [
+        "weak-mode induction did not close with the current warmup",
+        "retimed structure may need different skip or depth settings",
+        "sequential alignment may still be off on this pair",
+    ],
+    "bmc_bmc_phase_failed": [
+        "the BMC phase did not close within the current warmup/depth budget",
+        "retimed structure may still need more skip or depth",
+        "the trace should be replayed before changing proof policy",
+    ],
+    "bmc_induct_phase_failed": [
+        "the induction step failed even after the bounded phase ran",
+        "the pair may need a different retime or warmup setup",
+        "proof depth may still be too small for this pair",
+    ],
+    "amulet_verify_failed": [
+        "the multiplier-specific flow rejected the current candidate",
+        "signedness or width assumptions may be wrong",
+        "the blackboxing or substitute path may not match the extracted cone",
+    ],
+    "tool_exit_nonzero": [
+        "the external tool exited unsuccessfully before a clear clue was extracted",
+        "the command log is needed before changing the classification",
+    ],
+    "missing_log_or_parse_error": [
+        "the packet did not retain enough logging to classify the failure cleanly",
+        "the command should be replayed to recover the missing context",
+    ],
+    "unknown": [
+        "the packet does not match a known failure class yet",
+        "the command log needs manual inspection",
+    ],
+}
+
+CONFIDENCE = {
+    "abc_miter_failed": "medium",
+    "abc_not_equivalent_struct_hash": "high",
+    "abc_not_equivalent_sat": "high",
+    "abc_not_equivalent_generic": "medium",
+    "bmc_weak_failed": "medium",
+    "bmc_bmc_phase_failed": "medium",
+    "bmc_induct_phase_failed": "medium",
+    "amulet_verify_failed": "high",
+    "tool_exit_nonzero": "low",
+    "missing_log_or_parse_error": "low",
+    "unknown": "low",
+}
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Explain guide_check failure packets with rules or OpenAI."
+        description="Explain guide_check failure packets into canonical failure_hints.json artifacts."
     )
     parser.add_argument("input", help="Input failure packet JSONL file.")
     parser.add_argument(
         "-o",
         "--output",
-        default="failure_explained.json",
+        default="failure_hints.json",
         help="Output JSON file.",
     )
     parser.add_argument(
-        "--use-openai",
+        "--rule",
         action="store_true",
-        help="Use the OpenAI-compatible API to explain packets.",
-    )
-    parser.add_argument(
-        "--use-gemini",
-        action="store_true",
-        help="Use the Gemini API to explain packets.",
-    )
-    parser.add_argument(
-        "--use-qwen",
-        action="store_true",
-        help="Use the Qwen API to explain packets.",
-    )
-    parser.add_argument(
-        "--online",
-        action="store_true",
-        help="Use the default online provider (Qwen).",
+        help="Use rule-only mode without the online OpenAI-compatible API.",
     )
     parser.add_argument(
         "--model",
@@ -82,187 +163,120 @@ def load_packets(path: str) -> list[dict[str, Any]]:
     return packets
 
 
-def summarize_packet(packet: dict[str, Any]) -> str:
-    teacher_class = packet.get("teacher_class", "unknown_failure")
+def packet_id(packet: dict[str, Any]) -> str:
+    if packet.get("packet_id"):
+        return str(packet["packet_id"])
+    joined = json.dumps(packet, sort_keys=True, ensure_ascii=True)
+    return "fp_" + hashlib.sha256(joined.encode("utf-8")).hexdigest()[:16]
+
+
+def pair_id(packet: dict[str, Any]) -> str:
+    return str(packet.get("pair_id", "unknown_pair"))
+
+
+def teacher_from_packet(packet: dict[str, Any]) -> dict[str, Any]:
+    teacher = packet.get("teacher")
+    if isinstance(teacher, dict):
+        cls = str(teacher.get("class", packet.get("teacher_class", "unknown")))
+        matched_clues = [str(x) for x in teacher.get("matched_clues", packet.get("clues", []))]
+        raw_steps = teacher.get("allowed_step_ids", packet.get("next_steps", []))
+    else:
+        cls = str(packet.get("teacher_class", "unknown"))
+        matched_clues = [str(x) for x in packet.get("clues", [])]
+        raw_steps = packet.get("next_steps", [])
+
+    allowed_step_ids: list[str] = []
+    for step in raw_steps:
+        step_id = normalize_step_id(step)
+        if step_id and step_id not in allowed_step_ids:
+            allowed_step_ids.append(step_id)
+
+    if not allowed_step_ids:
+        allowed_step_ids = ["inspect_command_log", "replay_failing_action"]
+
+    return {
+        "class": cls or "unknown",
+        "matched_clues": matched_clues,
+        "allowed_step_ids": allowed_step_ids,
+    }
+
+
+def normalize_step_id(step: Any) -> str:
+    if not isinstance(step, str):
+        return ""
+    if step in STEP_REASON:
+        return step
+    return LEGACY_STEP_IDS.get(step.lower(), "")
+
+
+def summarize_packet(packet: dict[str, Any], teacher: dict[str, Any]) -> str:
+    teacher_class = teacher["class"]
     action = packet.get("action", "unknown_action")
     stage = packet.get("stage", "UNKNOWN")
-    pair_id = packet.get("pair_id", "unknown_pair")
-    clues = packet.get("clues", [])
+    pid = pair_id(packet)
     proof_outcome = packet.get("proof_outcome", "unknown")
+    clues = packet.get("clues", [])
 
     if teacher_class == "abc_miter_failed":
-        return f"{stage} failed for {pair_id} while running {action}; ABC could not build a usable miter."
-    if teacher_class == "not_equivalent_after_structural_hashing":
-        return f"{stage} reported non-equivalence for {pair_id} during structural hashing while running {action}."
-    if teacher_class == "not_equivalent_after_sat":
-        return f"{stage} reported non-equivalence for {pair_id} after SAT while running {action}."
-    if teacher_class == "not_equivalent_after_fraiging":
-        return f"{stage} reported non-equivalence for {pair_id} after fraiging while running {action}."
-    if teacher_class == "not_equivalent_after_partitioning":
-        return f"{stage} reported non-equivalence for {pair_id} after partitioning while running {action}."
-    if teacher_class == "not_equivalent_after_framing":
-        return f"{stage} reported non-equivalence for {pair_id} after framing while running {action}."
-    if teacher_class == "not_equivalent_after_simulation":
-        return f"{stage} reported non-equivalence for {pair_id} after simulation while running {action}."
-    if teacher_class == "retime_or_warmup_issue":
-        return f"{stage} failed for {pair_id} while running {action}; the packet looks consistent with a retime or warmup issue."
-    if teacher_class == "multiplier_annotation_or_sca_issue":
-        return f"{stage} failed for {pair_id} while running {action}; the multiplier-specific flow rejected the candidate module."
-    if teacher_class == "not_equivalent_counterexample":
-        return f"{stage} reported a non-equivalence result for {pair_id} while running {action}."
-    if proof_outcome == "tool_error":
-        return f"{stage} hit a tool-side execution error for {pair_id} while running {action}."
+        return f"{stage} blocked on {pid} while running {action}; ABC could not build a usable miter."
+    if teacher_class == "abc_not_equivalent_struct_hash":
+        return f"{stage} reported a mismatch for {pid} during structural hashing while running {action}."
+    if teacher_class == "abc_not_equivalent_sat":
+        return f"{stage} reported a mismatch for {pid} after SAT while running {action}."
+    if teacher_class == "abc_not_equivalent_generic":
+        return f"{stage} reported a mismatch for {pid} while running {action}; replay the failing pair before changing heuristics."
+    if teacher_class == "bmc_weak_failed":
+        return f"{stage} blocked for {pid} while running {action}; weak-mode induction did not close."
+    if teacher_class == "bmc_bmc_phase_failed":
+        return f"{stage} blocked for {pid} while running {action}; the bounded phase did not close cleanly."
+    if teacher_class == "bmc_induct_phase_failed":
+        return f"{stage} blocked for {pid} while running {action}; the induction phase failed."
+    if teacher_class == "amulet_verify_failed":
+        return f"{stage} blocked for {pid} while running {action}; the multiplier-specific verification path rejected the candidate."
+    if teacher_class == "tool_exit_nonzero":
+        return f"{stage} hit a tool-side execution error for {pid} while running {action}."
+    if teacher_class == "missing_log_or_parse_error":
+        return f"{stage} failed for {pid} while running {action}; the packet is missing enough log context for a clean classification."
     if proof_outcome == "timeout":
-        return f"{stage} timed out for {pair_id} while running {action}."
+        return f"{stage} timed out for {pid} while running {action}."
     if clues:
-        return f"{stage} failed for {pair_id} while running {action}; primary clue: {clues[0]}."
-    return f"{stage} failed for {pair_id} while running {action}; inspect the command log for the root cause."
+        return f"{stage} failed for {pid} while running {action}; primary clue: {clues[0]}."
+    return f"{stage} failed for {pid} while running {action}; inspect the captured log before changing the proof path."
 
 
-def rule_explanation(packet: dict[str, Any]) -> dict[str, Any]:
-    teacher_class = packet.get("teacher_class", "unknown_failure")
-    likely_causes = {
-        "abc_miter_failed": [
-            "miter construction failed before proof completed",
-            "signal name mapping may be too sparse or misleading",
-            "the current action ordering may not fit this module pair",
-        ],
-        "not_equivalent_after_structural_hashing": [
-            "a mismatch is visible before deeper proof engines are needed",
-            "boundary naming or trivial signal alignment may already differ",
-            "the pair may have a real shallow combinational mismatch",
-        ],
-        "not_equivalent_after_sat": [
-            "SAT found a concrete counterexample after hashing did not settle the pair",
-            "the pair likely differs semantically, not just syntactically",
-            "the mismatch may be concentrated in a small cone of logic",
-        ],
-        "not_equivalent_after_fraiging": [
-            "fraiging exposed a semantic mismatch after structural simplification",
-            "the difference may be sensitive to internal rewriting choices",
-            "the pair may need cone-level inspection rather than name-based triage",
-        ],
-        "not_equivalent_after_partitioning": [
-            "partition-local reasoning found a real mismatch",
-            "a partition boundary may be exposing an actual functional delta",
-            "the failing partition should be inspected before changing shell heuristics",
-        ],
-        "not_equivalent_after_framing": [
-            "sequential framing exposed a real mismatch",
-            "reset or init handling may be involved in the failing trace",
-            "the mismatch may depend on time-step alignment",
-        ],
-        "not_equivalent_after_simulation": [
-            "simulation found an early counterexample before deeper proof completed",
-            "the mismatch may be easy to reproduce from a short trace",
-            "waveform-style triage is likely useful here",
-        ],
-        "retime_or_warmup_issue": [
-            "sequential proof depth may be too small",
-            "warmup or retime handling may be mismatched",
-            "retimed structure may need a different proof order",
-        ],
-        "multiplier_annotation_or_sca_issue": [
-            "multiplier annotation may not match the extracted logic",
-            "signedness or width assumptions may be wrong",
-            "blackboxing or multiplier preprocessing may have changed module shape",
-        ],
-        "not_equivalent_counterexample": [
-            "the engines reported a concrete non-equivalence condition",
-            "matching may have aligned the wrong signals",
-            "an upstream transform may have changed behavior",
-        ],
-        "unknown_failure": [
-            "the proof flow failed without a recognized clue",
-            "the tool log needs manual inspection",
-        ],
-    }
-    confidence = {
-        "abc_miter_failed": "medium",
-        "not_equivalent_after_structural_hashing": "high",
-        "not_equivalent_after_sat": "high",
-        "not_equivalent_after_fraiging": "high",
-        "not_equivalent_after_partitioning": "high",
-        "not_equivalent_after_framing": "high",
-        "not_equivalent_after_simulation": "high",
-        "retime_or_warmup_issue": "medium",
-        "multiplier_annotation_or_sca_issue": "high",
-        "not_equivalent_counterexample": "medium",
-        "unknown_failure": "low",
-    }
-    failure_kind = {
-        "abc_miter_failed": "proof_path_blocked",
-        "not_equivalent_after_structural_hashing": "not_equivalent",
-        "not_equivalent_after_sat": "not_equivalent",
-        "not_equivalent_after_fraiging": "not_equivalent",
-        "not_equivalent_after_partitioning": "not_equivalent",
-        "not_equivalent_after_framing": "not_equivalent",
-        "not_equivalent_after_simulation": "not_equivalent",
-        "retime_or_warmup_issue": "sequential_proof_blocked",
-        "multiplier_annotation_or_sca_issue": "multiplier_verification_blocked",
-        "not_equivalent_counterexample": "possible_real_mismatch",
-        "unknown_failure": "unknown_failure",
-    }
-    return {
-        "mode": "rule",
-        "failure_kind": failure_kind.get(teacher_class, "unknown_failure"),
-        "confidence": confidence.get(teacher_class, "low"),
-        "hint_summary": summarize_packet(packet),
-        "likely_causes": likely_causes.get(teacher_class, likely_causes["unknown_failure"]),
-        "next_steps": packet.get(
-            "next_steps",
-            ["inspect command log", "replay failing action manually"],
-        ),
-    }
+def default_step_objs(step_ids: list[str]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for idx, step_id in enumerate(step_ids, start=1):
+        out.append(
+            {
+                "id": step_id,
+                "rank": idx,
+                "reason": STEP_REASON.get(step_id, "Inspect the captured failure context before changing the proof path."),
+            }
+        )
+    return out
 
 
-def openai_api_key() -> str:
-    return env_first("EQGUIDE_OPENAI_API_KEY", "OPENAI_API_KEY", "OPENAI_AI_KEY")
-
-
-def openai_base_url() -> str:
-    return env_first("EQGUIDE_OPENAI_BASE_URL", "OPENAI_BASE_URL", default="https://api.openai.com/v1")
-
-
-def gemini_api_key() -> str:
-    return env_first("EQGUIDE_GEMINI_API_KEY", "GEMINI_API_KEY")
-
-
-def gemini_base_url() -> str:
-    return env_first("EQGUIDE_GEMINI_BASE_URL", default="https://generativelanguage.googleapis.com/v1beta")
-
-
-def qwen_api_key() -> str:
-    return env_first("EQGUIDE_QWEN_API_KEY", "DASHSCOPE_API_KEY")
-
-
-def build_llm_prompt(packet: dict[str, Any]) -> str:
-    packet_json = json.dumps(packet, indent=2, sort_keys=True)
+def build_llm_prompt(packet: dict[str, Any], teacher: dict[str, Any]) -> str:
+    prompt_packet = dict(packet)
+    prompt_packet["packet_id"] = packet_id(packet)
+    prompt_packet["teacher"] = teacher
+    packet_json = json.dumps(prompt_packet, indent=2, sort_keys=True)
+    allowed_steps = ", ".join(teacher["allowed_step_ids"])
     return (
         "Generate equivalence-check debugging hints from this guide_check failure packet.\n"
         "Use only the packet contents.\n"
         "Do not decide whether the designs are equivalent.\n"
-        "Focus on why the equivalence-check did not complete cleanly and what to inspect next.\n"
-        "Do not claim structural or functional non-equivalence unless the packet explicitly states it.\n"
-        "Produce a concise hint summary, likely causes, and ranked next steps.\n\n"
+        "The teacher class is authoritative.\n"
+        "You may only choose next-step ids from this allowed set:\n"
+        f"{allowed_steps}\n"
+        "Return strict JSON only with these keys:\n"
+        "failure_kind, confidence, hint_summary, likely_causes, next_steps.\n"
+        "Set failure_kind to the authoritative teacher class.\n"
+        "Set next_steps to a ranked list of objects with keys id and reason.\n"
+        "Do not invent new step ids.\n\n"
         f"{packet_json}"
     )
-
-
-def extract_response_text(response: object) -> str:
-    output_text = getattr(response, "output_text", None)
-    if isinstance(output_text, str) and output_text:
-        return output_text
-
-    output = getattr(response, "output", None) or []
-    for item in output:
-        content = getattr(item, "content", None) or []
-        for entry in content:
-            text = getattr(entry, "text", None)
-            if isinstance(text, str) and text:
-                return text
-
-    raise RuntimeError("OpenAI response did not contain text output.")
 
 
 def extract_chat_text(completion: object) -> str:
@@ -284,12 +298,6 @@ def extract_chat_text(completion: object) -> str:
     if parts:
         return "\n".join(parts)
     finish_reason = getattr(choices[0], "finish_reason", None)
-    reasoning_content = getattr(message, "reasoning_content", None)
-    if isinstance(reasoning_content, str) and reasoning_content:
-        raise RuntimeError(
-            "Provider returned empty completion content; "
-            f"finish_reason={finish_reason}, reasoning_content_present=yes"
-        )
     raise RuntimeError(
         "OpenAI chat response did not contain text content; "
         f"finish_reason={finish_reason}"
@@ -310,201 +318,178 @@ def parse_llm_json(text: str) -> dict[str, Any]:
     return json.loads(text)
 
 
-def gemini_explanation(packet: dict[str, Any], model: str) -> dict[str, Any]:
-    api_key = gemini_api_key()
-    if not api_key:
-        raise RuntimeError("EQGUIDE_GEMINI_API_KEY or GEMINI_API_KEY is not set.")
+def validate_next_steps(raw_steps: Any, teacher: dict[str, Any]) -> list[dict[str, Any]]:
+    allowed = teacher["allowed_step_ids"]
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
 
-    payload = {
-        "contents": [
-            {
-                "role": "user",
-                "parts": [
-                    {
-                        "text": (
-                            "Return strict JSON only.\n"
-                            "Use exactly these keys: failure_kind, confidence, hint_summary, likely_causes, next_steps.\n"
-                            "Do not wrap the JSON in markdown fences.\n\n"
-                            + build_llm_prompt(packet)
-                        )
-                    }
-                ],
-            }
-        ],
-        "generationConfig": {
-            "responseMimeType": "application/json",
-            "temperature": 0.1,
-        },
-    }
+    if isinstance(raw_steps, list):
+        for item in raw_steps:
+            if isinstance(item, dict):
+                step_id = normalize_step_id(item.get("id"))
+                reason = str(item.get("reason", "")).strip()
+            else:
+                step_id = normalize_step_id(item)
+                reason = ""
+            if not step_id or step_id not in allowed or step_id in seen:
+                continue
+            seen.add(step_id)
+            out.append(
+                {
+                    "id": step_id,
+                    "rank": len(out) + 1,
+                    "reason": reason or STEP_REASON.get(step_id, "Inspect the failure context before changing the proof path."),
+                }
+            )
 
-    url = f"{gemini_base_url().rstrip('/')}/models/{model}:generateContent"
-    request = urllib.request.Request(
-        url,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={
-            "Content-Type": "application/json",
-            "x-goog-api-key": api_key,
-        },
-        method="POST",
-    )
+    if out:
+        return out
+    return default_step_objs(allowed)
 
-    try:
-        with urllib.request.urlopen(request, timeout=60) as response:
-            response_json = json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"Gemini HTTP {exc.code}: {body}") from exc
 
-    candidates = response_json.get("candidates", [])
-    if not candidates:
-        raise RuntimeError("Gemini response did not contain candidates.")
-    parts = candidates[0].get("content", {}).get("parts", [])
-    text = "\n".join(part.get("text", "") for part in parts if part.get("text"))
-    if not text:
-        raise RuntimeError("Gemini response did not contain text content.")
+def normalize_explanation(parsed: dict[str, Any], packet: dict[str, Any], teacher: dict[str, Any], kind: str) -> dict[str, Any]:
+    teacher_class = teacher["class"]
+    confidence = str(parsed.get("confidence", CONFIDENCE.get(teacher_class, "low"))).lower()
+    if confidence not in {"low", "medium", "high"}:
+        confidence = CONFIDENCE.get(teacher_class, "low")
 
-    parsed = parse_llm_json(text)
+    likely_causes = parsed.get("likely_causes", LIKELY_CAUSES.get(teacher_class, LIKELY_CAUSES["unknown"]))
+    if not isinstance(likely_causes, list) or not likely_causes:
+        likely_causes = LIKELY_CAUSES.get(teacher_class, LIKELY_CAUSES["unknown"])
+    likely_causes = [str(x) for x in likely_causes]
+
+    summary = str(parsed.get("hint_summary", "")).strip() or summarize_packet(packet, teacher)
+    next_steps = validate_next_steps(parsed.get("next_steps"), teacher)
+
     return {
-        "mode": "gemini",
-        "failure_kind": parsed["failure_kind"],
-        "confidence": parsed["confidence"],
-        "hint_summary": parsed["hint_summary"],
-        "likely_causes": parsed["likely_causes"],
-        "next_steps": parsed["next_steps"],
+        "provider_kind": kind,
+        "failure_kind": teacher_class,
+        "confidence": confidence,
+        "hint_summary": summary,
+        "likely_causes": likely_causes,
+        "next_steps": next_steps,
     }
 
 
-def qwen_explanation(packet: dict[str, Any], model: str) -> dict[str, Any]:
-    api_key = qwen_api_key()
-    if not api_key:
-        raise RuntimeError("EQGUIDE_QWEN_API_KEY or DASHSCOPE_API_KEY is not set.")
-
-    dashscope.api_key = api_key
-    prompt = build_llm_prompt(packet)
-    system_prompt = (
-        "Return strict JSON with this shape only: "
-        '{"failure_kind":"<string>","confidence":"<string>","hint_summary":"<string>",'
-        '"likely_causes":["<string>"],"next_steps":["<string>"]}.'
-    )
-    response = Generation.call(
-        model=model,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": prompt},
-        ],
-        result_format="message",
-    )
-    if getattr(response, "status_code", None) != 200:
-        raise RuntimeError(
-            "Qwen request failed: "
-            f"status={getattr(response, 'status_code', None)} "
-            f"code={getattr(response, 'code', None)} "
-            f"message={getattr(response, 'message', None)}"
-        )
-
-    content = response.output.choices[0]["message"]["content"]
-    parsed = parse_llm_json(content)
+def rule_explanation(packet: dict[str, Any], teacher: dict[str, Any]) -> dict[str, Any]:
+    teacher_class = teacher["class"]
     return {
-        "mode": "qwen",
-        "failure_kind": parsed["failure_kind"],
-        "confidence": parsed["confidence"],
-        "hint_summary": parsed["hint_summary"],
-        "likely_causes": parsed["likely_causes"],
-        "next_steps": parsed["next_steps"],
+        "provider_kind": "rule",
+        "failure_kind": teacher_class,
+        "confidence": CONFIDENCE.get(teacher_class, "low"),
+        "hint_summary": summarize_packet(packet, teacher),
+        "likely_causes": LIKELY_CAUSES.get(teacher_class, LIKELY_CAUSES["unknown"]),
+        "next_steps": default_step_objs(teacher["allowed_step_ids"]),
     }
 
 
-def openai_explanation(packet: dict[str, Any], model: str) -> dict[str, Any]:
+def openai_api_key() -> str:
+    return os.environ.get("EQGUIDE_OPENAI_API_KEY", "")
+
+
+def openai_base_url() -> str:
+    return os.environ.get("EQGUIDE_OPENAI_BASE_URL", "https://api.openai.com/v1")
+
+
+def openai_explanation(
+    packet: dict[str, Any],
+    teacher: dict[str, Any],
+    model: str,
+) -> dict[str, Any]:
     api_key = openai_api_key()
-    if not api_key:
-        raise RuntimeError("EQGUIDE_OPENAI_API_KEY, OPENAI_API_KEY, or OPENAI_AI_KEY is not set.")
     base_url = openai_base_url()
+    if not api_key:
+        raise RuntimeError("OpenAI-compatible API key is not set.")
 
     client = OpenAI(api_key=api_key, base_url=base_url, timeout=60.0)
-    prompt = build_llm_prompt(packet)
-    format_instruction = (
-        "Return strict JSON with this shape only: "
-        '{"failure_kind":"<string>","confidence":"<string>","hint_summary":"<string>",'
-        '"likely_causes":["<string>"],"next_steps":["<string>"]}.'
-    )
     completion = client.chat.completions.create(
         model=model,
         messages=[
-            {"role": "system", "content": format_instruction},
-            {"role": "user", "content": prompt},
+            {
+                "role": "system",
+                "content": (
+                    "Return strict JSON only. "
+                    "Use the authoritative teacher class and only the allowed step ids."
+                ),
+            },
+            {"role": "user", "content": build_llm_prompt(packet, teacher)},
         ],
     )
-    response_text = extract_chat_text(completion)
+    parsed = parse_llm_json(extract_chat_text(completion))
+    return normalize_explanation(parsed, packet, teacher, "openai")
 
-    parsed = parse_llm_json(response_text)
-    return {
-        "mode": "openai",
-        "failure_kind": parsed["failure_kind"],
-        "confidence": parsed["confidence"],
-        "hint_summary": parsed["hint_summary"],
-        "likely_causes": parsed["likely_causes"],
-        "next_steps": parsed["next_steps"],
+
+def explain_packet(
+    packet: dict[str, Any],
+    use_rule: bool,
+    model: str,
+) -> dict[str, Any]:
+    teacher = teacher_from_packet(packet)
+    explanation = rule_explanation(packet, teacher)
+    provider_error = ""
+
+    try:
+        if not use_rule:
+            explanation = openai_explanation(packet, teacher, model)
+    except Exception as exc:
+        provider_error = str(exc)
+
+    item = {
+        "packet_id": packet_id(packet),
+        "pair_id": pair_id(packet),
+        "scope": str(packet.get("scope", "pair")),
+        "engine": str(packet.get("engine", "unknown")),
+        "stage": str(packet.get("stage", "UNKNOWN")),
+        "action": str(packet.get("action", "unknown_action")),
+        "proof_outcome": str(packet.get("proof_outcome", "unknown")),
+        "failure_kind": explanation["failure_kind"],
+        "confidence": explanation["confidence"],
+        "hint_summary": explanation["hint_summary"],
+        "likely_causes": explanation["likely_causes"],
+        "next_steps": explanation["next_steps"],
+        "teacher": teacher,
     }
+    if provider_error:
+        item["provider_error"] = provider_error
+    return item
 
 
-def explain_packet(packet: dict[str, Any], use_openai: bool, use_gemini: bool, use_qwen: bool, model: str) -> dict[str, Any]:
-    explanation = rule_explanation(packet)
-    if use_qwen:
-        try:
-            explanation = qwen_explanation(packet, model)
-        except Exception as exc:
-            explanation["mode"] = "rule_with_qwen_error"
-            explanation["llm_error"] = str(exc)
-    elif use_gemini:
-        try:
-            explanation = gemini_explanation(packet, model)
-        except Exception as exc:
-            explanation["mode"] = "rule_with_gemini_error"
-            explanation["llm_error"] = str(exc)
-    elif use_openai:
-        try:
-            explanation = openai_explanation(packet, model)
-        except Exception as exc:
-            explanation["mode"] = "rule_with_openai_error"
-            explanation["llm_error"] = str(exc)
+def provider_kind(args: argparse.Namespace) -> str:
+    return "rule" if args.rule else "openai"
 
-    return {
-        "packet": packet,
-        "explanation": explanation,
-    }
+
+def provider_model(args: argparse.Namespace) -> str | None:
+    if args.rule:
+        return None
+    if args.model:
+        return args.model
+    return os.environ.get("EQGUIDE_OPENAI_MODEL", DEFAULT_OPENAI_MODEL)
 
 
 def main() -> int:
     args = parse_args()
-    if args.online:
-        args.use_qwen = True
-
-    if sum([1 if args.use_openai else 0, 1 if args.use_gemini else 0, 1 if args.use_qwen else 0]) > 1:
-        raise SystemExit("Use only one of --use-openai, --use-gemini, --use-qwen, or --online.")
-
-    model = args.model
-    if not model:
-        if args.use_qwen:
-            model = env_first("EQGUIDE_QWEN_MODEL", default=DEFAULT_QWEN_MODEL)
-        elif args.use_gemini:
-            model = env_first("EQGUIDE_GEMINI_MODEL", default=DEFAULT_GEMINI_MODEL)
-        elif args.use_openai:
-            model = env_first("EQGUIDE_OPENAI_MODEL", "OPENAI_MODEL", default=DEFAULT_MODEL)
-
+    model = provider_model(args)
     packets = load_packets(args.input)
     if args.max_packets > 0:
         packets = packets[: args.max_packets]
 
-    explained = [
-        explain_packet(packet, args.use_openai, args.use_gemini, args.use_qwen, model)
+    items = [
+        explain_packet(
+            packet,
+            args.rule,
+            model or "",
+        )
         for packet in packets
     ]
 
     output = {
-        "input": args.input,
-        "mode": "qwen" if args.use_qwen else ("gemini" if args.use_gemini else ("openai" if args.use_openai else "rule")),
-        "model": model if (args.use_openai or args.use_gemini or args.use_qwen) else None,
-        "items": explained,
+        "schema_version": SCHEMA_VERSION,
+        "source_fail_jsonl": os.path.abspath(args.input),
+        "provider": {
+            "kind": provider_kind(args),
+            "model": model,
+        },
+        "items": items,
     }
 
     with open(args.output, "w", encoding="utf-8") as handle:
