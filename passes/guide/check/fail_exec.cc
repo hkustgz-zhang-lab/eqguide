@@ -317,11 +317,19 @@ FailureTeacher failure_teacher(const CommandResult &result, const std::vector<st
         if (clue == "Networks are NOT EQUIVALENT after SAT")
             return {"abc_not_equivalent_sat", {clue},
                     {"inspect_counterexample", "inspect_upstream_transforms", "replay_failing_action"}};
-        if (clue == "Networks are NOT EQUIVALENT after fraiging" ||
-            clue == "Networks are NOT EQUIVALENT after partitioning" ||
-            clue == "Networks are NOT EQUIVALENT after framing" ||
-            clue == "Networks are NOT EQUIVALENT after simulation" ||
-            clue == "Networks are NOT EQUIVALENT. Output" ||
+        if (clue == "Networks are NOT EQUIVALENT after fraiging")
+            return {"abc_not_equivalent_fraiging", {clue},
+                    {"inspect_counterexample", "inspect_upstream_transforms", "replay_failing_action"}};
+        if (clue == "Networks are NOT EQUIVALENT after partitioning")
+            return {"abc_not_equivalent_partitioning", {clue},
+                    {"inspect_partition_boundary", "inspect_counterexample", "replay_failing_action"}};
+        if (clue == "Networks are NOT EQUIVALENT after framing")
+            return {"abc_not_equivalent_framing", {clue},
+                    {"inspect_counterexample", "inspect_retime_pair", "replay_failing_action"}};
+        if (clue == "Networks are NOT EQUIVALENT after simulation")
+            return {"abc_not_equivalent_simulation", {clue},
+                    {"inspect_counterexample", "inspect_upstream_transforms", "replay_failing_action"}};
+        if (clue == "Networks are NOT EQUIVALENT. Output" ||
             clue == "Networks are NOT EQUIVALENT")
             return {"abc_not_equivalent_generic", {clue},
                     {"inspect_counterexample", "inspect_upstream_transforms", "replay_failing_action"}};
@@ -564,6 +572,10 @@ static dict<string, string> HINT_CONFIDENCE = {
     {"abc_miter_failed", "medium"},
     {"abc_not_equivalent_struct_hash", "high"},
     {"abc_not_equivalent_sat", "high"},
+    {"abc_not_equivalent_fraiging", "high"},
+    {"abc_not_equivalent_partitioning", "medium"},
+    {"abc_not_equivalent_framing", "high"},
+    {"abc_not_equivalent_simulation", "high"},
     {"abc_not_equivalent_generic", "medium"},
     {"bmc_weak_failed", "medium"},
     {"bmc_bmc_phase_failed", "medium"},
@@ -589,6 +601,26 @@ static dict<string, std::vector<string>> HINT_LIKELY_CAUSES = {
         "SAT found a concrete mismatch after structural hashing did not settle the pair",
         "the mismatch is likely semantic rather than purely syntactic",
         "the failing cone is often small enough to inspect directly",
+    }},
+    {"abc_not_equivalent_fraiging", {
+        "fraiging detected a concrete mismatch after structural hashing did not settle the pair",
+        "the mismatch likely comes from a functional difference in the mapped pair",
+        "the fraiging-sensitive cone should be inspected before changing matching",
+    }},
+    {"abc_not_equivalent_partitioning", {
+        "partition-level proof detected a concrete mismatch",
+        "the partition boundary assumptions may not hold for this pair",
+        "inspect the partition cutpoints and boundary naming before changing policy",
+    }},
+    {"abc_not_equivalent_framing", {
+        "sequential framing detected a concrete mismatch",
+        "retimed or framed structure may be misaligned on this pair",
+        "inspect retimed alignment and sequential framing before changing proof path",
+    }},
+    {"abc_not_equivalent_simulation", {
+        "simulation found a counterexample on this pair",
+        "the mismatch is concrete and reproducible",
+        "the counterexample-bearing signals should be replayed before changing policy",
     }},
     {"abc_not_equivalent_generic", {
         "the proof engines found a concrete mismatch on this pair",
@@ -675,6 +707,14 @@ static string hint_summarize(const Json &packet)
         return stringf("%s reported a mismatch for %s during structural hashing while running %s.", stage.c_str(), pid.c_str(), action.c_str());
     if (tc == "abc_not_equivalent_sat")
         return stringf("%s reported a mismatch for %s after SAT while running %s.", stage.c_str(), pid.c_str(), action.c_str());
+    if (tc == "abc_not_equivalent_fraiging")
+        return stringf("%s reported a mismatch for %s after fraiging while running %s.", stage.c_str(), pid.c_str(), action.c_str());
+    if (tc == "abc_not_equivalent_partitioning")
+        return stringf("%s reported a mismatch for %s after partitioning while running %s.", stage.c_str(), pid.c_str(), action.c_str());
+    if (tc == "abc_not_equivalent_framing")
+        return stringf("%s reported a mismatch for %s after framing while running %s.", stage.c_str(), pid.c_str(), action.c_str());
+    if (tc == "abc_not_equivalent_simulation")
+        return stringf("%s reported a mismatch for %s after simulation while running %s.", stage.c_str(), pid.c_str(), action.c_str());
     if (tc == "abc_not_equivalent_generic")
         return stringf("%s reported a mismatch for %s while running %s; replay the failing pair before changing heuristics.", stage.c_str(), pid.c_str(), action.c_str());
     if (tc == "bmc_weak_failed")
