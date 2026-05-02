@@ -3,6 +3,7 @@
 
 #include "passes/guide/check/shared.h"
 #include "passes/guide/check/check.h"
+#include "passes/guide/check/scheduler.h"
 
 YOSYS_NAMESPACE_BEGIN
 namespace guide_check {

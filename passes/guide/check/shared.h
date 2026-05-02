@@ -96,50 +96,6 @@ struct RunRecord
 	string log_file;
 };
 
-struct GuideSchedLinearAction
-{
-	double bias = 0;
-	dict<string, double> weights;
-};
-
-struct GuideSchedTreeNode
-{
-	int feature_index = -1;
-	double threshold = 0;
-	int left = -1;
-	int right = -1;
-	double value = 0;
-	bool is_leaf = false;
-};
-
-struct GuideSchedTree
-{
-	std::vector<GuideSchedTreeNode> nodes;
-};
-
-struct GuideMatchModel
-{
-	bool loaded = false;
-	string path;
-	string model_type;
-	std::vector<string> feature_names;
-	double base_score = 0;
-	double learning_rate = 1.0;
-	std::vector<GuideSchedTree> trees;
-};
-
-struct GuideSchedModel
-{
-	bool loaded = false;
-	string path;
-	string model_type;
-	std::vector<string> feature_names;
-	double base_score = 0;
-	double learning_rate = 1.0;
-	dict<string, GuideSchedLinearAction> linear_actions;
-	std::vector<GuideSchedTree> trees;
-};
-
 struct CommandResult
 {
 	int exit_status = -1;
@@ -173,6 +129,9 @@ struct GuideTelemetry
 	pool<RTLIL::IdString> multiplier_mods;
 	Json::array match_suggestions;
 };
+
+struct GuideSchedModel;
+struct GuideMatchModel;
 
 struct CheckConfig
 {
