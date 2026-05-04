@@ -457,6 +457,7 @@ void emit_failure_packet(const MlDumpConfig &dump_cfg, const string &pair_id, co
                                 const string &action, const string &gold_mod, const string &gate_mod,
                                 const CommandResult &command_result)
 {
+    auto t_start = std::chrono::steady_clock::now();
     if (!dump_cfg.dump_fail || dump_cfg.fail_jsonl.empty())
         return;
 
@@ -508,6 +509,8 @@ void emit_failure_packet(const MlDumpConfig &dump_cfg, const string &pair_id, co
             {"allowed_step_ids", string_array_to_json(teacher.step_ids)}
         }}
     });
+    timing_stat.fail_emit_ms += std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - t_start).count();
 }
 int exectue_and_check(const std::string & cmd, bool & correct,
                       const std::string & target_output,
@@ -804,6 +807,7 @@ Json failure_hint_from_packet(const Json &packet)
 
 void write_failure_hints(const string &fail_jsonl, const string &hints_jsonl)
 {
+    auto t_start = std::chrono::steady_clock::now();
     if (fail_jsonl.empty() || hints_jsonl.empty())
         return;
 
@@ -844,6 +848,8 @@ void write_failure_hints(const string &fail_jsonl, const string &hints_jsonl)
         log_error("Cannot open %s for writing.\n", hints_jsonl.c_str());
     fprintf(fout, "%s\n", output.dump().c_str());
     fclose(fout);
+    timing_stat.hint_gen_ms += std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - t_start).count();
 }
 
 } // namespace guide_check

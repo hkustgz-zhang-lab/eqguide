@@ -943,7 +943,10 @@ struct GuideCheckPass : public Pass {
 
         
 
+        auto t_match_start = std::chrono::steady_clock::now();
         auto gold2cutpoints = match_signals(design, conf, mod_map, true, "post_async");
+        timing_stat.match_ms += std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t_match_start).count();
         if (local_vali_shadow)
             run_local_vali_shadow(conf, mod_map, gold2cutpoints);
         int total_applied_sugs = 0;

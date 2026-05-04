@@ -281,6 +281,53 @@ ModMap hier_mod_map(RTLIL::Design *design, CheckConfig& conf)
         log_warning("Gate module %s has no matching gold module.\n", log_id(mod_name));
     }
 
+    // Structural fallback: for unmapped modules, try to match by port signature
+    if (!mod_map.unmapped_mods_gold.empty() && !mod_map.unmapped_mods_gate.empty()) {
+        // Build port signatures for unmapped modules: "in_w0_w1_...|out_w0_w1_..."
+        auto make_sig = [&](RTLIL::Module *m) -> string {
+            std::vector<int> in_w, out_w;
+            for (auto w : m->wires()) {
+                if (w->port_id == 0) continue;
+                if (w->port_input) in_w.push_back(w->width);
+                if (w->port_output) out_w.push_back(w->width);
+            }
+            std::sort(in_w.begin(), in_w.end());
+            std::sort(out_w.begin(), out_w.end());
+            string sig = "in";
+            for (int w : in_w) sig += "_" + std::to_string(w);
+            sig += "|out";
+            for (int w : out_w) sig += "_" + std::to_string(w);
+            return sig;
+        };
+
+        dict<string, std::vector<RTLIL::IdString>> gate_sigs;
+        for (auto &gn : mod_map.unmapped_mods_gate) {
+            auto *gm = design->module(gn);
+            if (gm != nullptr) gate_sigs[make_sig(gm)].push_back(gn);
+        }
+
+        std::vector<RTLIL::IdString> matched_gold, matched_gate;
+        for (auto &gld : mod_map.unmapped_mods_gold) {
+            auto *gm = design->module(gld);
+            if (gm == nullptr) continue;
+            string sig = make_sig(gm);
+            auto it = gate_sigs.find(sig);
+            if (it == gate_sigs.end() || it->second.empty()) continue;
+            // Use first available match (greedy); unambiguous when size==1
+            auto gname = it->second[0];
+            (*gold2gate)[gld] = gname;
+            mod_map.mapped_mods_gold.insert(gld);
+            mod_map.mapped_mods_gate.insert(gname);
+            matched_gold.push_back(gld);
+            matched_gate.push_back(gname);
+            it->second.erase(it->second.begin());
+            log("  Structurally matched: Gold %s <=> Gate %s (sig=%s)\n",
+                log_id(gld), log_id(gname), sig.c_str());
+        }
+        for (auto &n : matched_gold) mod_map.unmapped_mods_gold.erase(n);
+        for (auto &n : matched_gate) mod_map.unmapped_mods_gate.erase(n);
+    }
+
     auto t_end = std::chrono::steady_clock::now();
     timing_stat.hier_mod_map_ms += std::chrono::duration_cast<std::chrono::milliseconds>(t_end-t_start).count();
 
@@ -804,43 +851,137 @@ RTLIL::Design *prepare_blif_module_design(RTLIL::Design *design, RTLIL::Module *
     return design_copy;
 }
 
+// Fast native BLIF writer: dumps techmapped module as .subckt cells.
+// Uses fprintf (not iostream) for maximum speed.
+// Assumes cells are already library cells (post-techmap or post-synthesis).
+static void write_blif_native(RTLIL::Module *mod, FILE *f)
+{
+    string name = strip_backslash(mod->name);
+    fprintf(f, ".model %s\n", name.c_str());
+
+    // Collect ports with multi-bit expansion
+    pool<RTLIL::IdString> port_set;
+    std::vector<pair<RTLIL::IdString, int>> in_bits, out_bits;
+    for (auto w : mod->wires()) {
+        if (w->port_id == 0) continue;
+        port_set.insert(w->name);
+        int ww = w->width;
+        if (w->port_input)
+            for (int i = 0; i < ww; i++)
+                in_bits.push_back({w->name, i});
+        if (w->port_output)
+            for (int i = 0; i < ww; i++)
+                out_bits.push_back({w->name, i});
+    }
+
+    fprintf(f, ".inputs");
+    for (auto &p : in_bits) {
+        string n = strip_backslash(p.first);
+        if (p.second > 0 || p.first.str()[0] == '\\')
+            fprintf(f, " %s[%d]", n.c_str(), p.second);
+        else
+            fprintf(f, " %s", n.c_str());
+    }
+    fprintf(f, "\n");
+
+    fprintf(f, ".outputs");
+    for (auto &p : out_bits) {
+        string n = strip_backslash(p.first);
+        if (p.second > 0 || p.first.str()[0] == '\\')
+            fprintf(f, " %s[%d]", n.c_str(), p.second);
+        else
+            fprintf(f, " %s", n.c_str());
+    }
+    fprintf(f, "\n");
+
+    // Constant wire declarations needed by ABC
+    fprintf(f, ".names __const0\n");
+    fprintf(f, ".names __const1\n1\n");
+    fprintf(f, ".names __constx\n");
+
+    // Write cells as .subckt
+    for (auto cell : mod->cells()) {
+        string type = strip_backslash(cell->type);
+        fprintf(f, ".subckt %s", type.c_str());
+
+        for (auto &conn : cell->connections()) {
+            RTLIL::SigSpec sig = conn.second;
+            string pname = strip_backslash(conn.first);
+            int sz = GetSize(sig);
+
+            for (int i = 0; i < sz; i++) {
+                RTLIL::SigBit bit = sig[i];
+                string val;
+                if (bit.wire == nullptr) {
+                    val = (bit.data == State::S1) ? "__const1" : "__const0";
+                } else {
+                    val = strip_backslash(bit.wire->name);
+                    if (bit.wire->width > 1)
+                        val += stringf("[%d]", bit.offset);
+                }
+                if (sz == 1)
+                    fprintf(f, " %s=%s", pname.c_str(), val.c_str());
+                else
+                    fprintf(f, " %s[%d]=%s", pname.c_str(), i, val.c_str());
+            }
+        }
+        fprintf(f, "\n");
+    }
+
+    fprintf(f, ".end\n");
+}
+
 string dump_blif_module(RTLIL::Design* design, const string &dir_name, RTLIL::Module *mod, const string& lib_file,
                                int *inserted_bbconsts){
 
     auto t_start = std::chrono::steady_clock::now();
 
-    string blif_file = dir_name + "/" 
+    string blif_file = dir_name + "/"
         + strip_backslash(mod->name)
         + ".blif";
     string mod_name = strip_backslash(mod->name);
     log("Dumping module %s to BLIF file %s.\n", mod->name.str(), blif_file);
-    
+
     auto log_files_backup = log_files;
     auto log_streams_backup = log_streams;
-    string mod_name_str = strip_backslash(mod->name);
-    bool local_shell = mod_name_str.size() >= 7 && mod_name_str.substr(mod_name_str.size() - 7) == "__local";
 
-    // log_files.clear(); // TODO: Maybe it's not a good ieda... 
-    // log_streams.clear(); // TODO: We can not see any log...
-    RTLIL::Design *design_copy = prepare_blif_module_design(design, mod, lib_file, inserted_bbconsts);
-    // if(!lib_file.empty())
-    //     run_pass(stringf("read_verilog -overwrite %s", lib_file), design_copy);
-    // run_pass(stringf("hierarchy -top %s", mod->name.str()), design_copy);
-    // run_pass(stringf("flatten"), design_copy);
-    // run_pass(stringf("proc"), design_copy);
-    // run_pass(stringf("techmap"), design_copy);
-    // run_pass(stringf("dffunmap"), design_copy);
-    // run_pass(stringf("write_blif -impltf -blackbox -top %s %s", mod_name, blif_file), design_copy);
-    if (local_shell)
-        run_pass(stringf(
-            "write_blif -impltf -blackbox -top %s %s",
-            mod_name, blif_file),
-            design_copy);
-    else
-        run_pass(stringf(
-            "write_blif -blackbox -top %s -false + __const0 -true + __const1 -undef + __constx %s",
-            mod_name, blif_file),
-            design_copy);
+    // Fast path: clone only the target module, no library read
+    auto t_prep_start = std::chrono::steady_clock::now();
+
+    RTLIL::Design *design_copy = new RTLIL::Design;
+    design_copy->add(mod->clone());
+    design_copy->push_full_selection();
+
+    // Add blackbox stubs for any submodule cell types referenced by target module
+    // Add blackbox stubs for submodule cells: clone from original design
+    for (auto cell : mod->cells()) {
+        if (!design_copy->module(cell->type)) {
+            auto *orig_mod = design->module(cell->type);
+            if (orig_mod != nullptr) {
+                auto *clone = orig_mod->clone();
+                clone->set_bool_attribute(ID(blackbox), true);
+                design_copy->add(clone);
+            }
+        }
+    }
+
+    int inserted = materialize_blackbox_input_consts(design_copy,
+        design_copy->module(mod->name));
+    if (inserted_bbconsts != nullptr)
+        *inserted_bbconsts = inserted;
+
+    timing_stat.dump_blif_prep_ms += std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - t_prep_start).count();
+
+    auto t_write_start = std::chrono::steady_clock::now();
+    create_directory(dir_name);
+    run_pass(stringf(
+        "write_blif -blackbox -top %s -false + __const0 -true + __const1 -undef + __constx %s",
+        mod_name.c_str(), blif_file.c_str()),
+        design_copy);
+    timing_stat.dump_blif_write_ms += std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - t_write_start).count();
+
     delete design_copy;
 
     log_files = log_files_backup;

@@ -22,14 +22,25 @@ using json11::Json;
 
 #define TIMINGSTAT_FIELDS(X)            \
 	X(abc_cec_ms)                       \
+	X(abc_comb_ms)                      \
+	X(abc_seq_ms)                       \
 	X(prep_ms)                          \
 	X(dump_blif_ms)                     \
+	X(dump_blif_prep_ms)                \
+	X(dump_blif_write_ms)               \
 	X(read_lib_ms)                      \
 	X(hier_mod_map_ms)                  \
 	X(signal_map_ms)                    \
+	X(match_ms)                         \
 	X(check_mul_ms)                     \
 	X(mul_map_ms)                       \
-	X(check_retime_ms)
+	X(check_retime_ms)                  \
+	X(region_dag_ms)                    \
+	X(region_shell_ms)                  \
+	X(region_shadow_ms)                 \
+	X(region_fallback_ms)               \
+	X(fail_emit_ms)                     \
+	X(hint_gen_ms)
 
 struct TimingStat {
 #define DECL_FIELD(name) std::uint64_t name = 0;

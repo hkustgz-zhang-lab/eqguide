@@ -2477,6 +2477,7 @@ LocalValidateResult validate_partition_pair(const CheckConfig &conf,
 void run_local_vali_shadow(const CheckConfig &conf, ModMap &mod_map,
                                       const dict<RTLIL::Module*, std::vector<CutPoint>> &gold2cutpoints)
 {
+    auto t_shadow_start = std::chrono::steady_clock::now();
     int ran_pairs = 0;
     int skipped_pairs = 0;
     int passed_pairs = 0;
@@ -2631,6 +2632,8 @@ void run_local_vali_shadow(const CheckConfig &conf, ModMap &mod_map,
 
     log("LOCAL_VALIDATE shadow summary: ran %d pair(s), passed %d, failed %d, skipped %d.\n",
         ran_pairs, passed_pairs, failed_pairs, skipped_pairs);
+    timing_stat.region_shadow_ms += std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - t_shadow_start).count();
 }
 
 bool valid_region_child_module(RTLIL::Design *design, RTLIL::Cell *cell, RTLIL::Module *&child)
@@ -2760,7 +2763,10 @@ Results partition_prove(const CheckConfig &conf, ModMap &mod_map,
 
     log("Running region-driven proving branch.\n");
 
+    auto t_dag_start = std::chrono::steady_clock::now();
     std::vector<RegionNode> nodes = build_region_plan(conf, mod_map, gold2cutpoints);
+    timing_stat.region_dag_ms += std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - t_dag_start).count();
     std::vector<RegionProofResult> proof_results(GetSize(nodes));
 
     for (const auto &node : nodes) {
@@ -2818,8 +2824,11 @@ Results partition_prove(const CheckConfig &conf, ModMap &mod_map,
             }
         }
         if (shell_attempted) {
+            auto t_shell_start = std::chrono::steady_clock::now();
             LocalValidateResult shell_result =
                 validate_partition_pair(conf, node.gold_mod, node.gate_mod, local_cutpoints, true);
+            timing_stat.region_shell_ms += std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - t_shell_start).count();
             bool shadow_blocks_auth =
                 have_shadow &&
                 shadow_summary.cut_cnt >= shell_result.cut_cnt &&
@@ -3004,7 +3013,10 @@ Results partition_prove(const CheckConfig &conf, ModMap &mod_map,
             CheckConfig conf_ = conf;
             conf_.gold_mod = node.gold_mod;
             conf_.gate_mod = node.gate_mod;
+            auto t_fb_start = std::chrono::steady_clock::now();
             bool fallback_ok = abc_cec_module(conf_);
+            timing_stat.region_fallback_ms += std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - t_fb_start).count();
             if (region_result.fb_why.empty())
                 region_result.fb_why = region_result.proved ? "non_authoritative_region" : "shell_failed";
             log("REGION proof for %s falling back to module-pair proof (%s).\n",
