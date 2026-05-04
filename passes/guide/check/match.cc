@@ -438,7 +438,7 @@ MatchResult match_signals_module(RTLIL::Design *design, RTLIL::Module *gold_mod,
                     }
                     return false;
                 };
-                if (try_pair(gname, kname)) continue;
+                try_pair(gname, kname);
                 string gb = gname, kb = kname;
                 size_t gp = gname.rfind('[');
                 if (gp != string::npos) gb = gname.substr(0, gp);
