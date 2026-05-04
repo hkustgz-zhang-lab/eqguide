@@ -118,23 +118,11 @@ struct CommandResult
 	string log_file;
 };
 
-struct ShadowValiSummary
-{
-	bool ran = false;
-	bool proved = false;
-	bool auth_ok = true;
-	int cut_cnt = 0;
-	string vali_backend;
-	string unsafe_why;
-	string fb_why;
-};
 
 struct GuideTelemetry
 {
 	std::map<string, MatchStats> pair_match_stats;
 	std::map<string, PairRecord> pair_records;
-	std::map<string, ShadowValiSummary> shadow_vali;
-	std::map<string, ShadowValiSummary> shadow_vali_sliced;
 	dict<string, int> pair_applied_sugs;
 	pool<RTLIL::IdString> retimed_mods;
 	pool<RTLIL::IdString> multiplier_mods;
@@ -159,7 +147,6 @@ struct CheckConfig
 	string match_model_file;
 	string accept_sugs_file;
 	string external_match_file;
-	bool local_vali_slice = false;
 	SeqCheckConfig seq_check_cfg;
 	MlDumpConfig dump_cfg;
 	GuideSchedModel *sched_model = nullptr;
