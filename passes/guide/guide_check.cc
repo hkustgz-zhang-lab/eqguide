@@ -291,7 +291,6 @@ static std::vector<std::pair<RTLIL::IdString, bool>> abc_cec(const CheckConfig &
         .sched_model_file = conf.sched_model_file,
         .match_model_file = conf.match_model_file,
         .accept_sugs_file = conf.accept_sugs_file,
-        .local_vali_slice = conf.local_vali_slice,
         .seq_check_cfg = conf.seq_check_cfg,
         .dump_cfg = conf.dump_cfg,
         .sched_model = conf.sched_model,
@@ -557,7 +556,6 @@ struct GuideCheckRetimePass : public Pass {
             .sched_model_file = "",
             .match_model_file = "",
             .accept_sugs_file = "",
-            .local_vali_slice = false,
             .seq_check_cfg = SeqCheckConfig{
                 .k_induct = k_induct,
                 .step_skip = step_skip,
@@ -649,11 +647,7 @@ struct GuideCheckPass : public Pass {
         log("    -guide-external-match <file>\n");
         log("        append accepted suggestions from the JSON file into match_file.\n");
         log("\n");
-        log("    -local-validate-shadow\n");
-        log("        shadow-run DFF-only local partition proofs without changing the final result.\n");
         log("\n");
-        log("    -local-validate-support-slice\n");
-        log("        use candidate-centered support slicing for DFF suggestion validation.\n");
         log("\n");
         log("\n");
 	}
@@ -675,8 +669,6 @@ struct GuideCheckPass : public Pass {
         string match_model_file;
         string accept_sugs_file;
         string external_match_file;
-        bool local_vali_shadow = false;
-        bool local_vali_slice = false;
         MlDumpConfig dump_cfg;
         
         size_t argidx;
@@ -746,12 +738,8 @@ struct GuideCheckPass : public Pass {
                 external_match_file = args[++argidx];
                 continue;
             }
-            if (args[argidx] == "-local-validate-shadow") {
-                local_vali_shadow = true;
                 continue;
             }
-            if (args[argidx] == "-local-validate-support-slice") {
-                local_vali_slice = true;
                 continue;
             }
             break;
@@ -854,7 +842,6 @@ struct GuideCheckPass : public Pass {
             .match_model_file = match_model_file,
             .accept_sugs_file = accept_sugs_file,
             .external_match_file = external_match_file,
-            .local_vali_slice = local_vali_slice,
             .seq_check_cfg = seq_conf,
             .dump_cfg = dump_cfg,
             .sched_model = &sched_model,
@@ -947,8 +934,6 @@ struct GuideCheckPass : public Pass {
         auto gold2cutpoints = match_signals(design, conf, mod_map, true, "post_async");
         timing_stat.match_ms += std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - t_match_start).count();
-        if (local_vali_shadow)
-            run_local_vali_shadow(conf, mod_map, gold2cutpoints);
         int total_applied_sugs = 0;
         for (auto &it : telemetry.pair_applied_sugs)
             total_applied_sugs += it.second;
