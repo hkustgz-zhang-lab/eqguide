@@ -738,10 +738,6 @@ struct GuideCheckPass : public Pass {
                 external_match_file = args[++argidx];
                 continue;
             }
-                continue;
-            }
-                continue;
-            }
             break;
         }
 
