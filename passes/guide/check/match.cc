@@ -554,7 +554,7 @@ MatchResult match_signals_module(RTLIL::Design *design, RTLIL::Module *gold_mod,
 
             if (gentry.type == MatchType::DFF || gentry.type == MatchType::DFF_PO) {
                 std::vector<CutPoint> local_cps =
-                    conf.local_vali_slice ?
+                    false ?
                     select_support_sliced_dff_cutpoints(gold_mod, gate_mod, result.cut_points, candidate_cutpoint) :
                     select_local_dff_cutpoints(result.cut_points, &candidate_cutpoint);
                 LocalValidateResult vali =
@@ -625,7 +625,7 @@ MatchResult match_signals_module(RTLIL::Design *design, RTLIL::Module *gold_mod,
                     {"unresolved_internal_boundaries", vali.unr_int_bnd_cnt},
                     {"child_boundary_count", vali.child_bnd_cnt},
                     {"unresolved_child_boundaries", vali.unr_child_bnd_cnt},
-                    {"slice_mode", conf.local_vali_slice ? "support_slice" : "all_dff"}
+                    {"slice_mode", "all_dff"}
                 });
                 if (!vali.proved) {
                     rejected_dff_suggestions++;
