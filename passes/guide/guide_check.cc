@@ -655,8 +655,6 @@ struct GuideCheckPass : public Pass {
         log("    -local-validate-support-slice\n");
         log("        use candidate-centered support slicing for DFF suggestion validation.\n");
         log("\n");
-        log("    -partition-prove\n");
-        log("        use partition-driven proving for module pairs with authoritative DFF cutpoints.\n");
         log("\n");
 	}
 	void execute(std::vector<std::string> args, RTLIL::Design *design) override
@@ -679,7 +677,6 @@ struct GuideCheckPass : public Pass {
         string external_match_file;
         bool local_vali_shadow = false;
         bool local_vali_slice = false;
-        bool part_prove = false;
         MlDumpConfig dump_cfg;
         
         size_t argidx;
@@ -757,8 +754,6 @@ struct GuideCheckPass : public Pass {
                 local_vali_slice = true;
                 continue;
             }
-            if (args[argidx] == "-partition-prove") {
-                part_prove = true;
                 continue;
             }
             break;
@@ -972,9 +967,6 @@ struct GuideCheckPass : public Pass {
         // propagate_child_ports(design_check);
 
         // conf.design = design_check;
-        if (part_prove)
-            cec_result_mod = partition_prove(conf, mod_map, gold2cutpoints);
-        else
             cec_result_mod = abc_cec(conf);
 
         cec_result = true; 
