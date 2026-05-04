@@ -2,6 +2,7 @@
 #include "passes/guide/check/fail_exec.h"
 #include "passes/guide/check/scheduler.h"
 #include "passes/guide/check/region.h"
+#include <sstream>
 
 YOSYS_NAMESPACE_BEGIN
 namespace guide_check {
@@ -383,6 +384,74 @@ MatchResult match_signals_module(RTLIL::Design *design, RTLIL::Module *gold_mod,
 
     result.stats.unmatched_gold = GetSize(gold) - GetSize(matched_gold);
     result.stats.unmatched_gate = GetSize(gate) - GetSize(matched_gate);
+
+    // External verification guidance: user-provided signal map
+    if (!conf.external_match_file.empty()) {
+        FILE *fext = fopen(conf.external_match_file.c_str(), "r");
+        if (fext != nullptr) {
+            char buf[4096];
+            string active_section;
+            while (fgets(buf, sizeof(buf), fext) != nullptr) {
+                string line = buf;
+                while (!line.empty() && (line.back() == '\n' || line.back() == '\r'))
+                    line.pop_back();
+                if (line.empty() || line[0] == '#') continue;
+                // Section header: [gold:gate]
+                if (line[0] == '[' && line.back() == ']') {
+                    active_section = line.substr(1, line.size() - 2);
+                    continue;
+                }
+                // Signal lines: gold_name gate_name [TYPE]
+                std::istringstream iss(line);
+                string gname, kname, tstr;
+                if (!(iss >> gname >> kname)) continue;
+                iss >> tstr;
+                // Section filter
+                if (!active_section.empty()) {
+                    string pid = strip_backslash(gold_mod->name) + ":" + strip_backslash(gate_mod->name);
+                    if (active_section != pid) continue;
+                }
+                // Try literal + auto-expand multi-bit
+                auto try_pair = [&](const string &gn, const string &kn) -> bool {
+                    for (auto &ge : gold) {
+                        if (strip_backslash(ge.first) != gn) continue;
+                        if (matched_gold.count(ge.first)) continue;
+                        for (auto &ke : gate) {
+                            if (strip_backslash(ke.first) != kn) continue;
+                            if (matched_gate.count(ke.first)) continue;
+                            MatchType t = ge.second.type;
+                            if (tstr == "PI") t = MatchType::PI;
+                            else if (tstr == "PO") t = MatchType::PO;
+                            else if (tstr == "DFF") t = MatchType::DFF;
+                            else if (tstr == "DFF_PO") t = MatchType::DFF_PO;
+                            else if (tstr == "SUBCKT_PIPO") t = MatchType::SUBCKT_PIPO;
+                            result.cut_points.push_back(CutPoint{ge.first, ge.second.sig, ke.second.sig, t,
+                                nullptr, nullptr, ge.second.wire_name, ge.second.bit_index,
+                                ke.second.wire_name, ke.second.bit_index});
+                            matched_gold.insert(ge.first);
+                            matched_gate.insert(ke.first);
+                            result.stats.exact_total++;
+                            if (f) write_match_line(f, ge.first, ge.second.sig, ke.second.sig, t);
+                            if (f_exact) write_match_line(f_exact, ge.first, ge.second.sig, ke.second.sig, t);
+                            return true;
+                        }
+                    }
+                    return false;
+                };
+                if (try_pair(gname, kname)) continue;
+                string gb = gname, kb = kname;
+                size_t gp = gname.rfind('[');
+                if (gp != string::npos) gb = gname.substr(0, gp);
+                size_t kp = kname.rfind('[');
+                if (kp != string::npos) kb = kname.substr(0, kp);
+                for (int bi = 0; bi < 2048; bi++)
+                    try_pair(gb + "[" + std::to_string(bi) + "]", kb + "[" + std::to_string(bi) + "]");
+            }
+            fclose(fext);
+            result.stats.unmatched_gold = GetSize(gold) - GetSize(matched_gold);
+            result.stats.unmatched_gate = GetSize(gate) - GetSize(matched_gate);
+        }
+    }
 
     int applied_suggestions = 0;
     int validated_dff_suggestions = 0;
