@@ -158,6 +158,7 @@ struct CheckConfig
 	string sched_model_file;
 	string match_model_file;
 	string accept_sugs_file;
+	string external_match_file;
 	bool local_vali_slice = false;
 	SeqCheckConfig seq_check_cfg;
 	MlDumpConfig dump_cfg;

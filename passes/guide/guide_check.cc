@@ -646,6 +646,7 @@ struct GuideCheckPass : public Pass {
         log("        load a matching model JSON file and use it to score match suggestions.\n");
         log("\n");
         log("    -guide-accept-match-suggestions <file>\n");
+        log("    -guide-external-match <file>\n");
         log("        append accepted suggestions from the JSON file into match_file.\n");
         log("\n");
         log("    -local-validate-shadow\n");
@@ -675,6 +676,7 @@ struct GuideCheckPass : public Pass {
         string sched_model_file;
         string match_model_file;
         string accept_sugs_file;
+        string external_match_file;
         bool local_vali_shadow = false;
         bool local_vali_slice = false;
         bool part_prove = false;
@@ -741,6 +743,10 @@ struct GuideCheckPass : public Pass {
             }
             if (args[argidx] == "-guide-accept-match-suggestions" && argidx + 1 < args.size()) {
                 accept_sugs_file = args[++argidx];
+                continue;
+            }
+            if (args[argidx] == "-guide-external-match" && argidx + 1 < args.size()) {
+                external_match_file = args[++argidx];
                 continue;
             }
             if (args[argidx] == "-local-validate-shadow") {
@@ -854,6 +860,7 @@ struct GuideCheckPass : public Pass {
             .sched_model_file = sched_model_file,
             .match_model_file = match_model_file,
             .accept_sugs_file = accept_sugs_file,
+            .external_match_file = external_match_file,
             .local_vali_slice = local_vali_slice,
             .seq_check_cfg = seq_conf,
             .dump_cfg = dump_cfg,
