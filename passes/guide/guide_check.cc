@@ -754,8 +754,6 @@ struct GuideCheckPass : public Pass {
                 local_vali_slice = true;
                 continue;
             }
-                continue;
-            }
             break;
         }
 
