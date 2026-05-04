@@ -1,3 +1,4 @@
+#include <sstream>
 #include "passes/guide/check/check.h"
 #include "passes/guide/check/fail_exec.h"
 #include "passes/guide/check/scheduler.h"
@@ -279,6 +280,39 @@ ModMap hier_mod_map(RTLIL::Design *design, CheckConfig& conf)
     }
     for(const auto &mod_name : mod_map.unmapped_mods_gate){
         log_warning("Gate module %s has no matching gold module.\n", log_id(mod_name));
+    }
+
+    // External verification guidance: module-level matching
+    if (!conf.external_match_file.empty()) {
+        FILE *fext = fopen(conf.external_match_file.c_str(), "r");
+        if (fext != nullptr) {
+            char buf[4096];
+            while (fgets(buf, sizeof(buf), fext) != nullptr) {
+                string line = buf;
+                while (!line.empty() && (line.back() == '\n' || line.back() == '\r'))
+                    line.pop_back();
+                if (line.empty() || line[0] == '#') continue;
+                // Signal lines contain '.'; module lines don't
+                if (line.find('.') != string::npos) continue;
+
+                std::istringstream iss(line);
+                string gold_name, gate_name;
+                if (!(iss >> gold_name >> gate_name)) continue;
+
+                auto gld = RTLIL::escape_id(gold_name);
+                auto gte = RTLIL::escape_id(gate_name);
+                if (design->module(gld) == nullptr || design->module(gte) == nullptr) continue;
+                if (mod_map.mapped_mods_gold.count(gld) || mod_map.mapped_mods_gate.count(gte)) continue;
+
+                (*gold2gate)[gld] = gte;
+                mod_map.mapped_mods_gold.insert(gld);
+                mod_map.mapped_mods_gate.insert(gte);
+                mod_map.unmapped_mods_gold.erase(gld);
+                mod_map.unmapped_mods_gate.erase(gte);
+                log("  External module match: Gold %s <=> Gate %s\n", log_id(gld), log_id(gte));
+            }
+            fclose(fext);
+        }
     }
 
     // Structural fallback: for unmapped modules, try to match by port signature
