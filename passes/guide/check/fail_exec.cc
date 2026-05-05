@@ -1,4 +1,5 @@
 #include "passes/guide/check/fail_exec.h"
+#include <unistd.h>
 
 YOSYS_NAMESPACE_BEGIN
 namespace guide_check {
