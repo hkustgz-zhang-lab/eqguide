@@ -34,6 +34,7 @@ using json11::Json;
 	X(match_ms)                         \
 	X(check_mul_ms)                     \
 	X(mul_map_ms)                       \
+	X(check_div_ms)                     \
 	X(check_retime_ms)                  \
 	X(region_dag_ms)                    \
 	X(region_shell_ms)                  \
@@ -126,6 +127,7 @@ struct GuideTelemetry
 	dict<string, int> pair_applied_sugs;
 	pool<RTLIL::IdString> retimed_mods;
 	pool<RTLIL::IdString> multiplier_mods;
+	pool<RTLIL::IdString> divider_mods;
 	Json::array match_suggestions;
 };
 

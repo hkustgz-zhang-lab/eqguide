@@ -57,6 +57,7 @@ USING_YOSYS_NAMESPACE
 #include "passes/guide/check/match.h"
 #include "passes/guide/check/region.h"
 #include "passes/guide/check/retime_multi.h"
+#include "passes/guide/check/div_check.h"
 
 using namespace Yosys::guide_check;
 
@@ -649,7 +650,6 @@ struct GuideCheckPass : public Pass {
         log("\n");
         log("\n");
         log("\n");
-        log("\n");
 	}
 	void execute(std::vector<std::string> args, RTLIL::Design *design) override
 	{
@@ -669,6 +669,7 @@ struct GuideCheckPass : public Pass {
         string match_model_file;
         string accept_sugs_file;
         string external_match_file;
+        string div_sig_dir;
         MlDumpConfig dump_cfg;
         
         size_t argidx;
@@ -736,6 +737,10 @@ struct GuideCheckPass : public Pass {
             }
             if (args[argidx] == "-guide-external-match" && argidx + 1 < args.size()) {
                 external_match_file = args[++argidx];
+                continue;
+            }
+            if (args[argidx] == "-div-sig-dir" && argidx + 1 < args.size()) {
+                div_sig_dir = args[++argidx];
                 continue;
             }
             break;
@@ -885,8 +890,24 @@ struct GuideCheckPass : public Pass {
                 break;
             }
         }
-        if(!multi_result) { 
+        if(!multi_result) {
             log("GUIDE_CHECK multiplier check failed.\n");
+        }
+
+        DivMap div_map = get_div_map(design, mod_map);
+        auto div_results = check_extract_div(design, div_map, tempdir_name, dump_cfg, div_sig_dir, &telemetry.divider_mods);
+        bool div_result = true;
+        for(auto r: div_results){
+            log("GUIDE_CHECK for divider module : %s : %s\n",
+                log_id(r.first),
+                r.second ? "\033[1;32mPASSED\033[0m" : "\033[1;31mFAILED\033[0m");
+            if (!r.second) {
+                div_result = false;
+                break;
+            }
+        }
+        if(!div_result) {
+            log("GUIDE_CHECK divider check failed.\n");
         }
         if (dump_cfg.dump_match)
             (void)match_signals(design, conf, mod_map, false, "pre_async");
@@ -957,7 +978,7 @@ struct GuideCheckPass : public Pass {
         }
 
         report(gold_mod_name_id, gate_mod_name_id,
-                multi_results,retime_results, cec_result_mod);
+                multi_results, div_results, retime_results, cec_result_mod);
 
         if (dump_cfg.dump_match) {
             write_match_suggestions(match_suggestions_path(dump_cfg.match_jsonl), telemetry.match_suggestions);
@@ -986,7 +1007,7 @@ struct GuideCheckPass : public Pass {
 			remove_directory(conf.tempdir_name);
 		}
 
-        bool succ = cec_result && multi_result && retime_result;
+        bool succ = cec_result && multi_result && div_result && retime_result;
         if(assert_mode && !succ){
             log_error("GUIDE_CHECK Assertion Failed!\n");
         }
@@ -998,6 +1019,7 @@ struct GuideCheckPass : public Pass {
 
     bool report(RTLIL::IdString gold_mod_name_id, RTLIL::IdString gate_mod_name_id,
                     Results &mul_results,
+                    Results &div_results,
                     Results &retime_results,
                     Results &cec_results)
     {
@@ -1023,6 +1045,7 @@ struct GuideCheckPass : public Pass {
 
         bool mul_ok = true;
         bool cec_ok = true;
+        bool div_ok = true;
         bool retime_ok = true;
 
         log("\n================== Equivalence Checking Report ================\n");
@@ -1034,6 +1057,11 @@ struct GuideCheckPass : public Pass {
         for (const auto &r : mul_results) {
             print_row(W_CAT, W_MOD, W_RES, "MULTIPLIER", log_id(r.first), ok_str(r.second));
             if (!r.second) mul_ok = false;
+        }
+
+        for (const auto &r : div_results) {
+            print_row(W_CAT, W_MOD, W_RES, "DIVIDER", log_id(r.first), ok_str(r.second));
+            if (!r.second) div_ok = false;
         }
 
         for (const auto &r : retime_results) {
@@ -1048,7 +1076,7 @@ struct GuideCheckPass : public Pass {
 
         print_sep(W_CAT, W_MOD, W_RES);
 
-        bool succ = mul_ok && cec_ok && retime_ok;
+        bool succ = mul_ok && div_ok && cec_ok && retime_ok;
 
         if (!succ) {
             log("\nGUIDE_CHECK FAILED: Modules %s and %s are NOT equivalent.\n",

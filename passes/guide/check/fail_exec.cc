@@ -66,7 +66,8 @@ std::vector<string> extract_failure_clues(const string &output)
         "BMC-Induct failed in weak mode",
         "BMC-Induct failed in BMC phase",
         "BMC-Induct failed in Induct phase",
-        "Amulet Verify failed"
+        "Amulet Verify failed",
+        "DivVerify failed"
     };
 
     for (auto &clue : known_clues)
@@ -102,7 +103,8 @@ static string infer_proof_outcome(const CommandResult &result, const std::vector
             clue == "BMC-Induct failed in weak mode" ||
             clue == "BMC-Induct failed in BMC phase" ||
             clue == "BMC-Induct failed in Induct phase" ||
-            clue == "Amulet Verify failed")
+            clue == "Amulet Verify failed" ||
+            clue == "DivVerify failed")
             return "blocked";
 
     string out_lc = result.output;
@@ -144,6 +146,8 @@ static string packet_engine(const string &stage)
         return "bmc";
     if (stage == "AMULET")
         return "amulet";
+    if (stage == "DIVVERIFY")
+        return "divverify";
     if (stage == "REGION")
         return "abc";
     return "unknown";
@@ -155,6 +159,8 @@ static string packet_scope(const string &stage)
         return "bmc";
     if (stage == "AMULET")
         return "multiplier_subcheck";
+    if (stage == "DIVVERIFY")
+        return "divider_subcheck";
     if (stage == "REGION")
         return "region_local";
     return "pair";
@@ -346,6 +352,9 @@ FailureTeacher failure_teacher(const CommandResult &result, const std::vector<st
         if (clue == "Amulet Verify failed")
             return {"amulet_verify_failed", {clue},
                     {"check_multiplier_sign_width", "check_blackboxing_path", "replay_failing_action"}};
+        if (clue == "DivVerify failed")
+            return {"divverify_verify_failed", {clue},
+                    {"check_divider_sign_width", "check_blackboxing_path", "replay_failing_action"}};
     }
 
     if (result.log_file.empty())
@@ -585,6 +594,7 @@ static dict<string, string> HINT_CONFIDENCE = {
     {"bmc_bmc_phase_failed", "medium"},
     {"bmc_induct_phase_failed", "medium"},
     {"amulet_verify_failed", "high"},
+    {"divverify_verify_failed", "high"},
     {"tool_exit_nonzero", "low"},
     {"missing_log_or_parse_error", "low"},
     {"unknown", "low"},
@@ -651,6 +661,11 @@ static dict<string, std::vector<string>> HINT_LIKELY_CAUSES = {
         "signedness or width assumptions may be wrong",
         "the blackboxing or substitute path may not match the extracted cone",
     }},
+    {"divverify_verify_failed", {
+        "the divider-specific flow rejected the current candidate",
+        "signedness or width assumptions may be wrong",
+        "the signature file may not match the extracted divider",
+    }},
     {"tool_exit_nonzero", {
         "the external tool exited unsuccessfully before a clear clue was extracted",
         "the command log is needed before changing the classification",
@@ -673,6 +688,7 @@ static dict<string, string> HINT_STEP_REASON = {
     {"increase_bmc_k", "Increase the search depth so the failing sequential proof has a chance to settle."},
     {"inspect_retime_pair", "Inspect retimed structure and warmup alignment on this module pair."},
     {"check_multiplier_sign_width", "Check multiplier signedness and width assumptions against the extracted cone."},
+    {"check_divider_sign_width", "Check divider signedness and width assumptions against the extracted cone."},
     {"check_blackboxing_path", "Verify the multiplier blackboxing/substitution path before changing the proof result."},
     {"replay_failing_action", "Replay the exact failing action with the captured log to confirm the failure mode."},
     {"inspect_counterexample", "Inspect the earliest counterexample-bearing signals before changing transforms or matching."},
@@ -729,6 +745,8 @@ static string hint_summarize(const Json &packet)
         return stringf("%s blocked for %s while running %s; the induction phase failed.", stage.c_str(), pid.c_str(), action.c_str());
     if (tc == "amulet_verify_failed")
         return stringf("%s blocked for %s while running %s; the multiplier-specific verification path rejected the candidate.", stage.c_str(), pid.c_str(), action.c_str());
+    if (tc == "divverify_verify_failed")
+        return stringf("%s blocked for %s while running %s; the divider-specific verification path rejected the candidate.", stage.c_str(), pid.c_str(), action.c_str());
     if (tc == "tool_exit_nonzero")
         return stringf("%s hit a tool-side execution error for %s while running %s.", stage.c_str(), pid.c_str(), action.c_str());
     if (tc == "missing_log_or_parse_error")
