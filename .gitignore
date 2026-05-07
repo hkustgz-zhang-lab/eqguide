@@ -90,3 +90,6 @@ __pycache__
 
 *.md
 !README.md
+.codex 
+/*.svg
+/_tmp_*
