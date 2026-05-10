@@ -292,6 +292,7 @@ static std::vector<std::pair<RTLIL::IdString, bool>> abc_cec(const CheckConfig &
         .sched_model_file = conf.sched_model_file,
         .match_model_file = conf.match_model_file,
         .accept_sugs_file = conf.accept_sugs_file,
+        .external_match_file = conf.external_match_file,
         .seq_check_cfg = conf.seq_check_cfg,
         .dump_cfg = conf.dump_cfg,
         .sched_model = conf.sched_model,
@@ -557,6 +558,7 @@ struct GuideCheckRetimePass : public Pass {
             .sched_model_file = "",
             .match_model_file = "",
             .accept_sugs_file = "",
+            .external_match_file = "",
             .seq_check_cfg = SeqCheckConfig{
                 .k_induct = k_induct,
                 .step_skip = step_skip,
