@@ -251,7 +251,7 @@ struct GuideMultiPass : public Pass {
                 continue;
             }
 
-            run_pass(stringf("wreduce %s", RTLIL::unescape_id(module->name)), design);
+            // run_pass(stringf("wreduce %s", RTLIL::unescape_id(module->name)), design);
 
             int cnt = wrap_mul_in_module(module);
             log("Module %s: wrapped %d $mul cells\n", module->name, cnt);
